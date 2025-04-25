@@ -68,22 +68,62 @@ def ensure_synched(func):
 
     return inner
 
+from urllib.parse import urlparse
+import re
+
+def get_path(url: str) -> str:
+    """
+    Return everything after the host[:port] portion of a URL,
+    including the query string and fragment if present.
+    """
+    parsed = urlparse(url)
+    # .path is always there; .query / .fragment may be empty
+    rest = parsed.path
+    if parsed.query:     # keep ?key=value part, if any
+        rest += '?' + parsed.query
+    if parsed.fragment:  # keep #anchor part, if any
+        rest += '#' + parsed.fragment
+    return rest
 
 def record_time(label):
     """
     Decorator that measures execution time (in ms) and stores it in self.timings[label].
     """
+
     def decorator(func):
         def wrapper(self, *args, **kwargs):
             # make sure we have a place to store
-            if not hasattr(self, 'timings'):
+            if not hasattr(self, "timings"):
                 self.timings = {}
             t0 = time.time()
             result = func(self, *args, **kwargs)
             t1 = time.time()
-            self.timings[label] = (t1 - t0) * 1000.0
+            
+            request_metadata = None
+            if label == "request_to_server":
+                _add_interaction_re = re.compile(r'^/add_[^/]+_interaction$')
+                
+                url = args[0]
+                path = urlparse(url).path
+                
+                request_metadata = {
+                    "is_request_to_server": True,
+                    "is_interaction_to_server": bool(_add_interaction_re.match(path)),
+                    "request_url": urlparse(url).path,
+                }
+            
+            if label not in self.timings:
+                self.timings[label] = []
+            
+            self.timings[label].append({
+                "time": (t1 - t0) * 1000.0,
+                "request_metadata": request_metadata,         
+            })
+            
             return result
+
         return wrapper
+
     return decorator
 
 
@@ -101,7 +141,12 @@ class SlicerNNInteractive(ScriptedLoadableModule):
             translate("qSlicerAbstractCoreModule", "Segmentation")
         ]
         self.parent.dependencies = []  # List other modules if needed
-        self.parent.contributors = ["Coen de Vente", "Kiran Vaidhya Venkadesh", "Bram van Ginneken", "Clara I. Sanchez"]
+        self.parent.contributors = [
+            "Coen de Vente",
+            "Kiran Vaidhya Venkadesh",
+            "Bram van Ginneken",
+            "Clara I. Sanchez",
+        ]
         self.parent.helpText = """
             This is an 3D Slicer extension for using nnInteractive.
 
@@ -219,8 +264,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self.ui.pbInteractionLassoCancel.clicked.connect(self.on_lasso_cancel_clicked)
 
-        self.addObserver(slicer.app.applicationLogic().GetInteractionNode(), 
-            slicer.vtkMRMLInteractionNode.InteractionModeChangedEvent, self.on_interaction_node_modified)
+        self.addObserver(
+            slicer.app.applicationLogic().GetInteractionNode(),
+            slicer.vtkMRMLInteractionNode.InteractionModeChangedEvent,
+            self.on_interaction_node_modified,
+        )
 
     def setup_shortcuts(self):
         """
@@ -391,7 +439,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
 
             prompt_type["node"] = node
-            prompt_type["button"].clicked.connect(lambda checked, prompt_name=prompt_name: self.on_place_button_clicked(checked, prompt_name)) 
+            prompt_type["button"].clicked.connect(
+                lambda checked, prompt_name=prompt_name: self.on_place_button_clicked(
+                    checked, prompt_name
+                )
+            )
             self.all_prompt_buttons[prompt_name] = prompt_type["button"]
 
         if (
@@ -492,16 +544,29 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         interactionNode = slicer.app.applicationLogic().GetInteractionNode()
         selectionNode = slicer.app.applicationLogic().GetSelectionNode()
         for prompt_type in self.prompt_types.values():
-            if interactionNode.GetCurrentInteractionMode() != slicer.vtkMRMLInteractionNode.Place:
-                if prompt_type["name"] == "LassoPrompt" and (self.ui.pbInteractionLasso.isChecked()):
+            if (
+                interactionNode.GetCurrentInteractionMode()
+                != slicer.vtkMRMLInteractionNode.Place
+            ):
+                if prompt_type["name"] == "LassoPrompt" and (
+                    self.ui.pbInteractionLasso.isChecked()
+                ):
                     self.submit_lasso_if_present()
                 prompt_type["button"].setChecked(False)
-            elif interactionNode.GetCurrentInteractionMode() == slicer.vtkMRMLInteractionNode.Place:
-                placingThisNode = (selectionNode.GetActivePlaceNodeID() == prompt_type["node"].GetID())
+            elif (
+                interactionNode.GetCurrentInteractionMode()
+                == slicer.vtkMRMLInteractionNode.Place
+            ):
+                placingThisNode = (
+                    selectionNode.GetActivePlaceNodeID() == prompt_type["node"].GetID()
+                )
                 prompt_type["button"].setChecked(placingThisNode)
 
         # Stop scribble if placing markup
-        if interactionNode.GetCurrentInteractionMode() == slicer.vtkMRMLInteractionNode.Place:
+        if (
+            interactionNode.GetCurrentInteractionMode()
+            == slicer.vtkMRMLInteractionNode.Place
+        ):
             self.ui.pbInteractionScribble.setChecked(False)
 
     def remove_all_but_last_prompt(self):
@@ -542,8 +607,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         interactionNode = slicer.app.applicationLogic().GetInteractionNode()
         if checked:
             selectionNode = slicer.app.applicationLogic().GetSelectionNode()
-            selectionNode.SetReferenceActivePlaceNodeClassName(self.prompt_types[prompt_name]["node_class"])
-            selectionNode.SetActivePlaceNodeID(self.prompt_types[prompt_name]["node"].GetID())
+            selectionNode.SetReferenceActivePlaceNodeClassName(
+                self.prompt_types[prompt_name]["node_class"]
+            )
+            selectionNode.SetActivePlaceNodeID(
+                self.prompt_types[prompt_name]["node"].GetID()
+            )
             interactionNode.SetPlaceModePersistence(1)
             interactionNode.SetCurrentInteractionMode(interactionNode.Place)
         else:
@@ -710,7 +779,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Called whenever a new point is added to the lasso.
         """
-        pointsDefined = self.prompt_types["lasso"]["node"].GetNumberOfControlPoints() > 0
+        pointsDefined = (
+            self.prompt_types["lasso"]["node"].GetNumberOfControlPoints() > 0
+        )
         self.ui.pbInteractionLassoCancel.setVisible(pointsDefined)
 
     def on_lasso_cancel_clicked(self):
@@ -812,6 +883,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Uploads lasso or scribble prompt to the server.
         """
+        if np.sum(mask) == 0:
+            return
+        
         url = f"{self.server}/add_{tp}_interaction"
         try:
             buffer = io.BytesIO()
@@ -1003,7 +1077,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.get_selected_segmentation_node_and_segment_id()
         )
 
-        was_3d_shown = segmentationNode.GetSegmentation().ContainsRepresentation(slicer.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName())
+        was_3d_shown = segmentationNode.GetSegmentation().ContainsRepresentation(
+            slicer.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName()
+        )
 
         with slicer.util.RenderBlocker():  # avoid flashing of 3D view
             self.editor_widget.saveStateForUndo()
@@ -1127,26 +1203,36 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Wraps requests.post in a try/except and shows error in pop up windows if necessary.
         """
 
-        with slicer.util.tryWithErrorDisplay(_("Segmentation failed."), waitCursor=True):
+        with slicer.util.tryWithErrorDisplay(
+            _("Segmentation failed."), waitCursor=True
+        ):
 
             error_message = None
             try:
                 response = requests.post(*args, **kwargs)
-                debug_print('response:', response)
+                debug_print("response:", response)
             except requests.exceptions.MissingSchema as e:
                 response = None
                 if self.server == "":
-                    raise RuntimeError("It seems you have not set the server URL yet. You can configure it in the 'Configuration' tab.")
+                    raise RuntimeError(
+                        "It seems you have not set the server URL yet. You can configure it in the 'Configuration' tab."
+                    )
                 else:
-                    raise RuntimeError(f"Server URL '{self.server}' is unreachable. You can edit the URL in the 'Configuration' tab.")
+                    raise RuntimeError(
+                        f"Server URL '{self.server}' is unreachable. You can edit the URL in the 'Configuration' tab."
+                    )
             except requests.exceptions.ConnectionError as e:
                 response = None
-                raise RuntimeError(f"Failed to connect to server '{self.server}'. Please make sure the server is running and check the server URL in the 'Configuration' tab.")
+                raise RuntimeError(
+                    f"Failed to connect to server '{self.server}'. Please make sure the server is running and check the server URL in the 'Configuration' tab."
+                )
 
             if response.status_code != 200:
                 status_code = response.status_code
                 response = None
-                raise RuntimeError(f"Something has gone wrong with your request (Status code {status_code}).")
+                raise RuntimeError(
+                    f"Something has gone wrong with your request (Status code {status_code})."
+                )
 
             t0 = time.time()
             # Try to parse JSON and check for a specific error.
@@ -1155,15 +1241,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 resp_json = response.json()
                 if resp_json.get("status") == "error":
                     if "No image uploaded" in resp_json.get("message", ""):
-                        debug_print("No image has been uploaded to the server. Please upload an image first.")
+                        debug_print(
+                            "No image has been uploaded to the server. Please upload an image first."
+                        )
                         self.upload_image_to_server()
                         self.upload_segment_to_server()
                         return self.request_to_server(*args, **kwargs)
                     else:
                         response = None
-                        raise RuntimeError(f"Server error: {resp_json.get('message', 'Unknown error')}")
+                        raise RuntimeError(
+                            f"Server error: {resp_json.get('message', 'Unknown error')}"
+                        )
 
-            debug_print('1157 took', time.time() - t0)
+            debug_print("1157 took", time.time() - t0)
 
         return response
 
@@ -1357,7 +1447,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         xyz = [int(round(c)) for c in point_Ijk[0:3]]
         return xyz
 
-
     def xyz_from_caller(self, caller, lock_point=True, point_type="control_point"):
         """
         Extract voxel coordinates from a Markups node.
@@ -1377,7 +1466,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return xyz
         elif point_type == "curve_point":
             vtk_pts = caller.GetCurvePointsWorld()
-            
+
             if vtk_pts is not None:
                 vtk_pts_data = vtk_to_numpy(vtk_pts.GetData())
                 xyz = [self.ras_to_xyz(pos) for pos in vtk_pts_data]
@@ -1386,7 +1475,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
             return []
         else:
-            raise ValueError(f'Unknown point_type {point_type}')
+            raise ValueError(f"Unknown point_type {point_type}")
 
     def lasso_points_to_mask(self, points):
         """
@@ -1478,261 +1567,298 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.on_prompt_type_positive_clicked()
 
 
-
-
 from slicer.ScriptedLoadableModule import ScriptedLoadableModuleTest
 import os, slicer, vtk, time, gc
 
-class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):    
-  def setUp(self):
-    slicer.mrmlScene.Clear()
 
-  def runTest(self):
-    self.testPointClickAtWorld()
+class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
+    def setUp(self):
+        slicer.mrmlScene.Clear()
 
-  def selectPointPromptButton(self):
-    gui = slicer.util.getModuleGui('SlicerNNInteractive')
-    gui.ui.pbInteractionPoint.click()
-    slicer.app.processEvents()
+    def runTest(self):
+        self.testPointClickAtWorld()
 
-  def selectBBoxPromptButton(self):
-    gui = slicer.util.getModuleGui('SlicerNNInteractive')
-    gui.ui.pbInteractionBBox.click()
-    slicer.app.processEvents()
-    
-  def selectScribblePromptButton(self):
-    gui = slicer.util.getModuleGui('SlicerNNInteractive')
-    gui.ui.pbInteractionScribble.click()
-    slicer.app.processEvents()
-    
-  def selectLassoPromptButton(self):
-    gui = slicer.util.getModuleGui('SlicerNNInteractive')
-    gui.ui.pbInteractionLasso.click()
-    slicer.app.processEvents()
+    def selectPointPromptButton(self):
+        gui = slicer.util.getModuleGui("SlicerNNInteractive")
+        gui.ui.pbInteractionPoint.click()
+        slicer.app.processEvents()
 
-  def clickNextSegmentButton(self):
-    gui = slicer.util.getModuleGui('SlicerNNInteractive')
-    gui.ui.pbNextSegment.click()
-    slicer.app.processEvents()
-    
-  def clickResetSegmentButton(self):
-    gui = slicer.util.getModuleGui('SlicerNNInteractive')
-    gui.ui.pbResetSegment.click()
-    slicer.app.processEvents()
+    def selectBBoxPromptButton(self):
+        gui = slicer.util.getModuleGui("SlicerNNInteractive")
+        gui.ui.pbInteractionBBox.click()
+        slicer.app.processEvents()
 
-  def get_xy_redview(self, worldPt):
-    lm = slicer.app.layoutManager()
-    sliceLogic = lm.sliceWidget('Red').sliceLogic()
-    sliceNode = sliceLogic.GetSliceNode()
-    sliceNode.SetSliceOffset(worldPt[2])
-    
-    lm.sliceWidget('Red').sliceView().renderWindow().Render()
-    slicer.app.processEvents()
+    def selectScribblePromptButton(self):
+        gui = slicer.util.getModuleGui("SlicerNNInteractive")
+        gui.ui.pbInteractionScribble.click()
+        slicer.app.processEvents()
 
-    redView = lm.sliceWidget('Red').sliceView()
-    ren = redView.renderWindow().GetRenderers().GetFirstRenderer()
-    ren.SetWorldPoint(worldPt[0], worldPt[1], worldPt[2], 1.0)
-    ren.WorldToDisplay()
+    def selectLassoPromptButton(self):
+        gui = slicer.util.getModuleGui("SlicerNNInteractive")
+        gui.ui.pbInteractionLasso.click()
+        slicer.app.processEvents()
 
-    w, h = redView.width, redView.height
-    x_w = int(w / 2)
-    y_w = int(h / 2)
+    def clickNextSegmentButton(self):
+        gui = slicer.util.getModuleGui("SlicerNNInteractive")
+        gui.ui.pbNextSegment.click()
+        slicer.app.processEvents()
 
-    self.delayDisplay(f"Clicking at widget coords ({(x_w, y_w)})")
-    sliceNode.JumpSliceByCentering(worldPt[0], worldPt[1], worldPt[2])
-    
-    return redView, x_w, y_w
+    def clickResetSegmentButton(self):
+        gui = slicer.util.getModuleGui("SlicerNNInteractive")
+        gui.ui.pbResetSegment.click()
+        slicer.app.processEvents()
 
-  @record_time("clickPoint")
-  def clickPoint(self, worldPt, button='Left'):
-    redView, x_w, y_w = self.get_xy_redview(worldPt)
-    slicer.util.clickAndDrag(
-      redView,
-      start=(x_w, y_w),
-      end=(x_w, y_w),
-      steps=0,
-      button=button
-    )
-    slicer.app.processEvents()
-    
-  @record_time("dragPoints")
-  def dragPoints(self, middle):
-    redView, x_middle, y_middle = self.get_xy_redview(middle)
+    def get_xy_redview(self, worldPt):
+        lm = slicer.app.layoutManager()
+        sliceLogic = lm.sliceWidget("Red").sliceLogic()
+        sliceNode = sliceLogic.GetSliceNode()
+        sliceNode.SetSliceOffset(worldPt[2])
 
-    print('(x_middle, y_middle):', (x_middle, y_middle))
+        lm.sliceWidget("Red").sliceView().renderWindow().Render()
+        slicer.app.processEvents()
 
-    slicer.util.clickAndDrag(
-      redView,
-      start=(x_middle - 25, y_middle - 25),
-      end=(x_middle + 25, y_middle + 25),
-      steps=2,
-      button='Left'
-    )
-    slicer.app.processEvents()
-    
-  def resetTiming(self):
-      self.timings = {}
-      slicer.modules.SlicerNNInteractiveWidget.timings = {}
+        redView = lm.sliceWidget("Red").sliceView()
+        ren = redView.renderWindow().GetRenderers().GetFirstRenderer()
+        ren.SetWorldPoint(worldPt[0], worldPt[1], worldPt[2], 1.0)
+        ren.WorldToDisplay()
 
-  def reportTiming(self):
-    widget = slicer.modules.SlicerNNInteractiveWidget
-    timings = widget.timings
-    print('widget.timings:', timings)
-    widget_timings = copy.deepcopy(timings)
-    for stage, secs in timings.items():
-        print(f"Widget | {stage}: {secs:.1f} ms")
-        
-    timings = self.timings
-    for stage, secs in timings.items():
-        print(f"Test | {stage}: {secs:.1f} ms")
-    
-    return widget_timings, copy.deepcopy(self.timings)
+        w, h = redView.width, redView.height
+        x_w = int(w / 2)
+        y_w = int(h / 2)
 
-  def makeTimesTable(self, times):
-    """
-    Produces a markdown table of mean ± std (in ms) over repeats for each prompt type.
-    """
-    try:
-      import pandas as pd
-    except ImportError:
-      slicer.util.pip_install('pandas')
-      import pandas as pd
-    import numpy as np
+        self.delayDisplay(f"Clicking at widget coords ({(x_w, y_w)})")
+        sliceNode.JumpSliceByCentering(worldPt[0], worldPt[1], worldPt[2])
 
-    # Hard-coded row label
-    row_label = "Small Image | GPU 1"
-    # Mapping from our keys to column names
-    col_map = {
-      'point':    'Point',
-      'bbox':     'Bounding box',
-      'scribble': 'Scribble',
-      'lasso':    'Lasso'
-    }
+        return redView, x_w, y_w
 
-    # Compute mean ± std for each prompt type
-    table_data = {}
-    for key, col_name in col_map.items():
-      # sum server processing + remainder for each run
-      totals = [
-        entry['server_prompt_processing'] + entry['remainder']
-        for entry in times[key]
-      ]
-      mean = np.mean(totals)
-      std  = np.std(totals, ddof=1) if len(totals) > 1 else 0.0
-      table_data[col_name] = [f"{mean:.1f} ± {std:.1f} ms"]
-
-    # Build DataFrame
-    df = pd.DataFrame(table_data, index=[row_label])
-
-    # Print as Markdown
-    print(df.to_markdown())
-
-  def deleteCurrentSegment(self):
-    """
-    Remove the segment that is currently selected in the SlicerNNInteractive widget.
-    """
-    time.sleep(.2)
-    # Grab the module’s GUI/widget instance
-    gui = slicer.util.getModuleGui('SlicerNNInteractive')
-    # Ask the widget for its current segmentation node and selected segment ID
-    segmentation_node, segment_id = gui.get_selected_segmentation_node_and_segment_id()
-    # If there is a segment selected, delete it
-    if segment_id:
-      segmentation_node.GetSegmentation().RemoveSegment(segment_id)
-      # Refresh the editor so the UI knows the segment is gone
-      gui.editor_widget.setSegmentationNode(segmentation_node)
-      gui.editor_widget.updateWidgetFromMRML()
-      slicer.app.processEvents()
-
-  def testPointClickAtWorld(self):
-    volPath = os.path.expanduser(
-      '~/projects/plain/3d-slicer-uls-plugin/PlainAnnotator/PlainAnnotator/Data/Images/0_cropped_resized.nii.gz'
-    )
-    volumeNode = slicer.util.loadVolume(volPath)
-    self.assertIsNotNone(volumeNode)
-
-    slicer.app.processEvents()
-
-    slicer.util.selectModule('SlicerNNInteractive')
-    slicer.app.processEvents()
-    self.selectPointPromptButton()
-    slicer.app.processEvents()
-    
-    # Image should only be uploaded in this call
-    self.clickNextSegmentButton()
-    self.resetTiming()
-    self.clickPoint([54, 170, -173])
-    self.reportTiming()    
-    
-    times = {'point': [], 'bbox': [], 'scribble': [], 'lasso': []}
-        
-    n_repeats = 1
-    self.selectPointPromptButton()  # off
-    
-    for _ in range(n_repeats):
-        self.deleteCurrentSegment()
-        self.clickNextSegmentButton()
-        self.selectPointPromptButton() # on
-        self.resetTiming()
-        self.clickPoint([54, 170, -283])
-        widget_timing, test_timing = self.reportTiming()
-        times['point'].append(
-            {
-                'server_prompt_processing': widget_timing['request_to_server'],
-                'remainder': test_timing['clickPoint'] - widget_timing['request_to_server']
-                # Remainder: Last automated UI interaction for testing, sending empty segmentation mask, displaying segmentation etc.
-            }
+    @record_time("clickPoint")
+    def clickPoint(self, worldPt, button="Left"):
+        redView, x_w, y_w = self.get_xy_redview(worldPt)
+        slicer.util.clickAndDrag(
+            redView, start=(x_w, y_w), end=(x_w, y_w), steps=0, button=button
         )
-    
-        self.selectBBoxPromptButton()
-        self.deleteCurrentSegment()
-        self.clickNextSegmentButton()
-        self.resetTiming()
-        self.clickPoint([-112, 195, -190])
-        self.clickPoint([-190, 81, -190])
-        widget_timing, test_timing = self.reportTiming()
-        times['bbox'].append(
-            {
-                'server_prompt_processing': widget_timing['request_to_server'],
-                'remainder': test_timing['clickPoint'] - widget_timing['request_to_server']
-                # Remainder: Last automated UI interaction for testing, sending empty segmentation mask, displaying segmentation etc.
-            }
+        slicer.app.processEvents()
+
+    @record_time("dragPoints")
+    def dragPoints(self, middle):
+        redView, x_middle, y_middle = self.get_xy_redview(middle)
+
+        print("(x_middle, y_middle):", (x_middle, y_middle))
+
+        slicer.util.clickAndDrag(
+            redView,
+            start=(x_middle - 25, y_middle - 25),
+            end=(x_middle + 25, y_middle + 25),
+            steps=2,
+            button="Left",
         )
+        slicer.app.processEvents()
+
+    def resetTiming(self):
+        self.timings = {}
+        slicer.modules.SlicerNNInteractiveWidget.timings = {}
+
+    def reportTiming(self):
+        widget = slicer.modules.SlicerNNInteractiveWidget
+        timings = widget.timings
+        print("widget.timings:", timings)
+        widget_timings = copy.deepcopy(timings)
         
-        self.selectScribblePromptButton()   
-        self.deleteCurrentSegment()
+        server_interactions = [
+            t 
+            for t in widget_timings["request_to_server"] 
+            if t["request_metadata"] is not None
+            and t["request_metadata"]["is_interaction_to_server"]
+        ]
+        print('server_interactions:', server_interactions)
+        assert len(server_interactions) == 1
+        
+        server_time = server_interactions[0]['time']
+        
+        
+        timings = self.timings
+        print(timings)
+        key_0 = list(timings.keys())[0]
+        
+        print('timings:', timings)
+        
+        assert len(timings) == 1
+        assert len(timings[key_0]) == 1
+
+        return server_time, copy.deepcopy(timings[key_0][0])
+
+    def makeTimesTable(self, times):
+        """
+        Produces a markdown table with cells formatted as:
+        Total ± sigma_total (Server ± sigma_server), in seconds.
+        """
+        try:
+            import pandas as pd
+        except ImportError:
+            slicer.util.pip_install('pandas')
+            import pandas as pd
+        try:
+            import tabulate
+        except ImportError:
+            slicer.util.pip_install('tabulate')
+            import tabulate
+        import numpy as np
+        # Row label for this configuration
+        row_label = "Small Image | GPU 1"
+
+        # Mapping keys to column headers
+        col_map = {
+            "point": "Point",
+            "bbox": "Bounding box",
+            "scribble": "Scribble",
+            "lasso": "Lasso",
+        }
+
+        # Prepare data dictionary
+        table_data = {}
+        for key, col_name in col_map.items():
+            entries = times.get(key, [])
+            # Extract server and remainder times
+            server_times = [e["server_prompt_processing"] for e in entries]
+            remainder_times = [e["remainder"] for e in entries]
+            # Compute total times
+            total_times = [s + r for s, r in zip(server_times, remainder_times)]
+
+            # Compute statistics (mean, std) in seconds
+            def stats_ms_to_s(values):
+                if not values:
+                    return 0.0, 0.0
+                mean_ms = np.mean(values)
+                std_ms = np.std(values, ddof=1) if len(values) > 1 else 0.0
+                return mean_ms / 1000.0, std_ms / 1000.0
+
+            server_mean, server_std = stats_ms_to_s(server_times)
+            total_mean, total_std = stats_ms_to_s(total_times)
+
+            # Format string
+            cell = (
+                f"{total_mean:.1f} s ± {total_std:.2f} s "
+                f"({server_mean:.1f} s ± {server_std:.2f} s)"
+            )
+            table_data[col_name] = [cell]
+
+        # Build DataFrame and print as Markdown
+        df = pd.DataFrame(table_data, index=[row_label])
+        print(df.to_markdown())
+
+    def deleteCurrentSegment(self):
+        """
+        Remove the segment that is currently selected in the SlicerNNInteractive widget.
+        """
+        time.sleep(0.2)
+        # Grab the module’s GUI/widget instance
+        gui = slicer.util.getModuleGui("SlicerNNInteractive")
+        # Ask the widget for its current segmentation node and selected segment ID
+        segmentation_node, segment_id = (
+            gui.get_selected_segmentation_node_and_segment_id()
+        )
+        # If there is a segment selected, delete it
+        if segment_id:
+            segmentation_node.GetSegmentation().RemoveSegment(segment_id)
+            # Refresh the editor so the UI knows the segment is gone
+            gui.editor_widget.setSegmentationNode(segmentation_node)
+            gui.editor_widget.updateWidgetFromMRML()
+            slicer.app.processEvents()
+
+    def testPointClickAtWorld(self):
+        
+        # self.makeTimesTable({'point': [{'server_prompt_processing': 274.81770515441895, 'remainder': 1084.2270851135254}, {'server_prompt_processing': 270.0059413909912, 'remainder': 1018.8159942626953}, {'server_prompt_processing': 367.0217990875244, 'remainder': 1086.721420288086}, {'server_prompt_processing': 272.7179527282715, 'remainder': 1101.8640995025635}, {'server_prompt_processing': 293.9410209655762, 'remainder': 1003.39674949646}, {'server_prompt_processing': 342.46015548706055, 'remainder': 1086.9767665863037}, {'server_prompt_processing': 277.8630256652832, 'remainder': 1120.5148696899414}, {'server_prompt_processing': 388.9279365539551, 'remainder': 1138.554334640503}, {'server_prompt_processing': 363.4791374206543, 'remainder': 1134.6831321716309}, {'server_prompt_processing': 250.1530647277832, 'remainder': 1047.9130744934082}], 'bbox': [{'server_prompt_processing': 267.9722309112549, 'remainder': 1290.557861328125}, {'server_prompt_processing': 277.70495414733887, 'remainder': 1203.4249305725098}, {'server_prompt_processing': 264.57810401916504, 'remainder': 1206.1126232147217}, {'server_prompt_processing': 222.81908988952637, 'remainder': 1307.049036026001}, {'server_prompt_processing': 254.87494468688965, 'remainder': 1220.2939987182617}, {'server_prompt_processing': 318.51911544799805, 'remainder': 1300.35400390625}, {'server_prompt_processing': 355.1318645477295, 'remainder': 1261.366367340088}, {'server_prompt_processing': 362.22290992736816, 'remainder': 1339.8020267486572}, {'server_prompt_processing': 227.5378704071045, 'remainder': 1243.8380718231201}, {'server_prompt_processing': 232.36918449401855, 'remainder': 1364.2230033874512}], 'scribble': [{'server_prompt_processing': 115.55099487304688, 'remainder': 2936.944007873535}, {'server_prompt_processing': 125.45895576477051, 'remainder': 2896.9268798828125}, {'server_prompt_processing': 103.80268096923828, 'remainder': 2852.9422283172607}, {'server_prompt_processing': 111.67621612548828, 'remainder': 2935.222864151001}, {'server_prompt_processing': 109.13205146789551, 'remainder': 2983.234643936157}, {'server_prompt_processing': 116.23072624206543, 'remainder': 3075.700044631958}, {'server_prompt_processing': 119.88496780395508, 'remainder': 2937.4608993530273}, {'server_prompt_processing': 110.96596717834473, 'remainder': 2966.5510654449463}, {'server_prompt_processing': 109.39693450927734, 'remainder': 3133.073091506958}, {'server_prompt_processing': 101.77803039550781, 'remainder': 2975.1129150390625}], 'lasso': [{'server_prompt_processing': 298.4428405761719, 'remainder': 1350.2402305603027}, {'server_prompt_processing': 249.02105331420898, 'remainder': 1265.3090953826904}, {'server_prompt_processing': 236.29307746887207, 'remainder': 1231.6608428955078}, {'server_prompt_processing': 251.4822483062744, 'remainder': 1330.0085067749023}, {'server_prompt_processing': 317.3098564147949, 'remainder': 1347.9561805725098}, {'server_prompt_processing': 358.2158088684082, 'remainder': 1371.7823028564453}, {'server_prompt_processing': 242.71702766418457, 'remainder': 1352.2160053253174}, {'server_prompt_processing': 254.51016426086426, 'remainder': 1396.7690467834473}, {'server_prompt_processing': 342.35405921936035, 'remainder': 1369.4860935211182}, {'server_prompt_processing': 279.97398376464844, 'remainder': 1352.8289794921875}]})
+        # return
+    
+        volPath = os.path.expanduser(
+            "~/projects/plain/3d-slicer-uls-plugin/PlainAnnotator/PlainAnnotator/Data/Images/0_cropped_resized.nii.gz"
+        )
+        volumeNode = slicer.util.loadVolume(volPath)
+        self.assertIsNotNone(volumeNode)
+
+        slicer.app.processEvents()
+
+        slicer.util.selectModule("SlicerNNInteractive")
+        slicer.app.processEvents()
+        self.selectPointPromptButton()
+        slicer.app.processEvents()
+
+        # Image should only be uploaded in this call
         self.clickNextSegmentButton()
         self.resetTiming()
-        self.dragPoints(middle=[63, 182, -190])  
-        
-        widget_timing, test_timing = self.reportTiming()
-        times['scribble'].append(
-            {
-                'server_prompt_processing': widget_timing['request_to_server'],
-                'remainder': test_timing['dragPoints'] - widget_timing['request_to_server']
-                # Remainder: Last automated UI interaction for testing, sending empty segmentation mask, displaying segmentation etc.
-            }
-        )
-        
-        self.selectLassoPromptButton()
-        self.deleteCurrentSegment()
-        self.clickNextSegmentButton()
-        self.resetTiming()
-        self.clickPoint([-40, 141, -174])
-        self.clickPoint([-53, 127, -174])
-        self.clickPoint([-40, 115, -174])
-        self.clickPoint([-27, 129, -174])
-        self.clickPoint([-40, 150, -174], button='Right')
-        widget_timing, test_timing = self.reportTiming()
-        times['lasso'].append(
-            {
-                'server_prompt_processing': widget_timing['request_to_server'],
-                'remainder': test_timing['clickPoint'] - widget_timing['request_to_server']
-                # Remainder: Last automated UI interaction for testing, sending empty segmentation mask, displaying segmentation etc.
-            }
-        )
-    
-    print(times)
-    self.makeTimesTable(times)
+        self.clickPoint([54, 170, -173])
+        self.reportTiming()
 
-    self.delayDisplay("Done!")
+        times = {"point": [], "bbox": [], "scribble": [], "lasso": []}
+
+        n_repeats = 1
+        self.selectPointPromptButton()  # off
+
+        for _ in range(n_repeats):
+            self.deleteCurrentSegment()
+            self.clickNextSegmentButton()
+            self.selectPointPromptButton()  # on
+            self.resetTiming()
+            self.clickPoint([54, 170, -283])
+            server_time, test_timing = self.reportTiming()
+            
+            times["point"].append(
+                {
+                    "server_prompt_processing": server_time,
+                    "remainder": test_timing["time"] - server_time,
+                }
+            )
+
+            self.selectBBoxPromptButton()
+            self.deleteCurrentSegment()
+            self.clickNextSegmentButton()
+            self.clickPoint([-112, 195, -190])
+            
+            self.resetTiming()
+            self.clickPoint([-190, 81, -190])
+            server_time, test_timing = self.reportTiming()
+            times["bbox"].append(
+                {
+                    "server_prompt_processing": server_time,
+                    "remainder": test_timing["time"] - server_time,
+                }
+            )
+
+            self.selectScribblePromptButton()
+            self.deleteCurrentSegment()
+            self.clickNextSegmentButton()
+            
+            self.resetTiming()
+            self.dragPoints(middle=[63, 182, -190])
+
+            server_time, test_timing = self.reportTiming()
+            times["scribble"].append(
+                {
+                    "server_prompt_processing": server_time,
+                    "remainder": test_timing["time"] - server_time,
+                }
+            )
+
+            self.selectLassoPromptButton()
+            self.deleteCurrentSegment()
+            self.clickNextSegmentButton()
+            self.clickPoint([-40, 141, -174])
+            self.clickPoint([-53, 127, -174])
+            self.clickPoint([-40, 115, -174])
+            self.clickPoint([-27, 129, -174])
+            
+            self.resetTiming()
+            self.clickPoint([-40, 150, -174], button="Right")
+            
+            server_time, test_timing = self.reportTiming()
+            times["lasso"].append(
+                {
+                    "server_prompt_processing": server_time,
+                    "remainder": test_timing["time"] - server_time,
+                }
+            )
+
+        print(times)
+        self.makeTimesTable(times)
+
+        self.delayDisplay("Done!")
