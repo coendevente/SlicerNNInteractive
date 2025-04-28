@@ -1943,7 +1943,7 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
         md_txt = times_tables_df.to_markdown()
         print(md_txt)
         
-        with open(f'/Users/coendevente/projects/plain/nninteractive-slicer/timing_results/{time.time()}.txt', "w", encoding="utf-8") as f:
+        with open(f'/Users/coendevente/projects/plain/nninteractive-slicer/timing_results/{time.time()}.md', "w", encoding="utf-8") as f:
             f.write(md_txt)
                     
         import json
