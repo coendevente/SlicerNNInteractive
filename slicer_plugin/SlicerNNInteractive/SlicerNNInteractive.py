@@ -1767,26 +1767,18 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
             gui.editor_widget.updateWidgetFromMRML()
             slicer.app.processEvents()
 
-    def testPointClickAtWorld(self, use_sample_data=True):
+    def testPointClickAtWorld(self):
         from pathlib import Path
-        
-        root_path = Path("~/projects/plain/3d-slicer-uls-plugin/PlainAnnotator/PlainAnnotator/Data/Images").expanduser()
         
         images = [
             {
-                "volPath": root_path / "0_cropped_resized.nii.gz" if use_sample_data else None,
-                "name": "S",
-                "slice_offset": 0
+                "name": "S"
             },
             {
-                "volPath": root_path / "0_cropped.nii.gz" if use_sample_data else None,
-                "name": "M",
-                "slice_offset": 0
+                "name": "M"
             },
             {
-                "volPath": root_path / "0.nii.gz" if use_sample_data else None,
-                "name": "L",
-                "slice_offset": -170
+                "name": "L"
             }
         ]
         
@@ -1796,7 +1788,7 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
         }
         
         
-        n_repeats = 10
+        n_repeats = 1
         # n_repeats = 5
         for _ in range(n_repeats):
             for image in images:
@@ -1808,111 +1800,82 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
                     for node in nodes:
                         slicer.mrmlScene.RemoveNode(node)
 
-                if use_sample_data:
-                    from SampleData import SampleDataLogic
-                    sampleDataLogic = SampleDataLogic()
-                    volumeNode = sampleDataLogic.downloadMRBrainTumor2()
+                from SampleData import SampleDataLogic
+                sampleDataLogic = SampleDataLogic()
+                volumeNode = sampleDataLogic.downloadMRBrainTumor2()
+                
+                self.assertIsNotNone(volumeNode)
+                slicer.app.processEvents()
+
+                from SampleData import SampleDataLogic
+                import SimpleITK as sitk
+                import sitkUtils
+
+                sampleDataLogic = SampleDataLogic()
+                volumeNode = sampleDataLogic.downloadMRBrainTumor2()
+                self.assertIsNotNone(volumeNode)
+                slicer.app.processEvents()
+
+                if image_name in ("M", "S"):
+                    print('image_name:', image_name)
+                    factor = 2 if image_name == "M" else 4
+                    sitk_img = sitkUtils.PullVolumeFromSlicer(volumeNode)
+                    orig_spacing = sitk_img.GetSpacing()
+                    orig_size    = sitk_img.GetSize()
+                    new_spacing  = [sp * factor for sp in orig_spacing]
+                    new_size     = [int(round(sz / factor)) for sz in orig_size]
                     
-                    self.assertIsNotNone(volumeNode)
-                    slicer.app.processEvents()
-
-                    if use_sample_data:
-                        from SampleData import SampleDataLogic
-                        import SimpleITK as sitk
-                        import sitkUtils
-
-                        sampleDataLogic = SampleDataLogic()
-                        volumeNode = sampleDataLogic.downloadMRBrainTumor2()
-                        self.assertIsNotNone(volumeNode)
-                        slicer.app.processEvents()
-
-                        if image_name in ("M", "S"):
-                            print('image_name:', image_name)
-                            factor = 2 if image_name == "M" else 4
-                            sitk_img = sitkUtils.PullVolumeFromSlicer(volumeNode)
-                            orig_spacing = sitk_img.GetSpacing()
-                            orig_size    = sitk_img.GetSize()
-                            new_spacing  = [sp * factor for sp in orig_spacing]
-                            new_size     = [int(round(sz / factor)) for sz in orig_size]
-                            
-                            print('orig_size:', orig_size)
-                            print('new_size:', new_size)
-                            
-                            # resample
-                            resampler = sitk.ResampleImageFilter()
-                            resampler.SetReferenceImage(sitk_img)
-                            resampler.SetOutputSpacing(new_spacing)
-                            resampler.SetSize(new_size)
-                            resampler.SetInterpolator(sitk.sitkLinear)
-                            resampled_sitk = resampler.Execute(sitk_img)
-                            
-                            # push back into Slicer
-                            resampledNode = slicer.mrmlScene.AddNewNodeByClass(
-                                "vtkMRMLScalarVolumeNode",
-                                f"{volumeNode.GetName()}_{image_name}_res"
-                            )
-                            sitkUtils.PushVolumeToSlicer(resampled_sitk, resampledNode)
-                            volumeNode = resampledNode
-                        # keep original volumeNode if image_name == "L"
-
-                        # redisplay the chosen volume
-                        slicer.util.setSliceViewerLayers(background=volumeNode)
-
-                        # re‐attach to your module’s segment editors
-                        widget = slicer.util.getModuleGui("SlicerNNInteractive")
-                        segNode = widget.get_segmentation_node()
-                        widget.editor_widget.setSegmentationNode(segNode)
-                        widget.editor_widget.setSourceVolumeNode(volumeNode)
-                        widget.scribble_editor_widget.setMRMLSegmentEditorNode(widget.scribble_editor_node)
-                        widget.scribble_editor_widget.setSegmentationNode(widget.scribble_segment_node)
-                        widget.scribble_editor_widget.setSourceVolumeNode(volumeNode)
-                    else:
-                        volumeNode = slicer.util.loadVolume(image["volPath"])
-
-                    # switch to your module
-                    slicer.util.selectModule("SlicerNNInteractive")
-                    slicer.app.processEvents()
+                    print('orig_size:', orig_size)
+                    print('new_size:', new_size)
                     
-                    center_point = [-14, 20, 29]  # RAS
-                    bbox_points = [
-                        [7, 41, 29],
-                        [-33, 5, 29]
-                    ]
-                    scribble_middle = [-15, 23, 29]
-                    scribble_dist_fraction_h = 1 / 100
-                    lasso_points_left = [
-                        [-14, 40, 29],
-                        [5, 22, 29], 
-                        [-16, 5, 29], 
-                        [-30, 23, 29]
-                    ]
-                    lasso_points_right = [-30, 37, 29]
+                    # resample
+                    resampler = sitk.ResampleImageFilter()
+                    resampler.SetReferenceImage(sitk_img)
+                    resampler.SetOutputSpacing(new_spacing)
+                    resampler.SetSize(new_size)
+                    resampler.SetInterpolator(sitk.sitkLinear)
+                    resampled_sitk = resampler.Execute(sitk_img)
                     
-                else:
-                    volumeNode = slicer.util.loadVolume(image['volPath'])
-                    
-                    center_point = [54, 170, -173 + zres]
-                    bbox_points = [
-                        [-61, 263, -173 + zres],
-                        [134, 55, -173 + zres]
-                    ]
-                    scribble_middle = [63, 182, -190 + zres]
-                    scribble_dist_fraction_h = 1 / 10
-                    lasso_points_left = [
-                        [-62, 224, -174 + zres],
-                        [5, 260, -174 + zres],
-                        [88, 224, -174 + zres],
-                        [137, 140, -174 + zres],
-                        [105, 74, -174 + zres],
-                        [33, 71, -174 + zres],
-                        [8, 140, -174 + zres],
-                        [16, 153, -174 + zres],
-                        [4, 177, -174 + zres],
-                        [-19, 163, -174 + zres],
-                    ]
-                    lasso_points_right = [-40, 188, -174 + zres]
+                    # push back into Slicer
+                    resampledNode = slicer.mrmlScene.AddNewNodeByClass(
+                        "vtkMRMLScalarVolumeNode",
+                        f"{volumeNode.GetName()}_{image_name}_res"
+                    )
+                    sitkUtils.PushVolumeToSlicer(resampled_sitk, resampledNode)
+                    volumeNode = resampledNode
+                # keep original volumeNode if image_name == "L"
 
-                zres = image["slice_offset"]
+                # redisplay the chosen volume
+                slicer.util.setSliceViewerLayers(background=volumeNode)
+
+                # re‐attach to your module’s segment editors
+                widget = slicer.util.getModuleGui("SlicerNNInteractive")
+                segNode = widget.get_segmentation_node()
+                widget.editor_widget.setSegmentationNode(segNode)
+                widget.editor_widget.setSourceVolumeNode(volumeNode)
+                widget.scribble_editor_widget.setMRMLSegmentEditorNode(widget.scribble_editor_node)
+                widget.scribble_editor_widget.setSegmentationNode(widget.scribble_segment_node)
+                widget.scribble_editor_widget.setSourceVolumeNode(volumeNode)
+
+                # switch to your module
+                slicer.util.selectModule("SlicerNNInteractive")
+                slicer.app.processEvents()
+                
+                center_point = [-14, 20, 29]  # RAS
+                bbox_points = [
+                    [7, 41, 29],
+                    [-33, 5, 29]
+                ]
+                scribble_middle = [-15, 23, 29]
+                scribble_dist_fraction_h = 1 / 100
+                lasso_points_left = [
+                    [-14, 40, 29],
+                    [5, 22, 29], 
+                    [-16, 5, 29], 
+                    [-30, 23, 29]
+                ]
+                lasso_points_right = [-30, 37, 29]
+
                 self.assertIsNotNone(volumeNode)
 
                 slicer.app.processEvents()
@@ -2011,22 +1974,6 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
                             "remainder": full_time - server_time,
                         }
                     )
-                
-                from itertools import permutations 
-                perms = list(permutations([do_bbox, do_point, do_scribble, do_lasso]))
-                # print('perm:', perms)
-                print('len(perm):', len(perms))
-                # return
-                
-                try:
-                    from tqdm import tqdm
-                except ImportError:
-                    slicer.util.pip_install('tqdm')
-                from tqdm import tqdm
-                
-                # for perm in tqdm(perms):
-                #     for fn in perm:
-                #         fn()
                     
                 do_point()
                 do_bbox()
