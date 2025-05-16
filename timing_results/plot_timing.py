@@ -31,8 +31,7 @@ LABELS = {
 	"scribble": "Scribble",
 	"lasso":    "Lasso",
 }
-SIZES = ["S", "M", "L"]              # axial-slice depth groups
-# SIZES = ["S"]              # axial-slice depth groups
+SIZES = ["S", "M", "L"]
 COLOR_CYCLE = plt.rcParams["axes.prop_cycle"].by_key()["color"][:4]  # C0–C3
 
 
