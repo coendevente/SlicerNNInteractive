@@ -1629,26 +1629,26 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
         # self.delayDisplay(f"Clicking at widget coords ({(x_w, y_w)})")
         sliceNode.JumpSliceByCentering(worldPt[0], worldPt[1], worldPt[2])
 
-        return redView, x_w, y_w
+        return redView, x_w, y_w, w, h
 
     @record_time("clickPoint")
     def clickPoint(self, worldPt, button="Left"):
-        redView, x_w, y_w = self.get_xy_redview(worldPt)
-        slicer.util.clickAndDrag(
-            redView, start=(x_w, y_w), end=(x_w, y_w), steps=0, button=button
-        )
+        redView, x_w, y_w, w, h = self.get_xy_redview(worldPt)
+        slicer.util.clickAndDrag(redView, start=(x_w, y_w), end=(x_w, y_w), steps=0, button=button)
         slicer.app.processEvents()
 
     @record_time("dragPoints")
-    def dragPoints(self, middle):
-        redView, x_middle, y_middle = self.get_xy_redview(middle)
+    def dragPoints(self, middle, scribble_dist_fraction_h):
+        redView, x_middle, y_middle, w, h = self.get_xy_redview(middle)
 
         print("(x_middle, y_middle):", (x_middle, y_middle))
+        
+        sdf = scribble_dist_fraction_h
 
         slicer.util.clickAndDrag(
             redView,
-            start=(x_middle - 25, y_middle - 25),
-            end=(x_middle + 25, y_middle + 25),
+            start=(x_middle - int(h * sdf), y_middle - int(h * sdf)),
+            end=(x_middle + int(h * sdf), y_middle + int(h * sdf)),
             steps=2,
             button="Left",
         )
@@ -1767,28 +1767,24 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
             gui.editor_widget.updateWidgetFromMRML()
             slicer.app.processEvents()
 
-    def testPointClickAtWorld(self):
-        
-        # self.makeTimesTable({'point': [{'server_prompt_processing': 274.81770515441895, 'remainder': 1084.2270851135254}, {'server_prompt_processing': 270.0059413909912, 'remainder': 1018.8159942626953}, {'server_prompt_processing': 367.0217990875244, 'remainder': 1086.721420288086}, {'server_prompt_processing': 272.7179527282715, 'remainder': 1101.8640995025635}, {'server_prompt_processing': 293.9410209655762, 'remainder': 1003.39674949646}, {'server_prompt_processing': 342.46015548706055, 'remainder': 1086.9767665863037}, {'server_prompt_processing': 277.8630256652832, 'remainder': 1120.5148696899414}, {'server_prompt_processing': 388.9279365539551, 'remainder': 1138.554334640503}, {'server_prompt_processing': 363.4791374206543, 'remainder': 1134.6831321716309}, {'server_prompt_processing': 250.1530647277832, 'remainder': 1047.9130744934082}], 'bbox': [{'server_prompt_processing': 267.9722309112549, 'remainder': 1290.557861328125}, {'server_prompt_processing': 277.70495414733887, 'remainder': 1203.4249305725098}, {'server_prompt_processing': 264.57810401916504, 'remainder': 1206.1126232147217}, {'server_prompt_processing': 222.81908988952637, 'remainder': 1307.049036026001}, {'server_prompt_processing': 254.87494468688965, 'remainder': 1220.2939987182617}, {'server_prompt_processing': 318.51911544799805, 'remainder': 1300.35400390625}, {'server_prompt_processing': 355.1318645477295, 'remainder': 1261.366367340088}, {'server_prompt_processing': 362.22290992736816, 'remainder': 1339.8020267486572}, {'server_prompt_processing': 227.5378704071045, 'remainder': 1243.8380718231201}, {'server_prompt_processing': 232.36918449401855, 'remainder': 1364.2230033874512}], 'scribble': [{'server_prompt_processing': 115.55099487304688, 'remainder': 2936.944007873535}, {'server_prompt_processing': 125.45895576477051, 'remainder': 2896.9268798828125}, {'server_prompt_processing': 103.80268096923828, 'remainder': 2852.9422283172607}, {'server_prompt_processing': 111.67621612548828, 'remainder': 2935.222864151001}, {'server_prompt_processing': 109.13205146789551, 'remainder': 2983.234643936157}, {'server_prompt_processing': 116.23072624206543, 'remainder': 3075.700044631958}, {'server_prompt_processing': 119.88496780395508, 'remainder': 2937.4608993530273}, {'server_prompt_processing': 110.96596717834473, 'remainder': 2966.5510654449463}, {'server_prompt_processing': 109.39693450927734, 'remainder': 3133.073091506958}, {'server_prompt_processing': 101.77803039550781, 'remainder': 2975.1129150390625}], 'lasso': [{'server_prompt_processing': 298.4428405761719, 'remainder': 1350.2402305603027}, {'server_prompt_processing': 249.02105331420898, 'remainder': 1265.3090953826904}, {'server_prompt_processing': 236.29307746887207, 'remainder': 1231.6608428955078}, {'server_prompt_processing': 251.4822483062744, 'remainder': 1330.0085067749023}, {'server_prompt_processing': 317.3098564147949, 'remainder': 1347.9561805725098}, {'server_prompt_processing': 358.2158088684082, 'remainder': 1371.7823028564453}, {'server_prompt_processing': 242.71702766418457, 'remainder': 1352.2160053253174}, {'server_prompt_processing': 254.51016426086426, 'remainder': 1396.7690467834473}, {'server_prompt_processing': 342.35405921936035, 'remainder': 1369.4860935211182}, {'server_prompt_processing': 279.97398376464844, 'remainder': 1352.8289794921875}]})
-        # return
-        
+    def testPointClickAtWorld(self, use_sample_data=True):
         from pathlib import Path
         
         root_path = Path("~/projects/plain/3d-slicer-uls-plugin/PlainAnnotator/PlainAnnotator/Data/Images").expanduser()
         
         images = [
             {
-                "volPath": root_path / "0_cropped_resized.nii.gz",
+                "volPath": root_path / "0_cropped_resized.nii.gz" if use_sample_data else None,
                 "name": "S",
                 "slice_offset": 0
             },
             {
-                "volPath": root_path / "0_cropped.nii.gz",
+                "volPath": root_path / "0_cropped.nii.gz" if use_sample_data else None,
                 "name": "M",
                 "slice_offset": 0
             },
             {
-                "volPath": root_path / "0.nii.gz",
+                "volPath": root_path / "0.nii.gz" if use_sample_data else None,
                 "name": "L",
                 "slice_offset": -170
             }
@@ -1799,7 +1795,9 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
             for image in images
         }
         
+        
         n_repeats = 10
+        # n_repeats = 5
         for _ in range(n_repeats):
             for image in images:
                 image_name = image["name"]
@@ -1810,7 +1808,109 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
                     for node in nodes:
                         slicer.mrmlScene.RemoveNode(node)
 
-                volumeNode = slicer.util.loadVolume(image['volPath'])
+                if use_sample_data:
+                    from SampleData import SampleDataLogic
+                    sampleDataLogic = SampleDataLogic()
+                    volumeNode = sampleDataLogic.downloadMRBrainTumor2()
+                    
+                    self.assertIsNotNone(volumeNode)
+                    slicer.app.processEvents()
+
+                    if use_sample_data:
+                        from SampleData import SampleDataLogic
+                        import SimpleITK as sitk
+                        import sitkUtils
+
+                        sampleDataLogic = SampleDataLogic()
+                        volumeNode = sampleDataLogic.downloadMRBrainTumor2()
+                        self.assertIsNotNone(volumeNode)
+                        slicer.app.processEvents()
+
+                        if image_name in ("M", "S"):
+                            print('image_name:', image_name)
+                            factor = 2 if image_name == "M" else 4
+                            sitk_img = sitkUtils.PullVolumeFromSlicer(volumeNode)
+                            orig_spacing = sitk_img.GetSpacing()
+                            orig_size    = sitk_img.GetSize()
+                            new_spacing  = [sp * factor for sp in orig_spacing]
+                            new_size     = [int(round(sz / factor)) for sz in orig_size]
+                            
+                            print('orig_size:', orig_size)
+                            print('new_size:', new_size)
+                            
+                            # resample
+                            resampler = sitk.ResampleImageFilter()
+                            resampler.SetReferenceImage(sitk_img)
+                            resampler.SetOutputSpacing(new_spacing)
+                            resampler.SetSize(new_size)
+                            resampler.SetInterpolator(sitk.sitkLinear)
+                            resampled_sitk = resampler.Execute(sitk_img)
+                            
+                            # push back into Slicer
+                            resampledNode = slicer.mrmlScene.AddNewNodeByClass(
+                                "vtkMRMLScalarVolumeNode",
+                                f"{volumeNode.GetName()}_{image_name}_res"
+                            )
+                            sitkUtils.PushVolumeToSlicer(resampled_sitk, resampledNode)
+                            volumeNode = resampledNode
+                        # keep original volumeNode if image_name == "L"
+
+                        # redisplay the chosen volume
+                        slicer.util.setSliceViewerLayers(background=volumeNode)
+
+                        # re‐attach to your module’s segment editors
+                        widget = slicer.util.getModuleGui("SlicerNNInteractive")
+                        segNode = widget.get_segmentation_node()
+                        widget.editor_widget.setSegmentationNode(segNode)
+                        widget.editor_widget.setSourceVolumeNode(volumeNode)
+                        widget.scribble_editor_widget.setMRMLSegmentEditorNode(widget.scribble_editor_node)
+                        widget.scribble_editor_widget.setSegmentationNode(widget.scribble_segment_node)
+                        widget.scribble_editor_widget.setSourceVolumeNode(volumeNode)
+                    else:
+                        volumeNode = slicer.util.loadVolume(image["volPath"])
+
+                    # switch to your module
+                    slicer.util.selectModule("SlicerNNInteractive")
+                    slicer.app.processEvents()
+                    
+                    center_point = [-14, 20, 29]  # RAS
+                    bbox_points = [
+                        [7, 41, 29],
+                        [-33, 5, 29]
+                    ]
+                    scribble_middle = [-15, 23, 29]
+                    scribble_dist_fraction_h = 1 / 100
+                    lasso_points_left = [
+                        [-14, 40, 29],
+                        [5, 22, 29], 
+                        [-16, 5, 29], 
+                        [-30, 23, 29]
+                    ]
+                    lasso_points_right = [-30, 37, 29]
+                    
+                else:
+                    volumeNode = slicer.util.loadVolume(image['volPath'])
+                    
+                    center_point = [54, 170, -173 + zres]
+                    bbox_points = [
+                        [-61, 263, -173 + zres],
+                        [134, 55, -173 + zres]
+                    ]
+                    scribble_middle = [63, 182, -190 + zres]
+                    scribble_dist_fraction_h = 1 / 10
+                    lasso_points_left = [
+                        [-62, 224, -174 + zres],
+                        [5, 260, -174 + zres],
+                        [88, 224, -174 + zres],
+                        [137, 140, -174 + zres],
+                        [105, 74, -174 + zres],
+                        [33, 71, -174 + zres],
+                        [8, 140, -174 + zres],
+                        [16, 153, -174 + zres],
+                        [4, 177, -174 + zres],
+                        [-19, 163, -174 + zres],
+                    ]
+                    lasso_points_right = [-40, 188, -174 + zres]
 
                 zres = image["slice_offset"]
                 self.assertIsNotNone(volumeNode)
@@ -1825,112 +1925,113 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
                 # A point prompt just to trigger the uploading of the image
                 self.clickNextSegmentButton()
                 self.resetTiming()
-                self.clickPoint([54, 170, -173 + zres])
+                self.clickPoint(center_point)
                 self.reportTiming()
-
-                
 
                 self.selectPointPromptButton()  # off
                 
-                # break
+                def do_point():
+                    self.selectPointPromptButton()  # on
+                    self.deleteCurrentSegment()
+                    self.clickNextSegmentButton()
+                    
+                    self.resetTiming()
+                    # self.clickPoint([54, 170, -283])  # renal tumor
+                    self.clickPoint(center_point)  # liver
+                    server_time, widget_timings, _ = self.reportTiming()
+                    
+                    full_time = widget_timings["on_point_placed"][0]["time"]
+                    
+                    times[image_name]["point"].append(
+                        {
+                            "server_prompt_processing": server_time,
+                            "remainder": full_time - server_time,
+                        }
+                    )
+                    # self.selectPointPromptButton()  # off
+                
+                def do_bbox():
+                    self.selectBBoxPromptButton()
+                    self.deleteCurrentSegment()
+                    self.clickNextSegmentButton()
+                    
+                    # liver
+                    self.clickPoint(bbox_points[0])
+                    
+                    self.resetTiming()
+                    self.clickPoint(bbox_points[1])
+                    server_time, widget_timings, _ = self.reportTiming()
+                    
+                    full_time = widget_timings["on_bbox_placed"][0]["time"]
+                    
+                    times[image_name]["bbox"].append(
+                        {
+                            "server_prompt_processing": server_time,
+                            "remainder": full_time - server_time,
+                        }
+                    )
+                
+                def do_scribble():
+                    self.selectScribblePromptButton()
+                    self.deleteCurrentSegment()
+                    self.clickNextSegmentButton()
+                    
+                    self.resetTiming()
+                    self.dragPoints(middle=scribble_middle, scribble_dist_fraction_h=scribble_dist_fraction_h)
+
+                    server_time, widget_timings, _ = self.reportTiming()
+                    
+                    full_time = widget_timings["on_scribble_finished"][0]["time"]
+                    
+                    times[image_name]["scribble"].append(
+                        {
+                            "server_prompt_processing": server_time,
+                            "remainder": full_time - server_time,
+                        }
+                    )
+                
+                def do_lasso():
+                    self.selectLassoPromptButton()
+                    self.deleteCurrentSegment()
+                    self.clickNextSegmentButton()
+                    
+                    for p in lasso_points_left:
+                        self.clickPoint(p)
+                    
+                    self.resetTiming()
+                    self.clickPoint(lasso_points_right, button="Right")
+                    
+                    server_time, widget_timings, _ = self.reportTiming()
+                    
+                    full_time = widget_timings["submit_lasso_if_present"][0]["time"]
+                    
+                    times[image_name]["lasso"].append(
+                        {
+                            "server_prompt_processing": server_time,
+                            "remainder": full_time - server_time,
+                        }
+                    )
+                
+                from itertools import permutations 
+                perms = list(permutations([do_bbox, do_point, do_scribble, do_lasso]))
+                # print('perm:', perms)
+                print('len(perm):', len(perms))
                 # return
-
-                self.deleteCurrentSegment()
-                self.clickNextSegmentButton()
-                self.selectPointPromptButton()  # on
-                self.resetTiming()
-                # self.clickPoint([54, 170, -283])  # renal tumor
-                self.clickPoint([54, 170, -173 + zres])  # liver
-                server_time, widget_timings, _ = self.reportTiming()
                 
-                full_time = widget_timings["on_point_placed"][0]["time"]
+                try:
+                    from tqdm import tqdm
+                except ImportError:
+                    slicer.util.pip_install('tqdm')
+                from tqdm import tqdm
                 
-                times[image_name]["point"].append(
-                    {
-                        "server_prompt_processing": server_time,
-                        "remainder": full_time - server_time,
-                    }
-                )
-                # self.selectPointPromptButton()  # off
-
-                self.selectBBoxPromptButton()
-                self.deleteCurrentSegment()
-                self.clickNextSegmentButton()
-                
-                # spleen
-                # self.clickPoint([-112, 195, -190])
-                # self.clickPoint([-190, 81, -190])
-                
-                # liver
-                self.clickPoint([-61, 263, -173 + zres])       
-                
-                self.resetTiming()
-                self.clickPoint([134, 55, -173 + zres])
-                server_time, widget_timings, _ = self.reportTiming()
-                
-                full_time = widget_timings["on_bbox_placed"][0]["time"]
-                
-                times[image_name]["bbox"].append(
-                    {
-                        "server_prompt_processing": server_time,
-                        "remainder": full_time - server_time,
-                    }
-                )
-
-                self.selectScribblePromptButton()
-                self.deleteCurrentSegment()
-                self.clickNextSegmentButton()
-                
-                self.resetTiming()
-                self.dragPoints(middle=[63, 182, -190 + zres])
-
-                server_time, widget_timings, _ = self.reportTiming()
-                
-                full_time = widget_timings["on_scribble_finished"][0]["time"]
-                
-                times[image_name]["scribble"].append(
-                    {
-                        "server_prompt_processing": server_time,
-                        "remainder": full_time - server_time,
-                    }
-                )
-
-                self.selectLassoPromptButton()
-                self.deleteCurrentSegment()
-                self.clickNextSegmentButton()
-                
-                # aorta
-                # self.clickPoint([-40, 141, -174])
-                # self.clickPoint([-53, 127, -174])
-                # self.clickPoint([-40, 115, -174])
-                # self.clickPoint([-27, 129, -174])
-                # self.clickPoint([-40, 150, -174], button="Right")
-                
-                # liver
-                self.clickPoint([-62, 224, -174 + zres])
-                self.clickPoint([5, 260, -174 + zres])
-                self.clickPoint([88, 224, -174 + zres])
-                self.clickPoint([137, 140, -174 + zres])
-                self.clickPoint([105, 74, -174 + zres])
-                self.clickPoint([33, 71, -174 + zres])
-                self.clickPoint([8, 140, -174 + zres])
-                self.clickPoint([16, 153, -174 + zres])
-                self.clickPoint([4, 177, -174 + zres])
-                self.clickPoint([-19, 163, -174 + zres])
-                
-                self.resetTiming()
-                self.clickPoint([-40, 188, -174 + zres], button="Right")
-                
-                server_time, widget_timings, _ = self.reportTiming()
-                
-                full_time = widget_timings["submit_lasso_if_present"][0]["time"]
-                
-                times[image_name]["lasso"].append(
-                    {
-                        "server_prompt_processing": server_time,
-                        "remainder": full_time - server_time,
-                    }
-                )
+                # for perm in tqdm(perms):
+                #     for fn in perm:
+                #         fn()
+                    
+                do_point()
+                do_bbox()
+                do_scribble()
+                do_lasso()
 
                 print(times[image_name])
         

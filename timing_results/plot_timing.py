@@ -32,6 +32,7 @@ LABELS = {
 	"lasso":    "Lasso",
 }
 SIZES = ["S", "M", "L"]              # axial-slice depth groups
+# SIZES = ["S"]              # axial-slice depth groups
 COLOR_CYCLE = plt.rcParams["axes.prop_cycle"].by_key()["color"][:4]  # C0–C3
 
 
@@ -227,3 +228,7 @@ if __name__ == "__main__":
 #         high_compute_10_reruns.json   \
 #         low_compute_10_reruns.json    \
 #         --out figure.png
+# python plot_timing.py  \
+#         braintumor_highcomp.json    \
+#         braintumor_lowcomp.json   \
+#         --out speed_measurements.pdf
