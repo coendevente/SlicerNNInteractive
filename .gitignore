@@ -87,3 +87,5 @@ temp/
 
 log.out
 .nninteractive_weights
+
+timing_results/old

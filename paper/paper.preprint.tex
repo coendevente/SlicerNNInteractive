@@ -100,10 +100,10 @@
 \IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
 \urlstyle{same} % disable monospaced font for URLs
 \hypersetup{
-  pdftitle={nnInteractiveSlicer: A 3D Slicer extension for
+  pdftitle={SlicerNNInteractive: A 3D Slicer extension for
 nnInteractive},
-  pdfauthor={Coen de Vente, Kiran Vaidhya Venkadesh, Bram van Ginneken,
-Clara I. Sánchez},
+  pdfauthor={Coen de Vente, Kiran Vaidhya Venkadesh, Andras Lasso, Bram
+van Ginneken, Clara I. Sánchez},
   pdflang={en-US},
   colorlinks=true,
   linkcolor={Maroon},
@@ -112,7 +112,7 @@ Clara I. Sánchez},
   urlcolor={Blue},
   pdfcreator={LaTeX via pandoc}}
 
-\title{nnInteractiveSlicer: A 3D Slicer extension for nnInteractive}
+\title{SlicerNNInteractive: A 3D Slicer extension for nnInteractive}
 
 \definecolor{c53baa1}{RGB}{83,186,161}
 \definecolor{c202826}{RGB}{32,40,38}
@@ -146,6 +146,11 @@ Clara I. Sánchez},
   ]{Kiran Vaidhya Venkadesh%
     \,\orcidlink{0000-0002-4846-9049}\,%
     }
+\author[4%
+  %
+  ]{Andras Lasso%
+    \,\orcidlink{0000-0002-4220-7064}\,%
+    }
 \author[3%
   %
   ]{Bram van Ginneken%
@@ -166,37 +171,44 @@ Engineering and Physics, Amsterdam, The Netherlands%
 \affil[3]{Diagnostic Image Analysis Group (DIAG), Department of
 Radiology and Nuclear Medicine, Radboud UMC, Nijmegen, The Netherlands%
   }
+\affil[4]{Laboratory for Percutaneous Surgery, School of Computing,
+Queen's University, Kingston, Canada%
+  }
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-\date{7 April 2025}
+\date{17 May 2025}
 
 \begin{document}
 \maketitle
 
 \section{Summary}\label{summary}
 
-\texttt{nnInteractiveSlicer} integrates \texttt{nnInteractive}
+\texttt{SlicerNNInteractive} integrates \texttt{nnInteractive}
 (\citeproc{ref-isensee2025nninteractive}{Isensee et al., 2025}), a
 state-of-the-art promptable deep learning-based framework for 3D image
-segmentation, into the widely used \texttt{3D\ Slicer} platform. Our
-extension implements a client-server architecture that decouples
-computationally intensive model inference from the client-side
-interface. Therefore, \texttt{nnInteractiveSlicer} eliminates heavy
-hardware constraints on the client-side and enables better operating
-system compatibility than existing plugins for \texttt{nnInteractive}.
-Running both the client and server-side on a single machine is also
-possible, offering flexibility across different deployment scenarios.
-The extension provides an intuitive user interface with all interaction
-types available in the original framework (point, bounding box,
-scribble, and lasso prompts), while including a comprehensive set of
-keyboard shortcuts for efficient workflow.
+segmentation, into the widely used \texttt{3D\ Slicer}
+(\citeproc{ref-Kikinis2014}{Kikinis et al., 2014})
+(\url{https://slicer.org}) platform. Our extension implements a
+client-server architecture that decouples the computationally intensive
+model inference from the client-side interface. Therefore,
+\texttt{SlicerNNInteractive} eliminates heavy hardware constraints on
+the client-side and enables better operating system compatibility than
+existing plugins for \texttt{nnInteractive}. Running both the client and
+server on a single machine is also possible, offering flexibility across
+different deployment scenarios. The extension provides an intuitive user
+interface with all interaction types available in the original framework
+(point, bounding box, scribble, and lasso prompts), while including a
+comprehensive set of keyboard shortcuts for efficient workflow.
 
 \section{Statement of Need}\label{statement-of-need}
 
-Segmentation is a cornerstone of medical image analysis. Recently,
-\texttt{nnInteractive} (\citeproc{ref-isensee2025nninteractive}{Isensee
-et al., 2025}), a deep learning-based framework allowing for fast,
-promptable segmentation of 3D medical images was released and was shown
-to substantially outperform existing approaches, such as SAM2
+Segmentation is a cornerstone of medical image analysis. Manually
+acquiring segmentation labels, however, is time-consuming and expensive.
+Interactive segmentation tools can potentially accelerate this process
+and reduce costs. Recently, \texttt{nnInteractive}
+(\citeproc{ref-isensee2025nninteractive}{Isensee et al., 2025}), a deep
+learning-based framework allowing for fast, promptable segmentation of
+3D medical images was released and was shown to substantially outperform
+existing approaches, such as SAM2
 (\citeproc{ref-kirillov2023segment}{Kirillov et al., 2023}), SegVol
 (\citeproc{ref-du2024segvol}{Du et al., 2024}), and SAM-Med-3D
 (\citeproc{ref-wang2023sam}{Wang et al., 2023}). Alongside the
@@ -213,7 +225,7 @@ backend on a separate server. Moreover, \texttt{nnInteractive} only runs
 on Windows and Linux, so the image viewer cannot be run on MacOS
 machines.
 
-\texttt{nnInteractiveSlicer} decouples the computationally intensive
+\texttt{SlicerNNInteractive} decouples the computationally intensive
 \texttt{nnInteractive} inference by allowing users to configure a remote
 server (e.g., a node of a GPU cluster), while running the client on a
 machine with lower computational capabilities. This approach not only
@@ -223,7 +235,7 @@ widely available and potentially accelerating research related to
 promptable segmentation.
 
 \section{\texorpdfstring{Overview of
-\texttt{nnInteractiveSlicer}}{Overview of nnInteractiveSlicer}}\label{overview-of-nninteractiveslicer}
+\texttt{SlicerNNInteractive}}{Overview of SlicerNNInteractive}}\label{overview-of-slicernninteractive}
 
 \subsection{nnInteractive}\label{nninteractive}
 
@@ -238,31 +250,31 @@ through an nnUNet-based architecture
 encoders (\citeproc{ref-isensee2024nnu}{Isensee et al., 2024}) that
 supports diverse interation types: point, bounding box, scribble, and
 lasso prompts. Trained on over 120 diverse volumetric datasets across
-multiple modalities (CT, MRI, PET, 3D microscopy), the framework
+multiple modalities (CT, MRI, PET, 3D microscopy, etc.), the framework
 demonstrated high accuracy and versatility. Our implementation extends
 this capability to \texttt{3D\ Slicer}.
 
 \subsection{Availability and
 Installation}\label{availability-and-installation}
 
-\texttt{nnInteractiveSlicer} is available through multiple channels. The
+\texttt{SlicerNNInteractive} is available through multiple channels. The
 server-side is available through Docker Hub
 (\texttt{docker\ pull\ coendevente/nninteractive-slicer-server:latest}),
 Pip (\texttt{pip\ install\ nninteractive-slicer-server}), and GitHub
-(\url{https://github.com/coendevente/nninteractive-slicer}). The
-client-side is currently only available through our
-\href{https://github.com/coendevente/nninteractive-slicer}{GitHub
-repository}. In future versions of this extension, we plan to include it
-in the official 3D Slicer Extensions Manager.
+(\url{https://github.com/coendevente/SlicerNNInteractive}). The
+client-side is also available in the official \texttt{3D\ Slicer}
+Extensions Manager.
 
 \subsection{Client-server Setup}\label{client-server-setup}
 
-\texttt{nnInteractiveSlicer} uses a client-server setup, which decouples
+\texttt{SlicerNNInteractive} uses a client-server setup, which decouples
 the computationally intensive model inference from the
 \texttt{3D\ Slicer} client. The server-side and client-side communicate
-through FastAPI endpoints. The client maintains synchronization between
-the image and input mask in \texttt{3D\ Slicer}. An overview of the API
-is shown in \autoref{fig:api_overview}.
+through FastAPI endpoints. An overview of the API is shown in
+\autoref{fig:api_overview}. The client maintains synchronization between
+the image and input segmentation in \texttt{3D\ Slicer}. To ensure a
+smooth user experience, the client does not transfer this data each time
+before processing a prompt, but only when this data have changed.
 
 \begin{figure}
 \centering
@@ -272,7 +284,7 @@ is shown in \autoref{fig:api_overview}.
 
 \subsection{User Interface}\label{user-interface}
 
-The user interface of \texttt{nnInteractiveSlicer} largely follows the
+The user interface of \texttt{SlicerNNInteractive} largely follows the
 \texttt{nnInteractive} Napari and MITK plugins. A screenshot of the user
 interface, including segmentation results, is shown in
 \autoref{fig:screenshot}. A video showcasing the functionalities of the
@@ -282,7 +294,7 @@ extension is available
 \begin{figure}
 \centering
 \includegraphics{img/screenshot.png}
-\caption{Screenshot of the \texttt{nnInteractiveSlicer}
+\caption{Screenshot of the \texttt{SlicerNNInteractive}
 extension.\label{fig:screenshot}}
 \end{figure}
 
@@ -296,7 +308,7 @@ settings, which will be remembered in future sessions. The
 \begin{itemize}
 \item
   \textbf{Segment buttons:} The \emph{Reset segment} button removes all
-  prompts from the current segment and deletes the current segmentation
+  prompts from the current segment, and deletes the current segmentation
   on the server and client-side. The \emph{Next segment} button creates
   a new empty segment in the \emph{Segment Editor}.
 \item
@@ -315,14 +327,89 @@ settings, which will be remembered in future sessions. The
 \end{itemize}
 
 Each button in the \emph{nnInteractive Prompts} menu has an associated
-keyboard shortcut, which is indicted using the underlined letters within
-the button text.
+keyboard shortcut, which is indicated using the underlined letters
+within the button text.
 
 If a segment is selected in the \emph{Segment Editor}, prompts will
 always be applied to that segment. Every time a user has switched
 segments, the associated segmentation is uploaded to server and used as
 input mask to the \texttt{nnInteractive} model. When no segment is
 selected, a new segment is created automatically.
+
+\section{Speed Measurements}\label{speed-measurements}
+
+We measured the interaction time of \texttt{SlicerNNInteractive} for all
+interaction types, in settings with lower and higher computational
+resources. We automatically generated user interactions in
+\texttt{3D\ Slicer}, ensuring identical prompts in all computational
+settings. Each measurement was repeated 10 times, for which we report
+the mean and standard deviation. The code for these automated tests is
+available on
+\url{https://github.com/coendevente/SlicerNNInteractive/blob/add_timing_test/slicer_plugin/SlicerNNInteractive/SlicerNNInteractive.py}.
+
+For each interaction type, we generated automated prompts to segment the
+same brain tumor in the same MRI-scan. This image was
+\texttt{MRBrainTumor2} from \texttt{3D\ Slicer}'s \texttt{SampleData}
+extension. We also tested interaction speed for three different image
+sizes: \texttt{S}, \texttt{M}, and \texttt{L}. \texttt{L} was the
+original image, with a size of 256 × 256 × 130 voxels. \texttt{M} was a
+2× in each direction downsampled version of \texttt{L}, with a size of
+128 × 128 × 65 voxels. \texttt{S} was a 4× in each direction downsampled
+version of \texttt{L}, with a size of 64 × 64 × 32 voxels.
+
+The client was a 14'' MacBook Pro (2021, M1 Pro, Sonoma 14.5, 16 GB
+Memory, 8 CPU cores). In the lower computational resource experiments
+(\texttt{L}), the server was a Linux machine with an NVIDIA GeForce GTX
+1080 Ti GPU with 11 GB VRAM (Ubuntu 22.04.1, Intel® Core™ i7-6700 CPU,
+48 GB RAM). In the higher computational resource experiments
+(\texttt{H}), the server was a Linux machine with an NVIDIA GeForce RTX
+4090 GPU with 24 GB VRAM (Ubuntu 22.04.1, 13th Gen Intel® Core™
+i7-13700K CPU, 128 GB RAM).
+
+The results of these experiments are presented in
+\autoref{fig:speed_measurements}.
+
+\begin{figure}
+\centering
+\includegraphics{img/speed_measurements.pdf}
+\caption{Interaction speed measurements of \texttt{SlicerNNInteractive}.
+The images with sizes \texttt{S}, \texttt{M}, and \texttt{L} were images
+of small, medium, and large size, respectively. Computational resources
+\texttt{L} and \texttt{H} are experiments using machines with lower and
+higher computational resources, respectively. The height of each bar and
+the size of each error bar represent the mean and std. dev. of 10
+repeated measurements, respectively. The total height of each bar
+represents the total time for an interaction to be processed by our
+extension. The dashed portion of each bar represents the prompt server
+request time (including model inference, prompt upload, and mask
+download).\label{fig:speed_measurements}}
+\end{figure}
+
+\section{Future Work}\label{future-work}
+
+Despite the already high interaction speed, as quantitatively measured
+in this paper and noted by early users, our timing experiments show that
+a large portion of the total interaction time originates from
+client-side overhead -- especially for larger image sizes and better
+computational resources. This overhead is due to processes such as
+updating the visualized segmentation and checking for input changes.
+Future work may focus on reducing this overhead to further improve
+responsiveness.
+
+Currently, the server does not support multiple clients at the same
+time. \texttt{nnInteractive} releases most used VRAM instantly after
+having processed a prompt, so simultaneously running multiple servers --
+one for each individual user -- on one GPU is currently a viable
+solution in most settings. However, in future work, we would like to
+implement multi-user support through one server instance to further
+improve resource efficiency.
+
+Furthermore, for users with a sufficiently powerful local GPU, future
+versions of the plugin may support local inference directly within the
+Python environment of \texttt{3D\ Slicer}. With the upcoming release of
+Python 3.12 in \texttt{3D\ Slicer}, this functionality will become
+technically feasible. This would reduce the number of required
+installation steps even further for this group of users.
 
 \section*{References}\label{references}
 \addcontentsline{toc}{section}{References}
@@ -353,6 +440,13 @@ K., \& Jaeger, P. F. (2024). {nnU-Net} revisited: A call for rigorous
 validation in {3D} medical image segmentation. \emph{International
 Conference on Medical Image Computing and Computer-Assisted
 Intervention}, 488--498. \url{https://doi.org/10.48550/arXiv.2404.09556}
+
+\bibitem[\citeproctext]{ref-Kikinis2014}
+Kikinis, R., Pieper, S. D., \& Vosburgh, K. G. (2014). 3D slicer: A
+platform for subject-specific image analysis, visualization, and
+clinical support. In F. A. Jolesz (Ed.), \emph{Intraoperative imaging
+and image-guided therapy} (pp. 277--289). Springer New York.
+\url{https://doi.org/10.1007/978-1-4614-7657-3_19}
 
 \bibitem[\citeproctext]{ref-kirillov2023segment}
 Kirillov, A., Mintun, E., Ravi, N., Mao, H., Rolland, C., Gustafson, L.,
