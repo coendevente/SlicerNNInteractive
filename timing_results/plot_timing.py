@@ -24,7 +24,7 @@ import matplotlib as mpl
 # plt.rcParams.update({"font.size": 12})
 mpl.rcParams.update({"font.family": "Arial", "font.size": 12.9})
 MODES = ["point", "bbox", "scribble", "lasso"]
-# right after you define MODES
+
 LABELS = {
 	"point":    "Point",
 	"bbox":     "Bounding box",   # ← the wording you want
