@@ -243,9 +243,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Checks for (and installs if needed) python packages needed by the module.
         """
         dependencies = {
-            "xxhash": "xxhash==3.5.0",
             "requests_toolbelt": "requests_toolbelt==1.0.0",
-            "SimpleITK": "SimpleITK==2.3.1",
             "skimage": "scikit-image==0.22.0",
         }
 
@@ -995,7 +993,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Mark the segmentation as modified so the UI updates
         segmentationNode.Modified()
 
-        segmentationNode.GetSegmentation().CollapseBinaryLabelmaps()
+        if segmentation_mask.sum() > 0:
+            # If we do this when segmentation_mask.sum() == 0, sometimes Slicer will throw "bogus" OOM errors
+            # (see https://github.com/coendevente/SlicerNNInteractive/issues/38)
+            segmentationNode.GetSegmentation().CollapseBinaryLabelmaps()
+        
         del segmentation_mask
 
         debug_print(f"show_segmentation took {time.time() - t0}")
