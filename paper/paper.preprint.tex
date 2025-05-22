@@ -201,10 +201,15 @@ comprehensive set of keyboard shortcuts for efficient workflow.
 
 \section{Statement of Need}\label{statement-of-need}
 
-Segmentation is a cornerstone of medical image analysis. Manually
-acquiring segmentation labels, however, is time-consuming and expensive.
+Segmentation is a cornerstone of medical image analysis. Neural
+network-based segmentation models have proven to be able to successfully
+automate segmentation tasks, but training of these models require large
+amount of high-quality training data. Manually acquiring segmentation
+labels for training data, however, is time-consuming and expensive.
 Interactive segmentation tools can potentially accelerate this process
-and reduce costs. Recently, \texttt{nnInteractive}
+and reduce costs.
+
+Recently, \texttt{nnInteractive}
 (\citeproc{ref-isensee2025nninteractive}{Isensee et al., 2025}), a deep
 learning-based framework allowing for fast, promptable segmentation of
 3D medical images was released and was shown to substantially outperform
@@ -285,7 +290,9 @@ before processing a prompt, but only when this data have changed.
 \subsection{User Interface}\label{user-interface}
 
 The user interface of \texttt{SlicerNNInteractive} largely follows the
-\texttt{nnInteractive} Napari and MITK plugins. A screenshot of the user
+\texttt{nnInteractive} Napari and MITK plugins, but uses existing Slicer
+features to implement them, such as markups and segmentations for
+specifying inputs and displaying results. A screenshot of the user
 interface, including segmentation results, is shown in
 \autoref{fig:screenshot}. A video showcasing the functionalities of the
 extension is available

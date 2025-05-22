@@ -147,11 +147,14 @@ a Creative Commons Attribution 4.0 International License (CC BY
 </sec>
 <sec id="statement-of-need">
   <title>Statement of Need</title>
-  <p>Segmentation is a cornerstone of medical image analysis. Manually
-  acquiring segmentation labels, however, is time-consuming and
+  <p>Segmentation is a cornerstone of medical image analysis. Neural
+  network-based segmentation models have proven to be able to
+  successfully automate segmentation tasks, but training of these models
+  require large amount of high-quality training data. Manually acquiring
+  segmentation labels for training data, however, is time-consuming and
   expensive. Interactive segmentation tools can potentially accelerate
-  this process and reduce costs. Recently,
-  <monospace>nnInteractive</monospace>
+  this process and reduce costs.</p>
+  <p>Recently, <monospace>nnInteractive</monospace>
   (<xref alt="Isensee et al., 2025" rid="ref-isensee2025nninteractive" ref-type="bibr">Isensee
   et al., 2025</xref>), a deep learning-based framework allowing for
   fast, promptable segmentation of 3D medical images was released and
@@ -247,7 +250,9 @@ a Creative Commons Attribution 4.0 International License (CC BY
     <title>User Interface</title>
     <p>The user interface of <monospace>SlicerNNInteractive</monospace>
     largely follows the <monospace>nnInteractive</monospace> Napari and
-    MITK plugins. A screenshot of the user interface, including
+    MITK plugins, but uses existing Slicer features to implement them,
+    such as markups and segmentations for specifying inputs and
+    displaying results. A screenshot of the user interface, including
     segmentation results, is shown in
     <xref alt="[fig:screenshot]" rid="figU003Ascreenshot">[fig:screenshot]</xref>.
     A video showcasing the functionalities of the extension is available
