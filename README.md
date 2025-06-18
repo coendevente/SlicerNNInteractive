@@ -54,6 +54,7 @@ This will make the server available under port `1527` on your machine. If you wo
 ##### Option 2: Using `pip`
 
 ```
+python3 -m venv path_to_your_virtual_environment
 pip install nninteractive-slicer-server
 nninteractive-slicer-server --host 0.0.0.0 --port 1527
 ```
