@@ -53,23 +53,28 @@ This will make the server available under port `1527` on your machine. If you wo
 
 ##### Option 2: Using `pip`
 
-If setting for the first time you need to create a python virtual environment by specifying a location on your disk, and then activate that environment. On linux, you can accomplish that by these commands:
+_Step 1. Create a Python virtual environment_
 
-```
+If setting up the server for the first time, you need to create a Python virtual environment (e.g., `conda` or `venv`) by specifying a location on your disk and activating that environment. For example, on Linux, using `venv`, you can accomplish this using these commands:
+
+```bash
 python3 -m venv path_to_your_virtual_environment 
 source path_to_your_virtual_environment/bin/activate
 ```
 
-After which you can install the NNinteractive to this environment with these commands:
+_Step 2. Install the server_
 
-```
+Next, you can install the server to this environment with these commands:
+
+```bash
 pip install nninteractive-slicer-server
 nninteractive-slicer-server --host 0.0.0.0 --port 1527
 ```
 
 If you would like to use a different port, say `1627`, replace `--port 1527` with `--port 1627`.
 
-Remember you next time you need to start NNInteractive server, first activate your virtual python environment with the source command above and then just run the `nninteractive-slicer-server --host 0.0.0.0 --port 1527` to start the server. 
+> [!NOTE]  
+> Remember that you'll have to start the server again if it was stopped for some reason (e.g., after rebooting your machine). To do so, activate your virtual Python environment with the `source` command above and run the `nninteractive-slicer-server --host 0.0.0.0 --port 1527` again to start the server.
 
 > [!NOTE]  
 > When starting the server, you can ignore the message `nnUNet_raw is not defined [...] how to set this up.`. Setting up these environment variables is not necessary when using `SlicerNNInteractive`.
