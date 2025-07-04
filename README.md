@@ -55,7 +55,7 @@ This will make the server available under port `1527` on your machine. If you wo
 
 _Step 1. Create a Python virtual environment_
 
-If setting up the server for the first time, you need to create a Python virtual environment (e.g., `conda` or `venv`) by specifying a location on your disk and activating that environment. For example, on Linux, using `venv`, you can accomplish this using these commands:
+If setting up the server for the first time, you need to create a Python virtual environment (e.g., using `conda` or `venv`) by specifying a location on your disk and activating that environment. For example, on Linux, using `venv`, you can accomplish this using these commands:
 
 ```bash
 python3 -m venv path_to_your_virtual_environment 
