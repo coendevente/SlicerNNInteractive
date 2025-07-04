@@ -74,7 +74,7 @@ nninteractive-slicer-server --host 0.0.0.0 --port 1527
 If you would like to use a different port, say `1627`, replace `--port 1527` with `--port 1627`.
 
 > [!NOTE]  
-> Remember that you'll have to start the server again if it was stopped for some reason (e.g., after rebooting your machine). To do so, activate your virtual Python environment with the `source` command above and run the `nninteractive-slicer-server --host 0.0.0.0 --port 1527` again to start the server.
+> Remember that you'll have to start the server again if it was stopped for some reason (e.g., after rebooting your machine). To do so, activate your virtual Python environment with the `source` command above and run `nninteractive-slicer-server --host 0.0.0.0 --port 1527` again to start the server.
 
 > [!NOTE]  
 > When starting the server, you can ignore the message `nnUNet_raw is not defined [...] how to set this up.`. Setting up these environment variables is not necessary when using `SlicerNNInteractive`.
