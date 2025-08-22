@@ -453,6 +453,7 @@ a Creative Commons Attribution 4.0 International License (CC BY
       <article-title>Segment anything</article-title>
       <source>Proceedings of the IEEE/CVF international conference on computer vision</source>
       <year iso-8601-date="2023">2023</year>
+      <pub-id pub-id-type="doi">10.1109/ICCV51070.2023.00371</pub-id>
       <fpage>4015</fpage>
       <lpage>4026</lpage>
     </element-citation>
@@ -497,6 +498,7 @@ a Creative Commons Attribution 4.0 International License (CC BY
       <source>Advances in Neural Information Processing Systems</source>
       <year iso-8601-date="2024">2024</year>
       <volume>37</volume>
+      <pub-id pub-id-type="doi">10.48550/arXiv.2311.13385</pub-id>
       <fpage>110746</fpage>
       <lpage>110783</lpage>
     </element-citation>
@@ -611,6 +613,7 @@ a Creative Commons Attribution 4.0 International License (CC BY
       <article-title>MITK</article-title>
       <year iso-8601-date="2024-12">2024</year><month>12</month>
       <uri>https://github.com/MITK/MITK</uri>
+      <pub-id pub-id-type="doi">10.5281/zenodo.14356025</pub-id>
     </element-citation>
   </ref>
   <ref id="ref-isensee2021nnu">
