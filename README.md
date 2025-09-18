@@ -51,7 +51,15 @@ docker run --gpus all --rm -it -p 1527:1527 coendevente/nninteractive-slicer-ser
 
 This will make the server available under port `1527` on your machine. If you would like to use a different port, say `1627`, replace `-p 1527:1527` with `-p 1627:1527`.
 
-##### Option 2: Using `pip`
+##### Option 2: Using `uv`
+
+Another option is to run the server with [`uv`](https://docs.astral.sh/uv/) (see `uv` installation instructions [here](https://docs.astral.sh/uv/getting-started/installation/)):
+
+```bash
+uv run --with nninteractive-slicer-server nninteractive-slicer-server --host 0.0.0.0 --port 1527
+```
+
+##### Option 3: Using `pip`
 
 _Step 1. Create a Python virtual environment_
 
