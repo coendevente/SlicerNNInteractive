@@ -5,6 +5,7 @@ import io
 import gzip
 import hashlib
 import argparse
+import gc
 
 import numpy as np
 import torch
@@ -303,23 +304,27 @@ async def add_point_interaction(params: PointParams):
     """
     Receives a point (voxel_coord) + positive/negative. Updates the model & returns a binary mask.
     """
-    error = get_error_if_img_not_set()
-    if error is not None:
-        return error
-    
-    t = time.time()
+    try:
+        error = get_error_if_img_not_set()
+        if error is not None:
+            return error
+        
+        t = time.time()
 
-    seg_result = PROMPT_MANAGER.add_point_interaction(
-        point_coordinates=params.voxel_coord, include_interaction=params.positive_click
-    )
-    compressed_bin = segmentation_binary(seg_result, compress=True)
-    print(f"Server whole infer function time: {time.time() - t}")
+        seg_result = PROMPT_MANAGER.add_point_interaction(
+            point_coordinates=params.voxel_coord, include_interaction=params.positive_click
+        )
+        compressed_bin = segmentation_binary(seg_result, compress=True)
+        print(f"Server whole infer function time: {time.time() - t}")
 
-    return Response(
-        content=compressed_bin,
-        media_type="application/octet-stream",
-        headers={"Content-Encoding": "gzip"},
-    )
+        return Response(
+            content=compressed_bin,
+            media_type="application/octet-stream",
+            headers={"Content-Encoding": "gzip"},
+        )
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 #
@@ -336,26 +341,30 @@ async def add_bbox_interaction(params: BBoxParams):
     """
     Receives bounding box corners + positive/negative. Updates model & returns a mask.
     """
-    error = get_error_if_img_not_set()
-    if error is not None:
-        return error
-    
-    t = time.time()
+    try:
+        error = get_error_if_img_not_set()
+        if error is not None:
+            return error
+        
+        t = time.time()
 
-    seg_result = PROMPT_MANAGER.add_bbox_interaction(
-        params.outer_point_one,
-        params.outer_point_two,
-        include_interaction=params.positive_click,
-    )
+        seg_result = PROMPT_MANAGER.add_bbox_interaction(
+            params.outer_point_one,
+            params.outer_point_two,
+            include_interaction=params.positive_click,
+        )
 
-    segmentation_binary_data = segmentation_binary(seg_result, compress=True)
-    print(f"Server whole infer function time: {time.time() - t}")
+        segmentation_binary_data = segmentation_binary(seg_result, compress=True)
+        print(f"Server whole infer function time: {time.time() - t}")
 
-    return Response(
-        content=segmentation_binary_data,
-        media_type="application/octet-stream",
-        headers={"Content-Encoding": "gzip"},
-    )
+        return Response(
+            content=segmentation_binary_data,
+            media_type="application/octet-stream",
+            headers={"Content-Encoding": "gzip"},
+        )
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 #
@@ -370,26 +379,30 @@ async def add_lasso_interaction(
     """
     Receives a gzipped npy mask + positive/negative. Treated as a 'lasso' 3D mask.
     """
-    error = get_error_if_img_not_set()
-    if error is not None:
-        return error
-    
-    file_bytes = await file.read()
-    mask, positive_click_bool = process_mask_and_click_input(file_bytes, positive_click)
+    try:
+        error = get_error_if_img_not_set()
+        if error is not None:
+            return error
+        
+        file_bytes = await file.read()
+        mask, positive_click_bool = process_mask_and_click_input(file_bytes, positive_click)
 
-    # Process the lasso interaction.
-    seg_result = PROMPT_MANAGER.add_lasso_interaction(
-        mask, include_interaction=positive_click_bool
-    )
+        # Process the lasso interaction.
+        seg_result = PROMPT_MANAGER.add_lasso_interaction(
+            mask, include_interaction=positive_click_bool
+        )
 
-    # Convert the segmentation result to compressed binary data.
-    segmentation_binary_data = segmentation_binary(seg_result, compress=True)
+        # Convert the segmentation result to compressed binary data.
+        segmentation_binary_data = segmentation_binary(seg_result, compress=True)
 
-    return Response(
-        content=segmentation_binary_data,
-        media_type="application/octet-stream",
-        headers={"Content-Encoding": "gzip"},
-    )
+        return Response(
+            content=segmentation_binary_data,
+            media_type="application/octet-stream",
+            headers={"Content-Encoding": "gzip"},
+        )
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 #
@@ -402,27 +415,31 @@ async def add_scribble_interaction(
     """
     Receives a scribble mask + positive/negative. Updates model, returns updated segmentation.
     """
-    error = get_error_if_img_not_set()
-    if error is not None:
-        return error
-    
-    # Read the uploaded file bytes and decompress.
-    file_bytes = await file.read()
+    try:
+        error = get_error_if_img_not_set()
+        if error is not None:
+            return error
+        
+        # Read the uploaded file bytes and decompress.
+        file_bytes = await file.read()
 
-    mask, positive_click_bool = process_mask_and_click_input(file_bytes, positive_click)
+        mask, positive_click_bool = process_mask_and_click_input(file_bytes, positive_click)
 
-    seg_result = PROMPT_MANAGER.add_scribble_interaction(
-        mask, include_interaction=positive_click_bool
-    )
+        seg_result = PROMPT_MANAGER.add_scribble_interaction(
+            mask, include_interaction=positive_click_bool
+        )
 
-    # Convert the segmentation result to compressed binary data.
-    segmentation_binary_data = segmentation_binary(seg_result, compress=True)
+        # Convert the segmentation result to compressed binary data.
+        segmentation_binary_data = segmentation_binary(seg_result, compress=True)
 
-    return Response(
-        content=segmentation_binary_data,
-        media_type="application/octet-stream",
-        headers={"Content-Encoding": "gzip"},
-    )
+        return Response(
+            content=segmentation_binary_data,
+            media_type="application/octet-stream",
+            headers={"Content-Encoding": "gzip"},
+        )
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def main():
