@@ -17,12 +17,13 @@ RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -
 
 RUN /bin/bash -c "\
     source /opt/conda/etc/profile.d/conda.sh && \
-    conda create -y -n nnInteractive python=3.12 -c conda-forge && \
-    conda activate nnInteractive && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
+    conda create -y -n nnInteractive python=3.12 -c conda-forge --override-channels && \
     conda clean -afy \
 "
 
-RUN /opt/conda/bin/conda install pip
+RUN echo "Conda env nnInteractive created"
 
 RUN /opt/conda/envs/nnInteractive/bin/python3.12 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 
