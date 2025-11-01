@@ -40,7 +40,7 @@ The client machine _can_ be the same as the server machine.
 
 #### Server running on Linux
 
-You can install the server side of `SlicerNNInteractive` in two different ways:
+You can install the server side of `SlicerNNInteractive` in three different ways:
 
 ##### Option 1: Using Docker
 
