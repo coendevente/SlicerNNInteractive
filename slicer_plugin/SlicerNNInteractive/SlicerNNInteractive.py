@@ -1634,8 +1634,16 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
     @record_time("clickPoint")
     def clickPoint(self, worldPt, button="Left"):
         redView, x_w, y_w, w, h = self.get_xy_redview(worldPt)
-        slicer.util.clickAndDrag(redView, start=(x_w, y_w), end=(x_w, y_w), steps=0, button=button)
+        self.safeClickAndDrag(redView, start=(x_w, y_w), end=(x_w, y_w), steps=0, button=button)
         slicer.app.processEvents()
+
+    @staticmethod
+    def safeClickAndDrag(view, start, end, steps=0, button="Left"):
+        guiApp = qt.QGuiApplication.instance()
+        screen = guiApp.screens()[0]
+        ratio = screen.devicePixelRatio
+        def scale(p): return (int(p[0] * ratio), int(p[1] * ratio))
+        slicer.util.clickAndDrag(view, start=scale(start), end=scale(end), steps=steps, button=button)
 
     @record_time("dragPoints")
     def dragPoints(self, middle, scribble_dist_fraction_h):
@@ -1645,7 +1653,7 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
         
         sdf = scribble_dist_fraction_h
 
-        slicer.util.clickAndDrag(
+        self.safeClickAndDrag(
             redView,
             start=(x_middle - int(h * sdf), y_middle - int(h * sdf)),
             end=(x_middle + int(h * sdf), y_middle + int(h * sdf)),
@@ -1788,8 +1796,7 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
         }
         
         
-        n_repeats = 1
-        # n_repeats = 5
+        n_repeats = 10
         for _ in range(n_repeats):
             for image in images:
                 image_name = image["name"]
