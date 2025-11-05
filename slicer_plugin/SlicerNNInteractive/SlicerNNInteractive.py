@@ -1698,7 +1698,7 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
     def makeTimesTable(self, times):
         """
         Produces a markdown table with cells formatted as:
-        Total ± sigma_total (Server ± sigma_server), in seconds.
+        Total \pm sigma_total (Server \pm sigma_server), in seconds.
         """
         try:
             import pandas as pd
@@ -1745,8 +1745,8 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
 
             # Format string
             cell = (
-                f"{total_mean:.1f} s ± {total_std:.2f} s "
-                f"({server_mean:.1f} s ± {server_std:.2f} s)"
+                f"{total_mean:.1f} s \pm {total_std:.2f} s "
+                f"({server_mean:.1f} s \pm {server_std:.2f} s)"
             )
             table_data[col_name] = [cell]
 
@@ -1761,7 +1761,7 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
         Remove the segment that is currently selected in the SlicerNNInteractive widget.
         """
         time.sleep(0.2)
-        # Grab the module’s GUI/widget instance
+        # Grab the module's GUI/widget instance
         gui = slicer.util.getModuleGui("SlicerNNInteractive")
         # Ask the widget for its current segmentation node and selected segment ID
         segmentation_node, segment_id = (
@@ -1855,7 +1855,7 @@ class SlicerNNInteractiveTest(ScriptedLoadableModuleTest):
                 # redisplay the chosen volume
                 slicer.util.setSliceViewerLayers(background=volumeNode)
 
-                # re‐attach to your module’s segment editors
+                # re-attach to your module's segment editors
                 widget = slicer.util.getModuleGui("SlicerNNInteractive")
                 segNode = widget.get_segmentation_node()
                 widget.editor_widget.setSegmentationNode(segNode)
