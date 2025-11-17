@@ -21,6 +21,10 @@ include(${Slicer_USE_FILE})
 add_subdirectory(SlicerNNInteractive)
 ## NEXT_MODULE
 
+if(BUILD_TESTING)
+  add_subdirectory(SlicerNNInteractive/Testing)
+endif()
+
 #-----------------------------------------------------------------------------
 include(${Slicer_EXTENSION_GENERATE_CONFIG})
 include(${Slicer_EXTENSION_CPACK})

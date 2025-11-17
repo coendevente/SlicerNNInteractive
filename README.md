@@ -22,6 +22,7 @@ https://github.com/user-attachments/assets/c9f9ee0a-f74d-4907-aa21-484dcfd10948
 ](#editing-an-existing-segment)
   - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Common issues](#common-issues)
+- [Testing](#testing)
 - [Contributing](#contributing)
 - [Citation](#citation)
 - [License](#license)
@@ -159,6 +160,17 @@ Each button in the Interactive Prompts tab has a keyboard shortcut, indicated by
 ## Common issues
 
 - When resetting the server, the Slicer extension sometimes fails silently. Reloading the plugin or restarting Slicer often helps.
+
+## Testing
+
+`SlicerNNInteractiveSegmentationTest` is a set of regression tests that validates the output of the `SlicerNNInteractive` extension against a running nnInteractive server. It verifies for every interaction type whether it is correctly processed by the server and produces repeatable segmentations on the public MRBrainTumor2 volume from the `Sample Data` extension.
+
+How to run the test from Slicer:
+1. Start the nnInteractive server and note its URL/port.
+2. Launch Slicer, (optionally) load the `SlicerNNInteractive` module via the Extension Wizard, and configure the module with the server URL (under the `Configuration` tab).
+3. Open the `Self Tests` module, pick `SlicerNNInteractive`, and click `Reload and Test` (or use the toolbar’s `Reload and Test` button in the module itself). Slicer will re-import the module, execute the scripted prompts, and a "All SlicerNNInteractive segmentation tests passed" message will be in the Python Console if everything matches the stored references.
+
+Reference outputs are stored at `slicer_plugin/SlicerNNInteractive/Testing/Data/` (compressed NIfTI files). When running these tests, you do not have to regenerate these. If, for any reason you would still like to do so, set `SLICER_NNI_GENERATE_TEST_MASK=1` before launching Slicer (or uncomment the line `self.generate_mode = True` in `SlicerNNInteractiveSegmentationTest.setUp`), run the test once, manually review the newly written masks, then rerun without the variable so the test compares against the frozen references.
 
 ## Contributing
 Read more on how to contribute to this repository [here](CONTRIBUTING.md), while taking into account the [code of conduct](CODE_OF_CONDUCT.md).
