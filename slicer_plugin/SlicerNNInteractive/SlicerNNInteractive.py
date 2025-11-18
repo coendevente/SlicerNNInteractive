@@ -262,6 +262,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         dependencies = {
             "requests_toolbelt": "requests_toolbelt",
             "skimage": "scikit-image",
+            "matplotlib": "matplotlib",
         }
 
         for dependency in dependencies:
