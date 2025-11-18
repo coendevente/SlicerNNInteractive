@@ -163,7 +163,7 @@ Each button in the Interactive Prompts tab has a keyboard shortcut, indicated by
 
 ## Testing
 
-`SlicerNNInteractiveSegmentationTest` is a set of regression tests that validates the output of the `SlicerNNInteractive` extension against a running nnInteractive server. It verifies for every interaction type whether it is correctly processed by the server and produces repeatable segmentations on the public MRBrainTumor2 volume from the `Sample Data` extension.
+`SlicerNNInteractiveSegmentationTest` is a set of regression tests that verifies the output of `SlicerNNInteractive`. For every interaction type, it processes a set of test cases through the extension – which requires a running server – and compares the resulting segmentations against reference segementations. All tests use the publicly available `MRBrainTumor2` volume from the `Sample Data` extension.
 
 How to run the test from Slicer:
 1. Start the nnInteractive server and note its URL/port.
