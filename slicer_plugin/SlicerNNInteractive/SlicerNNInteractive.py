@@ -1468,3 +1468,24 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.on_prompt_type_negative_clicked()
         else:
             self.on_prompt_type_positive_clicked()
+
+
+###############################################################################
+# Test hook (used by Reload & Test)
+###############################################################################
+_test_module_path = (
+    Path(__file__).resolve().parents[0]
+    / "Testing"
+    / "Python"
+    / "SlicerNNInteractiveSegmentationTest.py"
+)
+
+if _test_module_path.exists():
+    import importlib.util as _importlib_util
+
+    _spec = _importlib_util.spec_from_file_location(
+        "SlicerNNInteractiveSegmentationTest", str(_test_module_path)
+    )
+    _test_module = _importlib_util.module_from_spec(_spec)
+    _spec.loader.exec_module(_test_module)
+    SlicerNNInteractiveTest = _test_module.SlicerNNInteractiveSegmentationTest
