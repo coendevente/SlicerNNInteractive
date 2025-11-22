@@ -1,6 +1,6 @@
-FROM nvidia/cuda:12.1.0-devel-ubuntu20.04
+FROM ubuntu:20.04
 
-RUN apt-get update && apt-get install -y wget
+RUN apt-get update && apt-get install -y wget python3.12 python3.12-pip
 
 RUN useradd -m user 
 
@@ -25,7 +25,7 @@ RUN /bin/bash -c "\
 
 RUN echo "Conda env nnInteractive created"
 
-RUN /opt/conda/envs/nnInteractive/bin/python3.12 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+RUN /opt/conda/envs/nnInteractive/bin/python3.12 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 WORKDIR /opt/server
 
