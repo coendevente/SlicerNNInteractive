@@ -1,7 +1,7 @@
 nninteractive==1.0.1
 fastapi==0.111.0
 numpy==2.2.3
-torch==2.6.0
+torch>=2.9.0
 Pillow==11.1.0
 transformers==4.49.0
 xxhash==3.5.0
