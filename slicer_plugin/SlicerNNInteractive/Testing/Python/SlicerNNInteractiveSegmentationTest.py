@@ -4,7 +4,6 @@ from pathlib import Path
 import numpy as np
 import SimpleITK as sitk
 import slicer
-from matplotlib.path import Path as MplPath
 from SampleData import SampleDataLogic
 from slicer.ScriptedLoadableModule import *
 
@@ -179,7 +178,13 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                     self._store_reference_mask(prompt_name, mask)
                 else:
                     reference_mask = self._load_reference_mask(prompt_name)
-                    self._verify_mask(reference_mask, mask, prompt_name)
+                    self._verify_mask(
+                        reference_mask,
+                        mask,
+                        prompt_name,
+                        sequence,
+                        volume_node.GetName() if volume_node else "UnknownVolume",
+                    )
         finally:
             self.tearDown()
 
@@ -205,7 +210,30 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         image_data = slicer.util.arrayFromVolume(volume_node).copy()
         widget.previous_states["image_data"] = image_data
         widget.previous_states["segment_data"] = np.zeros_like(image_data, dtype=np.uint8)
+        self._ensure_server_is_ready(widget)
+        self._upload_volume_before_tests(widget)
         return widget
+
+    def _ensure_server_is_ready(self, widget):
+        server_override = os.environ.get("SLICER_NNI_TEST_SERVER_URL", "").strip()
+        if server_override:
+            widget.server = server_override.rstrip("/")
+            widget.ui.Server.setText(widget.server)
+        if not getattr(widget, "server", ""):
+            self.fail(
+                "Server URL not configured. Set it in the Slicer settings or define "
+                "SLICER_NNI_TEST_SERVER_URL before running tests."
+            )
+
+    def _upload_volume_before_tests(self, widget):
+        # Uploading the current image to the nnInteractive server avoids requests failing
+        # with "No image uploaded" during the scripted prompts.
+        result = widget.upload_image_to_server()
+        if result is None:
+            self.fail(
+                "Failed to upload the volume to the nnInteractive server. "
+                "Verify the server is running and reachable."
+            )
 
     def _trigger_point_prompt(self, widget, ijk, positive=True):
         dims = widget.get_image_data().shape  # (k, j, i)
@@ -370,6 +398,8 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             processed_points.append(processed)
 
         polygon = np.vstack(processed_points)
+        
+        from matplotlib.path import Path as MplPath
         path = MplPath(polygon)
 
         grid_primary = np.arange(dims[coord_axes[0]])
@@ -424,13 +454,59 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         image = sitk.ReadImage(str(path))
         return sitk.GetArrayFromImage(image).astype(np.uint8)
 
-    def _verify_mask(self, reference_mask, result_mask, prompt_name):
-        self.assertEqual(reference_mask.shape, result_mask.shape)
-        self.assertGreater(result_mask.sum(), 0)
-        self.assertTrue(
-            np.array_equal(reference_mask, result_mask),
-            msg=f"Segmentation mismatch for prompt '{prompt_name}'.",
+    def _verify_mask(self, reference_mask, result_mask, prompt_name, prompt_sequence, volume_name):
+        context = (
+            f"prompt '{prompt_name}' "
+            f"[{self._describe_prompt_sequence(prompt_sequence)}] "
+            f"on volume '{volume_name}'"
         )
+        try:
+            self.assertEqual(reference_mask.shape, result_mask.shape)
+            self.assertGreater(result_mask.sum(), 0)
+            self.assertTrue(
+                np.array_equal(reference_mask, result_mask),
+                msg=f"Segmentation mismatch for prompt '{prompt_name}'.",
+            )
+        except AssertionError:
+            print(f"[FAIL] {context}")
+            raise
+        print(f"[PASS] {context}")
+
+    def _describe_prompt_sequence(self, prompt_sequence):
+        if not prompt_sequence:
+            return "no interactions"
+
+        def as_list(value):
+            if isinstance(value, np.ndarray):
+                return value.astype(float).tolist()
+            if isinstance(value, (list, tuple)):
+                return list(value)
+            return [value]
+
+        descriptions = []
+        for interaction in prompt_sequence:
+            kind = interaction.get("kind", "unknown")
+            positive = interaction.get("positive")
+            sign = ""
+            if positive is not None:
+                sign = "positive" if positive else "negative"
+            extra = ""
+            if kind == "point":
+                coords = as_list(interaction.get("coords", []))
+                extra = f"coords={coords}"
+            elif kind == "bbox":
+                p1 = as_list(interaction.get("point_one", []))
+                p2 = as_list(interaction.get("point_two", []))
+                extra = f"p1={p1}, p2={p2}"
+            elif kind in ("scribble", "lasso"):
+                plane = interaction.get("plane", "?")
+                slice_index = interaction.get("slice", "?")
+                count = len(interaction.get("points", []))
+                extra = f"{plane} slice={slice_index}, points={count}"
+            descriptions.append(
+                f"{kind} {sign}".strip() + (f" ({extra})" if extra else "")
+            )
+        return "; ".join(descriptions)
 
 
 SlicerNNInteractiveTest = SlicerNNInteractiveSegmentationTest
