@@ -195,6 +195,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.server = savedServer.rstrip("/")
 
         self.ui.Server.editingFinished.connect(self.update_server)
+        self.ui.pbTestServer.clicked.connect(self.test_server_connection)
 
         # Set initial prompt type
         self.current_prompt_type_positive = True
@@ -1112,6 +1113,61 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         settings = qt.QSettings()
         settings.setValue("SlicerNNInteractive/server", self.server)
         debug_print(f"Server URL updated and saved: {self.server}")
+
+    def test_server_connection(self):
+        """
+        Sends a lightweight GET request to see if the configured server responds.
+        """
+        server_text = self.ui.Server.text
+        if not server_text.strip():
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Test Connection",
+                "Please enter a server URL before testing the connection.",
+            )
+            return
+
+        self.ui.Server.setText(server_text.strip())
+        self.update_server()
+        server_url = self.server
+
+        if getattr(self, "_test_server_in_progress", False):
+            return
+        self._test_server_in_progress = True
+
+        slicer.util.showStatusMessage("Testing nnInteractive server connection...", 2000)
+        slicer.app.processEvents()
+
+        response = None
+        error_message = None
+        try:
+            response = requests.get(server_url, timeout=5)
+        except requests.exceptions.MissingSchema:
+            error_message = (
+                "Server URL is invalid. Make sure it starts with 'http://' or 'https://'."
+            )
+        except requests.exceptions.RequestException as exc:
+            error_message = str(exc)
+        finally:
+            self._test_server_in_progress = False
+            slicer.util.showStatusMessage("")
+
+        if response is not None:
+            info_message = (
+                f"Server at '{server_url}' is reachable."
+            )
+            QMessageBox.information(
+                slicer.util.mainWindow(),
+                "Test Connection",
+                info_message,
+            )
+            return
+        else:
+            QMessageBox.critical(
+                slicer.util.mainWindow(),
+                "Test Connection",
+                f"Failed to reach '{server_url}'.\n\n{error_message}",
+            )
 
     def request_to_server(self, *args, **kwargs):
         """
