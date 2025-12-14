@@ -330,6 +330,22 @@
           </widget>
          </item>
          <item>
+          <widget class="QPushButton" name="pbTestServer">
+           <property name="minimumSize">
+            <size>
+             <width>0</width>
+             <height>30</height>
+            </size>
+           </property>
+           <property name="toolTip">
+            <string>Test if the the server is reachable.</string>
+           </property>
+           <property name="text">
+            <string>Test Connection</string>
+           </property>
+          </widget>
+         </item>
+         <item>
           <spacer name="verticalSpacer">
            <property name="orientation">
             <enum>Qt::Vertical</enum>
