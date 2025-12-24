@@ -404,9 +404,7 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         sitk.WriteImage(image, str(path), useCompression=True)
 
     def _reference_path(self, prompt_name):
-        print("Reference path for prompt:", prompt_name)
         out = self.data_dir / f"MRBrainTumor2_point_prompt_{prompt_name}.nii.gz"
-        print(" -> ", out)
         return out
 
     def _store_reference_mask(self, prompt_name, mask):
@@ -458,7 +456,7 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             return dice
         
         dice = get_dice()
-        print('dice score:', dice)
+        print(f'Dice score {prompt_name}: {dice:.4f}')
         
         dice_threshold = 0.99
         self.assertGreaterEqual(
