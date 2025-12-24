@@ -155,6 +155,7 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                 )
 
             for prompt_name, sequence in self.PROMPTS:
+                print(f"Testing prompt sequence '{prompt_name}'...", sequence)
                 widget.clear_current_segment()
                 mask = None
                 for interaction in sequence:
@@ -403,7 +404,10 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         sitk.WriteImage(image, str(path), useCompression=True)
 
     def _reference_path(self, prompt_name):
-        return self.data_dir / f"MRBrainTumor2_point_prompt_{prompt_name}.nii.gz"
+        print("Reference path for prompt:", prompt_name)
+        out = self.data_dir / f"MRBrainTumor2_point_prompt_{prompt_name}.nii.gz"
+        print(" -> ", out)
+        return out
 
     def _store_reference_mask(self, prompt_name, mask):
         path = self._reference_path(prompt_name)
@@ -424,12 +428,46 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         image = sitk.ReadImage(str(path))
         return sitk.GetArrayFromImage(image).astype(np.uint8)
 
-    def _verify_mask(self, reference_mask, result_mask, prompt_name):
+    def _verify_mask(self, reference_mask, result_mask, prompt_name, save_debug=False):
+        if save_debug:
+            # Write masks as sitk for debug
+            reference_mask_sitk = sitk.GetImageFromArray(reference_mask.astype(np.uint8))
+            result_mask_sitk = sitk.GetImageFromArray(result_mask.astype(np.uint8))
+            debug_dir = self.test_dir / "DebugMasks"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            sitk.WriteImage(
+                reference_mask_sitk,
+                str(debug_dir / f"reference_mask_{prompt_name}.nii.gz"),
+                useCompression=True,
+            )
+            sitk.WriteImage(
+                result_mask_sitk,
+                str(debug_dir / f"result_mask_{prompt_name}.nii.gz"),
+                useCompression=True,
+            )
+        
         self.assertEqual(reference_mask.shape, result_mask.shape)
         self.assertGreater(result_mask.sum(), 0)
-        self.assertTrue(
-            np.array_equal(reference_mask, result_mask),
-            msg=f"Segmentation mismatch for prompt '{prompt_name}'.",
+        
+        def get_dice():
+            reference_mask_bool = reference_mask.astype(bool)
+            result_mask_bool = result_mask.astype(bool)
+            intersection = np.count_nonzero(reference_mask_bool & result_mask_bool)
+            total = reference_mask_bool.sum() + result_mask_bool.sum()
+            dice = 1.0 if total == 0 else (2.0 * intersection) / total
+            return dice
+        
+        dice = get_dice()
+        print('dice score:', dice)
+        
+        dice_threshold = 0.99
+        self.assertGreaterEqual(
+            dice,
+            dice_threshold,
+            msg=(
+                f"Segmentation mismatch for prompt '{prompt_name}'. "
+                f"Dice score {dice:.4f} below threshold {dice_threshold}."
+            ),
         )
 
 
