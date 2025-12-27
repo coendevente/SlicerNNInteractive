@@ -139,14 +139,26 @@ class PromptManager:
     def make_session(self):
         """
         Creates an nnInteractiveInferenceSession, points it at the downloaded model.
+        Automatically detect the best available device (MPS > CUDA > CPU).
         """
+        # Automatically detect the best available device
+        if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            device = torch.device("mps")
+            print("Using MPS (Metal Performance Shaders) device for inference")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda:0")
+            print("Using CUDA device for inference")
+        else:
+            device = torch.device("cpu")
+            print("Using CPU device for inference")
+
         session = nnInteractiveInferenceSession(
-            device=torch.device("cuda:0"),  # Set inference device
+            device=device,  # Set inference device automatically
             use_torch_compile=False,  # Experimental: Not tested yet
             verbose=True,
             torch_n_threads=os.cpu_count(),  # Use available CPU cores
             do_autozoom=True,  # Enables AutoZoom for better patching
-            use_pinned_memory=True,  # Optimizes GPU memory transfers
+            use_pinned_memory=(device.type == 'cuda'),  # Only use pinned memory for CUDA
         )
 
         # Load the trained model
