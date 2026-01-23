@@ -134,13 +134,32 @@ git push origin test-v0.2.1-beta1
 
 #### Testing the Published Packages:
 
+**Using pip:**
 ```bash
-# Test PyPI package
+# Install test package
 pip install --index-url https://test.pypi.org/simple/ \
             --extra-index-url https://pypi.org/simple/ \
             nninteractive-slicer-server==0.2.1-beta1
 
-# Test Docker image
+# Run the server
+nninteractive-slicer-server --host 0.0.0.0 --port 1527
+```
+
+**Using uv (recommended):**
+```bash
+# Run directly without installing
+uv run --index-url https://test.pypi.org/simple/ \
+       --extra-index-url https://pypi.org/simple/ \
+       --index-strategy unsafe-best-match \
+       --with nninteractive-slicer-server==0.2.1-beta1 \
+       nninteractive-slicer-server --host 0.0.0.0 --port 1527
+```
+
+**Note:** The `--index-strategy unsafe-best-match` flag is required when the package exists on both PyPI and TestPyPI. Without it, `uv` will only check the first index where it finds the package name (PyPI), and won't see the newer test version on TestPyPI.
+
+**Using Docker:**
+```bash
+# Pull and run test Docker image
 docker pull coendevente/nninteractive:test-0.2.1-beta1
 docker run coendevente/nninteractive:test-0.2.1-beta1
 ```
@@ -194,12 +213,23 @@ docker run coendevente/nninteractive:test-0.2.1-beta1
    - Creates GitHub release
 
 6. **Verify the release:**
-   ```bash
-   # Check PyPI
-   pip install nninteractive-slicer-server==0.2.1
 
-   # Check Docker Hub
+   **Using pip:**
+   ```bash
+   pip install nninteractive-slicer-server==0.2.1
+   nninteractive-slicer-server --host 0.0.0.0 --port 1527
+   ```
+
+   **Using uv (recommended):**
+   ```bash
+   uv run --with nninteractive-slicer-server==0.2.1 nninteractive-slicer-server --host 0.0.0.0 --port 1527
+   ```
+
+   **Using Docker:**
+   ```bash
    docker pull coendevente/nninteractive:0.2.1
+   # Or use :latest tag
+   docker pull coendevente/nninteractive:latest
    ```
 
 ## 🎯 Common Workflows

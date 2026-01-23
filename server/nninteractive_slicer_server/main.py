@@ -426,6 +426,8 @@ async def add_scribble_interaction(
 
 
 def main():
+    print(f"torch.__version__: {torch.__version__}")
+
     parser = argparse.ArgumentParser(description="Run the nnInteractive Slicer server.")
     parser.add_argument("--host", default="0.0.0.0", help="Host interface to bind to.")
     parser.add_argument("--port", type=int, default=1527, help="Port to listen on.")
@@ -435,5 +437,4 @@ def main():
 
 
 if __name__ == "__main__":
-    print(f"torch.__version__: {torch.__version__}")
     main()

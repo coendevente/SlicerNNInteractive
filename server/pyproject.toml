@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nninteractive-slicer-server"
-version = "0.1.3-alpha1"
+version = "0.3.0-alpha1"
 description = "Server package for nnInteractive Slicer"
 readme = "README.md"
 license = {text = "Apache License (2.0)"}
