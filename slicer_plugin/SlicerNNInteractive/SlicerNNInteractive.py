@@ -179,14 +179,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.all_prompt_buttons = {}
         self.setup_prompts()
 
-        self.init_ui_functionality()
-
-        _ = self.get_current_segment_id()
-        self.previous_states = {}
         self.max_history_depth = 2
         self._is_replaying_history = False
         self._active_request_count = 0
         self._history_state = None
+
+        self.init_ui_functionality()
+
+        _ = self.get_current_segment_id()
+        self.previous_states = {}
         self.reset_prompt_history()
 
     def init_ui_functionality(self):
@@ -200,7 +201,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.Server.text = savedServer
         self.server = savedServer.rstrip("/")
 
+        settings = qt.QSettings()
+        saved_history_depth = settings.value(
+            "SlicerNNInteractive/maxHistoryDepth", self.max_history_depth
+        )
+        self.set_max_history_depth(saved_history_depth, update_widget=False)
+        self.ui.sbHistoryDepth.value = self.max_history_depth
+
         self.ui.Server.editingFinished.connect(self.update_server)
+        self.ui.sbHistoryDepth.valueChanged.connect(self.on_history_depth_changed)
         self.ui.pbTestServer.clicked.connect(self.test_server_connection)
 
         # Set initial prompt type
@@ -638,6 +647,32 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._history_state["past"].clear()
         self._history_state["future"].clear()
 
+    def set_max_history_depth(self, max_history_depth, update_widget=True):
+        max_history_depth = max(1, int(max_history_depth))
+        self.max_history_depth = max_history_depth
+
+        if update_widget and hasattr(self, "ui") and hasattr(self.ui, "sbHistoryDepth"):
+            blocker = qt.QSignalBlocker(self.ui.sbHistoryDepth)
+            self.ui.sbHistoryDepth.value = self.max_history_depth
+            del blocker
+
+        if self._history_state is None:
+            return
+
+        while len(self._history_state["past"]) > self.max_history_depth:
+            dropped_entry = self._history_state["past"].popleft()
+            self._history_state["base_mask"] = np.array(
+                dropped_entry["mask"], dtype=np.uint8, copy=True
+            )
+
+        while len(self._history_state["future"]) > self.max_history_depth:
+            self._history_state["future"].pop()
+
+    def on_history_depth_changed(self, value):
+        self.set_max_history_depth(value, update_widget=False)
+        settings = qt.QSettings()
+        settings.setValue("SlicerNNInteractive/maxHistoryDepth", self.max_history_depth)
+
     def build_history_payload(self, **kwargs):
         payload = {}
         for key, value in kwargs.items():
@@ -711,6 +746,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 sync=False,
                 record_history=False,
             )
+        elif prompt_type == "clear":
+            # "Clear" is a no-op during replay because show_segmentation is called on masks
+            pass
         else:
             raise ValueError(f"Unknown prompt type '{prompt_type}' in history replay.")
 
@@ -1232,10 +1270,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         if selected_segment_id:
             debug_print(f"Clearing segment: {selected_segment_id}")
-            self.reset_prompt_history()
-            self.show_segmentation(
-                np.zeros(self.get_image_data().shape, dtype=np.uint8)
+            # Record the clear action in history before resetting prompt history or clearing
+            empty_mask = np.zeros(self.get_image_data().shape, dtype=np.uint8)
+            self.record_history_entry(
+                prompt_type="clear",
+                positive_click=True,
+                payload={},
+                segmentation_mask=empty_mask
             )
+            self.show_segmentation(empty_mask)
             self.setup_prompts()
             self.upload_segment_to_server()
         else:

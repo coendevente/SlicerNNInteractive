@@ -326,6 +326,33 @@
               </item>
              </layout>
             </item>
+                        <item>
+                         <layout class="QHBoxLayout" name="horizontalLayout_historyDepth">
+                            <item>
+                             <widget class="QLabel" name="labelHistoryDepth">
+                                <property name="text">
+                                 <string>Undo history steps:</string>
+                                </property>
+                             </widget>
+                            </item>
+                            <item>
+                             <widget class="QSpinBox" name="sbHistoryDepth">
+                                <property name="toolTip">
+                                 <string>Maximum number of plugin prompt states kept for Ctrl+Z / Ctrl+Y.</string>
+                                </property>
+                                <property name="minimum">
+                                 <number>1</number>
+                                </property>
+                                <property name="maximum">
+                                 <number>100</number>
+                                </property>
+                                <property name="value">
+                                 <number>2</number>
+                                </property>
+                             </widget>
+                            </item>
+                         </layout>
+                        </item>
            </layout>
           </widget>
          </item>
