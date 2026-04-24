@@ -1192,7 +1192,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             return
 
-        mask = slicer.util.arrayFromSegmentBinaryLabelmap(
+        mask = self.get_segment_mask_or_empty(
             self.scribble_segment_node, label_name, self.get_volume_node()
         )
 
@@ -1271,7 +1271,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if selected_segment_id:
             debug_print(f"Clearing segment: {selected_segment_id}")
             # Record the clear action in history before resetting prompt history or clearing
-            empty_mask = np.zeros(self.get_image_data().shape, dtype=np.uint8)
+            empty_mask = self.get_empty_mask()
             self.record_history_entry(
                 prompt_type="clear",
                 positive_click=True,
@@ -1372,6 +1372,39 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         return self.ui.editor_widget.mrmlSegmentEditorNode().GetSelectedSegmentID()
 
+    def get_empty_mask(self):
+        image_data = self.get_image_data()
+        if image_data is None:
+            return np.zeros((0,), dtype=np.uint8)
+
+        return np.zeros(image_data.shape, dtype=np.uint8)
+
+    def get_segment_mask_or_empty(self, segmentation_node, segment_id, volume_node=None):
+        if segmentation_node is None or not segment_id:
+            return self.get_empty_mask()
+
+        segment = segmentation_node.GetSegmentation().GetSegment(segment_id)
+        if segment is None:
+            return self.get_empty_mask()
+
+        if volume_node is None:
+            volume_node = self.get_volume_node()
+
+        try:
+            mask = slicer.util.arrayFromSegmentBinaryLabelmap(
+                segmentation_node, segment_id, volume_node
+            )
+        except Exception as exc:
+            debug_print(
+                f"Falling back to empty mask for segment '{segment_id}': {exc}"
+            )
+            return self.get_empty_mask()
+
+        if mask is None:
+            return self.get_empty_mask()
+
+        return np.array(mask, dtype=np.uint8, copy=True)
+
     def get_segment_data(self):
         """
         Gets the labelmap array (binary) of the currently selected segment.
@@ -1380,7 +1413,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.get_selected_segmentation_node_and_segment_id()
         )
 
-        mask = slicer.util.arrayFromSegmentBinaryLabelmap(
+        mask = self.get_segment_mask_or_empty(
             segmentation_node, selected_segment_id, self.get_volume_node()
         )
         seg_data_bool = mask.astype(bool)
