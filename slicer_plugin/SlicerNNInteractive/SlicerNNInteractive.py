@@ -800,6 +800,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     self.scribble_segment_node.RemoveObserver(tag)
                 del self._scribble_labelmap_callback_tag
 
+            self._cleanup_scribble_view_observers()
             return
 
         segment_id = "fg" if self.is_positive else "bg"
@@ -818,9 +819,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         paint_effect = self.scribble_editor_widget.activeEffect()
         if paint_effect:
-            paint_effect.setParameter("BrushUseAbsoluteSize", "0")  # Use relative mode
+            # preferred_scribble_thickness from 
+            # https://huggingface.co/nnInteractive/nnInteractive/blob/main/nnInteractive_v1.0/inference_session_class.json
+            paint_effect.setParameter("BrushUseAbsoluteSize", "1")
             paint_effect.setParameter("BrushSphere", "0")  # 2D brush
-            paint_effect.setParameter("BrushRelativeDiameter", ".75")
+            paint_effect.setParameter(
+                "BrushAbsoluteDiameter",
+                str(self._compute_scribble_brush_mm("Red")),
+            )
+            self._setup_scribble_view_observers()
             self._scribble_labelmap_callback_tag = {
                 "tag": self.scribble_segment_node.AddObserver(
                     vtk.vtkCommand.AnyEvent, self.on_scribble_finished
@@ -828,6 +835,57 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "label_name": segment_id,
             }
         debug_print(f"Scribble mode (hidden editor) activated on '{segment_id}'")
+
+    def _compute_scribble_brush_mm(self, view_name):
+        """Brush diameter in mm so the scribble is preferred_scribble_thickness 
+        voxels in in-plane axis of the given slice view."""
+        preferred_scribble_thickness = 2
+        volume_node = self.get_volume_node()
+        if not volume_node:
+            return preferred_scribble_thickness
+        spacing = volume_node.GetSpacing()  # (x, y, z) in mm
+        in_plane_axes = {
+            "Red": (0, 1),     # Axial
+            "Yellow": (1, 2),  # Sagittal
+            "Green": (0, 2),   # Coronal
+        }.get(view_name)
+        if in_plane_axes is None:
+            return preferred_scribble_thickness * min(spacing)
+        return preferred_scribble_thickness * max(
+            spacing[in_plane_axes[0]], spacing[in_plane_axes[1]]
+        )
+
+    def _on_scribble_view_entered(self, view_name):
+        if not self.scribble_editor_widget:
+            return
+        paint_effect = self.scribble_editor_widget.activeEffect()
+        if not paint_effect or paint_effect.name != "Paint":
+            return
+        paint_effect.setParameter(
+            "BrushAbsoluteDiameter", str(self._compute_scribble_brush_mm(view_name))
+        )
+
+    def _setup_scribble_view_observers(self):
+        self._cleanup_scribble_view_observers()
+        self._scribble_view_observer_tags = []
+        layout_manager = slicer.app.layoutManager()
+        for view_name in ("Red", "Yellow", "Green"):
+            slice_widget = layout_manager.sliceWidget(view_name)
+            if slice_widget is None:
+                continue
+            interactor = slice_widget.sliceView().interactor()
+            tag = interactor.AddObserver(
+                "EnterEvent",
+                lambda caller, event, vn=view_name: self._on_scribble_view_entered(vn),
+            )
+            self._scribble_view_observer_tags.append((interactor, tag))
+
+    def _cleanup_scribble_view_observers(self):
+        if not hasattr(self, "_scribble_view_observer_tags"):
+            return
+        for interactor, tag in self._scribble_view_observer_tags:
+            interactor.RemoveObserver(tag)
+        del self._scribble_view_observer_tags
 
     #
     #  -- Lasso/scribble
