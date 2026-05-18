@@ -141,7 +141,7 @@ class PromptManager:
         Creates an nnInteractiveInferenceSession, points it at the downloaded model.
         """
         session = nnInteractiveInferenceSession(
-            device=torch.device("cuda:0"),  # Set inference device
+            device=torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu"),  # Set inference device
             use_torch_compile=False,  # Experimental: Not tested yet
             verbose=True,
             torch_n_threads=os.cpu_count(),  # Use available CPU cores
