@@ -33,6 +33,25 @@ DOWNLOAD_DIR = ".nninteractive_weights"  # Specify the download directory
 
 app = FastAPI()
 
+
+def get_inference_device():
+    """
+    Select the inference device. Set NNI_DEVICE=cpu or NNI_DEVICE=cuda:0 to
+    override the default auto-detection.
+    """
+    requested_device = os.environ.get("NNI_DEVICE")
+    if requested_device:
+        return torch.device(requested_device)
+
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+
+    warnings.warn(
+        "CUDA is not available; starting nnInteractive on CPU. "
+        "Inference will be much slower than GPU mode."
+    )
+    return torch.device("cpu")
+
 ###############################################################################
 # Utility / helper functions
 ###############################################################################
@@ -140,13 +159,14 @@ class PromptManager:
         """
         Creates an nnInteractiveInferenceSession, points it at the downloaded model.
         """
+        device = get_inference_device()
         session = nnInteractiveInferenceSession(
-            device=torch.device("cuda:0"),  # Set inference device
+            device=device,  # Set inference device
             use_torch_compile=False,  # Experimental: Not tested yet
             verbose=True,
             torch_n_threads=os.cpu_count(),  # Use available CPU cores
             do_autozoom=True,  # Enables AutoZoom for better patching
-            use_pinned_memory=True,  # Optimizes GPU memory transfers
+            use_pinned_memory=device.type == "cuda",  # Optimizes GPU memory transfers
         )
 
         # Load the trained model
