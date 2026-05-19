@@ -184,6 +184,8 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                         mask,
                         prompt_name
                     )
+
+            self._test_selection_operations(widget)
         finally:
             self.tearDown()
 
@@ -502,6 +504,101 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             print(f"[FAIL] {prompt_name}")
             raise
         print(f"[PASS] {prompt_name}")
+
+    def _test_selection_operations(self, widget):
+        """
+        Verifies the Selection Operations (boolean editing) feature: the pure
+        compute_boolean_mask helper and the on_apply_selection_op_clicked path.
+        """
+        print("Testing selection (boolean) operations...")
+
+        # --- Pure logic: compute_boolean_mask (no MRML scene needed) ---
+        target = np.zeros((4, 4, 4), dtype=np.uint8)
+        target[1:3, 1:3, 1:3] = 1
+        operand = np.zeros((4, 4, 4), dtype=np.uint8)
+        operand[2:4, 2:4, 2:4] = 1
+        target_bool = target.astype(bool)
+        operand_bool = operand.astype(bool)
+
+        add = widget.compute_boolean_mask(target, operand, 0)
+        self.assertTrue(np.array_equal(add.astype(bool), target_bool | operand_bool))
+        subtract = widget.compute_boolean_mask(target, operand, 1)
+        self.assertTrue(
+            np.array_equal(subtract.astype(bool), target_bool & ~operand_bool)
+        )
+        intersect = widget.compute_boolean_mask(target, operand, 2)
+        self.assertTrue(
+            np.array_equal(intersect.astype(bool), target_bool & operand_bool)
+        )
+
+        with self.assertRaises(ValueError):
+            widget.compute_boolean_mask(target, np.zeros((2, 2, 2), dtype=np.uint8), 0)
+        with self.assertRaises(ValueError):
+            widget.compute_boolean_mask(target, operand, 99)
+
+        # --- Integration: on_apply_selection_op_clicked ---
+        dims = widget.get_image_data().shape  # (z, y, x)
+        segmentation_node, _ = widget.get_selected_segmentation_node_and_segment_id()
+        segmentation = segmentation_node.GetSegmentation()
+
+        mask_a = np.zeros(dims, dtype=np.uint8)
+        mask_a[10:30, 10:30, 10:30] = 1
+        mask_b = np.zeros(dims, dtype=np.uint8)
+        mask_b[20:40, 20:40, 20:40] = 1
+        mask_a_bool = mask_a.astype(bool)
+        mask_b_bool = mask_b.astype(bool)
+
+        seg_a_id = segmentation.AddEmptySegment("SelOpA", "SelOpA")
+        seg_b_id = segmentation.AddEmptySegment("SelOpB", "SelOpB")
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            mask_b, segmentation_node, seg_b_id, widget.get_volume_node()
+        )
+
+        widget.segment_editor_node.SetSelectedSegmentID(seg_a_id)
+        widget.populate_operand_selector()
+        operand_ids = [item_id for item_id, _ in widget.get_operand_segment_ids()]
+        self.assertNotIn(seg_a_id, operand_ids)
+        self.assertIn(seg_b_id, operand_ids)
+
+        def select_operand(segment_id):
+            combo = widget.ui.cbSelectionOperand
+            for i in range(combo.count):
+                if combo.itemData(i) == segment_id:
+                    combo.setCurrentIndex(i)
+                    return
+            self.fail("Operand segment not found in the selector.")
+
+        expected = {
+            0: mask_a_bool | mask_b_bool,
+            1: mask_a_bool & ~mask_b_bool,
+            2: mask_a_bool & mask_b_bool,
+        }
+        for operation, expected_mask in expected.items():
+            # Reset target A to its known content before each operation.
+            widget.segment_editor_node.SetSelectedSegmentID(seg_a_id)
+            slicer.util.updateSegmentBinaryLabelmapFromArray(
+                mask_a, segmentation_node, seg_a_id, widget.get_volume_node()
+            )
+            widget.previous_states["segment_data"] = mask_a_bool
+            select_operand(seg_b_id)
+            widget.ui.cbSelectionOperation.setCurrentIndex(operation)
+            widget.on_apply_selection_op_clicked()
+            slicer.app.processEvents()
+            result = widget.get_segment_data().astype(bool)
+            self.assertTrue(
+                np.array_equal(result, expected_mask),
+                msg=f"Boolean operation {operation} produced an unexpected mask.",
+            )
+
+        # The Apply path auto-syncs; confirm an explicit sync also succeeds.
+        self.assertIsNotNone(
+            widget.upload_segment_to_server(),
+            msg="upload_segment_to_server should succeed against a running server.",
+        )
+
+        segmentation.RemoveSegment(seg_a_id)
+        segmentation.RemoveSegment(seg_b_id)
+        print("[PASS] selection operations")
 
     def _describe_prompt_sequence(self, prompt_sequence):
         if not prompt_sequence:

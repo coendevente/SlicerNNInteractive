@@ -70,6 +70,22 @@
               </property>
              </widget>
             </item>
+            <item>
+             <widget class="QPushButton" name="pbSyncToServer">
+              <property name="minimumSize">
+               <size>
+                <width>0</width>
+                <height>30</height>
+               </size>
+              </property>
+              <property name="toolTip">
+               <string>Push the current segment's mask to the nnInteractive server.</string>
+              </property>
+              <property name="text">
+               <string>&amp;Sync to server</string>
+              </property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>
@@ -268,6 +284,82 @@
                </layout>
               </item>
              </layout>
+            </item>
+           </layout>
+          </widget>
+         </item>
+         <item>
+          <widget class="QGroupBox" name="selectionOpsGroup">
+           <property name="title">
+            <string>Selection Operations:</string>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_selops">
+            <item>
+             <layout class="QHBoxLayout" name="horizontalLayout_selops_op">
+              <item>
+               <widget class="QLabel" name="lblSelectionOp">
+                <property name="text">
+                 <string>Operation:</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QComboBox" name="cbSelectionOperation">
+                <property name="toolTip">
+                 <string>Boolean operation between the current segment and the operand segment.</string>
+                </property>
+                <item>
+                 <property name="text">
+                  <string>Add (S OR M)</string>
+                 </property>
+                </item>
+                <item>
+                 <property name="text">
+                  <string>Subtract (S AND NOT M)</string>
+                 </property>
+                </item>
+                <item>
+                 <property name="text">
+                  <string>Intersect (S AND M)</string>
+                 </property>
+                </item>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="horizontalLayout_selops_operand">
+              <item>
+               <widget class="QLabel" name="lblSelectionOperand">
+                <property name="text">
+                 <string>Operand segment:</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QComboBox" name="cbSelectionOperand">
+                <property name="toolTip">
+                 <string>Another segment to combine with the current segment.</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <widget class="QPushButton" name="pbApplySelectionOp">
+              <property name="minimumSize">
+               <size>
+                <width>0</width>
+                <height>30</height>
+               </size>
+              </property>
+              <property name="toolTip">
+               <string>Apply the boolean operation to the current segment and sync to server.</string>
+              </property>
+              <property name="text">
+               <string>&amp;Apply Operation</string>
+              </property>
+             </widget>
             </item>
            </layout>
           </widget>

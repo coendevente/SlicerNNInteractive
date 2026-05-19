@@ -219,8 +219,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self.ui.pbInteractionLassoCancel.clicked.connect(self.on_lasso_cancel_clicked)
 
-        self.addObserver(slicer.app.applicationLogic().GetInteractionNode(), 
+        self.addObserver(slicer.app.applicationLogic().GetInteractionNode(),
             slicer.vtkMRMLInteractionNode.InteractionModeChangedEvent, self.on_interaction_node_modified)
+
+        # Selection operations (boolean editing) and manual server sync
+        self.ui.pbSyncToServer.clicked.connect(self.on_sync_to_server_clicked)
+        self.ui.pbApplySelectionOp.clicked.connect(self.on_apply_selection_op_clicked)
+        self.populate_operand_selector()
+        self._install_selection_op_observers()
 
     def setup_shortcuts(self):
         """
@@ -1100,6 +1106,247 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         debug_print(f"selected_segment_changed: {selected_segment_changed}")
 
         return selected_segment_changed
+
+    ###############################################################################
+    # Selection operations (boolean editing)
+    ###############################################################################
+
+    def get_operand_segment_ids(self):
+        """
+        Returns a list of (segment_id, segment_name) for every segment in the
+        active segmentation node except the current target segment.
+        """
+        result = []
+        segmentation_node = self.get_segmentation_node()
+        if segmentation_node is None:
+            return result
+
+        target_id = self.get_current_segment_id()
+        segmentation = segmentation_node.GetSegmentation()
+        for segment_id in segmentation.GetSegmentIDs():
+            if segment_id == target_id:
+                continue
+            segment = segmentation.GetSegment(segment_id)
+            name = segment.GetName() if segment else segment_id
+            result.append((segment_id, name))
+
+        return result
+
+    def populate_operand_selector(self):
+        """
+        Refreshes the operand segment combo box. The stable segment ID is stored
+        as item data so renames do not break the current selection.
+        """
+        combo = self.ui.cbSelectionOperand
+        previous_id = combo.currentData if combo.count > 0 else None
+
+        combo.blockSignals(True)
+        combo.clear()
+        for segment_id, name in self.get_operand_segment_ids():
+            combo.addItem(name, segment_id)
+
+        if previous_id is not None:
+            for i in range(combo.count):
+                if combo.itemData(i) == previous_id:
+                    combo.setCurrentIndex(i)
+                    break
+        combo.blockSignals(False)
+
+        has_operand = combo.count > 0
+        self.ui.cbSelectionOperand.setEnabled(has_operand)
+        self.ui.pbApplySelectionOp.setEnabled(has_operand)
+
+    def segment_id_to_mask(self, segment_id):
+        """
+        Returns the binary (bool) mask of an arbitrary segment, sampled on the
+        current volume geometry so it is shape-aligned with the target segment.
+        """
+        segmentation_node = self.get_segmentation_node()
+        mask = slicer.util.arrayFromSegmentBinaryLabelmap(
+            segmentation_node, segment_id, self.get_volume_node()
+        )
+        if mask is None:
+            return np.zeros(self.get_image_data().shape, dtype=bool)
+        return mask.astype(bool)
+
+    @staticmethod
+    def compute_boolean_mask(target_mask, operand_mask, operation):
+        """
+        Pure set-algebra helper. `operation` is 0=Add, 1=Subtract, 2=Intersect.
+        Returns a uint8 mask. Raises ValueError on shape mismatch or bad operation.
+        """
+        target_mask = target_mask.astype(bool)
+        operand_mask = operand_mask.astype(bool)
+
+        if target_mask.shape != operand_mask.shape:
+            raise ValueError(
+                "Target and operand masks have different shapes: "
+                f"{target_mask.shape} vs {operand_mask.shape}."
+            )
+
+        if operation == 0:  # Add: S OR M
+            result_mask = target_mask | operand_mask
+        elif operation == 1:  # Subtract: S AND NOT M
+            result_mask = target_mask & ~operand_mask
+        elif operation == 2:  # Intersect: S AND M
+            result_mask = target_mask & operand_mask
+        else:
+            raise ValueError(f"Unknown operation index: {operation}")
+
+        return result_mask.astype(np.uint8)
+
+    def apply_boolean_operation(self, operand_mask, operation):
+        """
+        Computes a boolean set operation between the current segment and the
+        operand mask. Does not write back or upload.
+        """
+        return self.compute_boolean_mask(
+            self.get_segment_data(), operand_mask, operation
+        )
+
+    def on_apply_selection_op_clicked(self, checked=False):
+        """
+        Applies the selected boolean operation to the current segment, writes the
+        result back, and syncs it to the server.
+        """
+        self.populate_operand_selector()
+
+        target_id = self.get_current_segment_id()
+        if not target_id:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Selection Operations",
+                "Please select a target segment first.",
+            )
+            return
+
+        operand_id = self.ui.cbSelectionOperand.currentData
+        if not operand_id:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Selection Operations",
+                "No operand segment is available. Add another segment first.",
+            )
+            return
+
+        if operand_id == target_id:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Selection Operations",
+                "The operand segment must be different from the target segment.",
+            )
+            return
+
+        operand_mask = self.segment_id_to_mask(operand_id)
+        if operand_mask.sum() == 0:
+            slicer.util.showStatusMessage(
+                "Operand segment is empty; the operation may have no effect.", 3000
+            )
+
+        operation = self.ui.cbSelectionOperation.currentIndex
+        try:
+            result_mask = self.apply_boolean_operation(operand_mask, operation)
+        except ValueError as e:
+            QMessageBox.critical(
+                slicer.util.mainWindow(),
+                "Selection Operations",
+                f"Could not apply the operation:\n\n{e}",
+            )
+            return
+
+        self.show_segmentation(result_mask)
+        self.setup_prompts()
+
+        sync_result = self.upload_segment_to_server()
+        if sync_result is None:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Selection Operations",
+                "The operation was applied locally, but syncing to the server "
+                "failed. You can retry with the 'Sync to server' button.",
+            )
+        else:
+            slicer.util.showStatusMessage(
+                "Selection operation applied and synced to server.", 3000
+            )
+
+    def on_sync_to_server_clicked(self, checked=False):
+        """
+        Pushes the current segment's mask to the server. Useful after editing the
+        segment with native Segment Editor effects.
+        """
+        result = self.upload_segment_to_server()
+        if result is None:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Sync to server",
+                "Failed to sync the current segment to the server. Please check "
+                "the server connection in the 'Configuration' tab.",
+            )
+            return
+
+        # Keep previous_states in sync so the next prompt's @ensure_synched does
+        # not re-upload the identical mask.
+        self.previous_states["segment_data"] = self.get_segment_data()
+        slicer.util.showStatusMessage("Current segment synced to server.", 3000)
+
+    def _install_selection_op_observers(self):
+        """
+        Observes segmentation and segment-editor changes so the operand selector
+        stays up to date. Registration is idempotent.
+        """
+        if not self.hasObserver(
+            self.segment_editor_node,
+            vtk.vtkCommand.ModifiedEvent,
+            self.on_segment_editor_node_modified,
+        ):
+            self.addObserver(
+                self.segment_editor_node,
+                vtk.vtkCommand.ModifiedEvent,
+                self.on_segment_editor_node_modified,
+            )
+
+        self._observe_active_segmentation()
+
+    def _observe_active_segmentation(self):
+        """
+        (Re)attaches observers on the active segmentation so adding, removing or
+        renaming segments refreshes the operand selector.
+        """
+        segmentation_node = self.get_segmentation_node()
+        if segmentation_node is None:
+            return
+
+        segmentation = segmentation_node.GetSegmentation()
+        previous = getattr(self, "_observed_segmentation", None)
+        if previous is segmentation:
+            return
+
+        events = (
+            slicer.vtkSegmentation.SegmentAdded,
+            slicer.vtkSegmentation.SegmentRemoved,
+            slicer.vtkSegmentation.SegmentModified,
+        )
+        if previous is not None:
+            for event in events:
+                if self.hasObserver(previous, event, self.on_segmentation_modified):
+                    self.removeObserver(
+                        previous, event, self.on_segmentation_modified
+                    )
+
+        for event in events:
+            self.addObserver(segmentation, event, self.on_segmentation_modified)
+
+        self._observed_segmentation = segmentation
+
+    def on_segmentation_modified(self, caller, event):
+        """Refresh the operand selector when segments are added/removed/renamed."""
+        self.populate_operand_selector()
+
+    def on_segment_editor_node_modified(self, caller, event):
+        """Refresh observers and operand list when the node/segment selection changes."""
+        self._observe_active_segmentation()
+        self.populate_operand_selector()
 
     ###############################################################################
     # Server communication and sync functions
