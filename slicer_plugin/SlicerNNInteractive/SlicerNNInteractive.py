@@ -1407,15 +1407,138 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def roi_node_to_mask(self, roi_node):
         """
-        Rasterizes a vtkMRMLMarkupsROINode into a bool numpy mask aligned to the
-        current volume. First version: uses the ROI's world AABB. Axis-aligned
-        ROIs are exact; rotated ROIs are processed by their world AABB and so
-        will slightly over-include.
+        Rasterize a vtkMRMLMarkupsROINode into a bool numpy mask by testing
+        each candidate voxel inside the ROI's local (OBB) frame. This handles
+        obliquely-acquired volumes and rotated ROIs correctly (an earlier
+        world-AABB approach over-included voxels heavily for oblique scans).
+        The candidate IJK box is first restricted by the ROI's world AABB
+        (clamped to the volume) so iteration stays bounded.
         """
-        bounds = [0.0] * 6
-        roi_node.GetBounds(bounds)
+        # --- Production geometry fetch ---
+        radius = [0.0, 0.0, 0.0]
+        roi_node.GetRadiusXYZ(radius)
+        rx, ry, rz = radius
+        volume = self.get_volume_node()
         shape = self.get_image_data().shape
-        return self._aabb_to_voxel_box(bounds, self.ras_to_xyz, shape)
+        mask = np.zeros(shape, dtype=bool)
+        if min(rx, ry, rz) <= 0.0 or volume is None:
+            return mask
+
+        world_bounds = [0.0] * 6
+        roi_node.GetRASBounds(world_bounds)
+        xmin, xmax, ymin, ymax, zmin, zmax = world_bounds
+        corners_ras = [
+            (xmin, ymin, zmin), (xmax, ymin, zmin),
+            (xmin, ymax, zmin), (xmax, ymax, zmin),
+            (xmin, ymin, zmax), (xmax, ymin, zmax),
+            (xmin, ymax, zmax), (xmax, ymax, zmax),
+        ]
+        corners_ijk = [self.ras_to_xyz(list(c)) for c in corners_ras]
+        ijk_arr = np.array(corners_ijk)
+        i_lo_raw = int(ijk_arr[:, 0].min())
+        i_hi_raw = int(ijk_arr[:, 0].max())
+        j_lo_raw = int(ijk_arr[:, 1].min())
+        j_hi_raw = int(ijk_arr[:, 1].max())
+        k_lo_raw = int(ijk_arr[:, 2].min())
+        k_hi_raw = int(ijk_arr[:, 2].max())
+        i_lo_c = max(0, i_lo_raw)
+        i_hi_c = min(shape[2] - 1, i_hi_raw)
+        j_lo_c = max(0, j_lo_raw)
+        j_hi_c = min(shape[1] - 1, j_hi_raw)
+        k_lo_c = max(0, k_lo_raw)
+        k_hi_c = min(shape[0] - 1, k_hi_raw)
+
+        # vtkMRMLMarkupsROINode.GetObjectToWorldMatrix() is a 0-arg accessor
+        # in this Slicer's PythonQt binding, returning the vtkMatrix4x4 directly
+        # -- not the out-parameter style used by vtkMRMLScalarVolumeNode below.
+        object_to_world_vtk = roi_node.GetObjectToWorldMatrix()
+        ijk_to_ras_vtk = vtk.vtkMatrix4x4()
+        volume.GetIJKToRASMatrix(ijk_to_ras_vtk)
+
+        def _m_to_np(m):
+            return np.array(
+                [[m.GetElement(r, c) for c in range(4)] for r in range(4)]
+            )
+
+        ijk_to_object = (
+            np.linalg.inv(_m_to_np(object_to_world_vtk))
+            @ _m_to_np(ijk_to_ras_vtk)
+        )
+
+        # --- TEMP DIAGNOSTICS (remove once verified) ---
+        center = [0.0, 0.0, 0.0]
+        roi_node.GetCenter(center)
+        local_bounds = [0.0] * 6
+        roi_node.GetBounds(local_bounds)
+        print("[SelectionOps] roi_node_to_mask diagnostics:")
+        print(f"  ROI: name={roi_node.GetName()} id={roi_node.GetID()}")
+        print(f"  ROI center (RAS): {center}")
+        print(f"  ROI radius:       {radius}")
+        print(f"  GetBounds (local? old code): {local_bounds}")
+        print(f"  GetRASBounds (world, used): {world_bounds}")
+        print(
+            f"  Volume: name={volume.GetName()}"
+            f" shape(z,y,x)={shape}"
+        )
+        print(f"  Volume spacing:    {tuple(volume.GetSpacing())}")
+        print(f"  Volume origin:     {tuple(volume.GetOrigin())}")
+        vrb = [0.0] * 6
+        volume.GetRASBounds(vrb)
+        print(f"  Volume RAS bounds: {vrb}")
+        print("  Volume IJK->RAS matrix:")
+        for row in range(4):
+            print(
+                "    [{:.4f}, {:.4f}, {:.4f}, {:.4f}]".format(
+                    ijk_to_ras_vtk.GetElement(row, 0),
+                    ijk_to_ras_vtk.GetElement(row, 1),
+                    ijk_to_ras_vtk.GetElement(row, 2),
+                    ijk_to_ras_vtk.GetElement(row, 3),
+                )
+            )
+        print(f"  ROI center IJK:    {self.ras_to_xyz(list(center))}")
+        print(f"  8 RAS corners: {corners_ras}")
+        print(f"  8 IJK corners: {corners_ijk}")
+        print(
+            f"  Raw IJK box:     i=[{i_lo_raw},{i_hi_raw}] "
+            f"j=[{j_lo_raw},{j_hi_raw}] k=[{k_lo_raw},{k_hi_raw}]"
+        )
+        print(
+            f"  Clamped IJK box: i=[{i_lo_c},{i_hi_c}] "
+            f"j=[{j_lo_c},{j_hi_c}] k=[{k_lo_c},{k_hi_c}]"
+        )
+        seg_node = self.get_segmentation_node()
+        print(
+            f"  Segmentation node: name={seg_node.GetName() if seg_node else None}"
+            f" id={seg_node.GetID() if seg_node else None}"
+        )
+        # --- END TEMP DIAGNOSTICS ---
+
+        if i_hi_c < i_lo_c or j_hi_c < j_lo_c or k_hi_c < k_lo_c:
+            print("  Resulting mask voxel count: 0")
+            return mask
+
+        # Exact OBB containment in ROI-local space. Vectorized over the
+        # candidate IJK box.
+        ii, jj, kk = np.meshgrid(
+            np.arange(i_lo_c, i_hi_c + 1, dtype=np.float64),
+            np.arange(j_lo_c, j_hi_c + 1, dtype=np.float64),
+            np.arange(k_lo_c, k_hi_c + 1, dtype=np.float64),
+            indexing="ij",
+        )
+        M = ijk_to_object
+        x = M[0, 0] * ii + M[0, 1] * jj + M[0, 2] * kk + M[0, 3]
+        y = M[1, 0] * ii + M[1, 1] * jj + M[1, 2] * kk + M[1, 3]
+        z = M[2, 0] * ii + M[2, 1] * jj + M[2, 2] * kk + M[2, 3]
+        inside = (np.abs(x) <= rx) & (np.abs(y) <= ry) & (np.abs(z) <= rz)
+        if inside.any():
+            mask[
+                kk[inside].astype(np.int64),
+                jj[inside].astype(np.int64),
+                ii[inside].astype(np.int64),
+            ] = True
+
+        print(f"  Resulting mask voxel count: {int(mask.sum())}")
+        return mask
 
     def _is_selection_roi_valid(self):
         """True iff the operation ROI node still exists in the MRML scene."""
