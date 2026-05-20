@@ -328,22 +328,114 @@
              </layout>
             </item>
             <item>
-             <layout class="QHBoxLayout" name="horizontalLayout_selops_operand">
+             <layout class="QHBoxLayout" name="horizontalLayout_selops_source">
               <item>
-               <widget class="QLabel" name="lblSelectionOperand">
+               <widget class="QLabel" name="lblOperandSource">
                 <property name="text">
-                 <string>Operand segment:</string>
+                 <string>Operand source:</string>
                 </property>
                </widget>
               </item>
               <item>
-               <widget class="QComboBox" name="cbSelectionOperand">
+               <widget class="QComboBox" name="cbOperandSource">
                 <property name="toolTip">
-                 <string>Another segment to combine with the current segment.</string>
+                 <string>Where the operand mask comes from.</string>
                 </property>
+                <item>
+                 <property name="text">
+                  <string>Segment</string>
+                 </property>
+                </item>
+                <item>
+                 <property name="text">
+                  <string>ROI box</string>
+                 </property>
+                </item>
                </widget>
               </item>
              </layout>
+            </item>
+            <item>
+             <widget class="QWidget" name="operandSegmentContainer" native="true">
+              <layout class="QHBoxLayout" name="horizontalLayout_selops_operand">
+               <property name="leftMargin">
+                <number>0</number>
+               </property>
+               <property name="topMargin">
+                <number>0</number>
+               </property>
+               <property name="rightMargin">
+                <number>0</number>
+               </property>
+               <property name="bottomMargin">
+                <number>0</number>
+               </property>
+               <item>
+                <widget class="QLabel" name="lblSelectionOperand">
+                 <property name="text">
+                  <string>Operand segment:</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QComboBox" name="cbSelectionOperand">
+                 <property name="toolTip">
+                  <string>Another segment to combine with the current segment.</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item>
+             <widget class="QWidget" name="operandRoiContainer" native="true">
+              <layout class="QHBoxLayout" name="horizontalLayout_selops_roi">
+               <property name="leftMargin">
+                <number>0</number>
+               </property>
+               <property name="topMargin">
+                <number>0</number>
+               </property>
+               <property name="rightMargin">
+                <number>0</number>
+               </property>
+               <property name="bottomMargin">
+                <number>0</number>
+               </property>
+               <item>
+                <widget class="QPushButton" name="pbPlaceRoi">
+                 <property name="minimumSize">
+                  <size>
+                   <width>0</width>
+                   <height>30</height>
+                  </size>
+                 </property>
+                 <property name="toolTip">
+                  <string>Create or show the operation ROI in the 3D view; drag its handles to position it.</string>
+                 </property>
+                 <property name="text">
+                  <string>Place / Show ROI</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QPushButton" name="pbClearRoi">
+                 <property name="minimumSize">
+                  <size>
+                   <width>0</width>
+                   <height>30</height>
+                  </size>
+                 </property>
+                 <property name="toolTip">
+                  <string>Remove the operation ROI from the scene.</string>
+                 </property>
+                 <property name="text">
+                  <string>Clear ROI</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </widget>
             </item>
             <item>
              <widget class="QPushButton" name="pbApplySelectionOp">

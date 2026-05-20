@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import SimpleITK as sitk
 import slicer
+import vtk
 from SampleData import SampleDataLogic
 from slicer.ScriptedLoadableModule import *
 
@@ -568,6 +569,7 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                     return
             self.fail("Operand segment not found in the selector.")
 
+        widget.ui.cbOperandSource.setCurrentIndex(0)
         expected = {
             0: mask_a_bool | mask_b_bool,
             1: mask_a_bool & ~mask_b_bool,
@@ -595,6 +597,81 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             widget.upload_segment_to_server(),
             msg="upload_segment_to_server should succeed against a running server.",
         )
+
+        # --- ROI operand integration ---
+        widget.ui.cbOperandSource.setCurrentIndex(1)
+        widget.on_place_roi_clicked()
+        roi_node = widget._sel_op_roi_node
+        self.assertIsNotNone(roi_node)
+
+        # Drive the ROI to a known IJK voxel box by converting box corners
+        # through the volume's IJKToRAS matrix.
+        volume_node = widget.get_volume_node()
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        volume_node.GetIJKToRASMatrix(ijk_to_ras)
+
+        def ijk_to_ras_pt(ijk):
+            out = [0.0, 0.0, 0.0, 1.0]
+            ijk_to_ras.MultiplyPoint([ijk[0], ijk[1], ijk[2], 1.0], out)
+            return out[:3]
+
+        corner_min_ras = ijk_to_ras_pt([20, 20, 20])
+        corner_max_ras = ijk_to_ras_pt([40, 40, 40])
+        center_ras = [
+            0.5 * (corner_min_ras[i] + corner_max_ras[i]) for i in range(3)
+        ]
+        radius_ras = [
+            abs(0.5 * (corner_max_ras[i] - corner_min_ras[i])) for i in range(3)
+        ]
+        roi_node.SetCenter(center_ras)
+        roi_node.SetRadiusXYZ(radius_ras)
+
+        box_mask = widget.roi_node_to_mask(roi_node)
+        self.assertGreater(int(box_mask.sum()), 0)
+
+        expected_roi = {
+            0: mask_a_bool | box_mask,
+            1: mask_a_bool & ~box_mask,
+            2: mask_a_bool & box_mask,
+        }
+        for operation, expected_mask in expected_roi.items():
+            widget.segment_editor_node.SetSelectedSegmentID(seg_a_id)
+            slicer.util.updateSegmentBinaryLabelmapFromArray(
+                mask_a, segmentation_node, seg_a_id, widget.get_volume_node()
+            )
+            widget.previous_states["segment_data"] = mask_a_bool
+            widget.ui.cbSelectionOperation.setCurrentIndex(operation)
+            widget.on_apply_selection_op_clicked()
+            slicer.app.processEvents()
+            result = widget.get_segment_data().astype(bool)
+            self.assertTrue(
+                np.array_equal(result, expected_mask),
+                msg=f"ROI boolean op {operation} produced an unexpected mask.",
+            )
+
+        # --- _aabb_to_voxel_box pure-logic coverage ---
+        def fake_ras_to_ijk(pos):
+            return [
+                int(round(pos[0])), int(round(pos[1])), int(round(pos[2]))
+            ]
+
+        small_shape = (10, 10, 10)
+        in_box = widget._aabb_to_voxel_box(
+            (2, 5, 3, 7, 1, 4), fake_ras_to_ijk, small_shape
+        )
+        expected_box = np.zeros(small_shape, dtype=bool)
+        expected_box[1:5, 3:8, 2:6] = True
+        self.assertTrue(np.array_equal(in_box, expected_box))
+
+        outside = widget._aabb_to_voxel_box(
+            (100, 200, 100, 200, 100, 200), fake_ras_to_ijk, small_shape
+        )
+        self.assertFalse(outside.any())
+
+        # Cleanup ROI and restore segment operand source.
+        widget.on_clear_roi_clicked()
+        self.assertFalse(widget._is_selection_roi_valid())
+        widget.ui.cbOperandSource.setCurrentIndex(0)
 
         segmentation.RemoveSegment(seg_a_id)
         segmentation.RemoveSegment(seg_b_id)

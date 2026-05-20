@@ -108,6 +108,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Called when the user opens the module the first time and the widget is initialized."""
         ScriptedLoadableModuleWidget.__init__(self, parent)
         VTKObservationMixin.__init__(self)  # needed for parameter node observation
+        # Operation ROI used as an alternative operand for Selection Operations.
+        self._sel_op_roi_node = None
 
     def setup(self):
         """
@@ -225,8 +227,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Selection operations (boolean editing) and manual server sync
         self.ui.pbSyncToServer.clicked.connect(self.on_sync_to_server_clicked)
         self.ui.pbApplySelectionOp.clicked.connect(self.on_apply_selection_op_clicked)
+        self.ui.cbOperandSource.currentIndexChanged.connect(self._on_operand_source_changed)
+        self.ui.pbPlaceRoi.clicked.connect(self.on_place_roi_clicked)
+        self.ui.pbClearRoi.clicked.connect(self.on_clear_roi_clicked)
         self.populate_operand_selector()
         self._install_selection_op_observers()
+        # Initialize operand-row visibility and Apply enable state for the
+        # default source (Segment).
+        self._on_operand_source_changed(self.ui.cbOperandSource.currentIndex)
 
     def setup_shortcuts(self):
         """
@@ -1152,9 +1160,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     break
         combo.blockSignals(False)
 
-        has_operand = combo.count > 0
-        self.ui.cbSelectionOperand.setEnabled(has_operand)
-        self.ui.pbApplySelectionOp.setEnabled(has_operand)
+        self.ui.cbSelectionOperand.setEnabled(combo.count > 0)
+        self._refresh_apply_enabled()
 
     def segment_id_to_mask(self, segment_id):
         """
@@ -1207,7 +1214,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def on_apply_selection_op_clicked(self, checked=False):
         """
         Applies the selected boolean operation to the current segment, writes the
-        result back, and syncs it to the server.
+        result back, and syncs it to the server. The operand can be either another
+        segment or a 3D-positioned ROI box, depending on cbOperandSource.
         """
         self.populate_operand_selector()
 
@@ -1220,27 +1228,39 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
-        operand_id = self.ui.cbSelectionOperand.currentData
-        if not operand_id:
-            QMessageBox.warning(
-                slicer.util.mainWindow(),
-                "Selection Operations",
-                "No operand segment is available. Add another segment first.",
-            )
-            return
+        source = self.ui.cbOperandSource.currentIndex
+        if source == 0:
+            operand_id = self.ui.cbSelectionOperand.currentData
+            if not operand_id:
+                QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "Selection Operations",
+                    "No operand segment is available. Add another segment first.",
+                )
+                return
 
-        if operand_id == target_id:
-            QMessageBox.warning(
-                slicer.util.mainWindow(),
-                "Selection Operations",
-                "The operand segment must be different from the target segment.",
-            )
-            return
+            if operand_id == target_id:
+                QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "Selection Operations",
+                    "The operand segment must be different from the target segment.",
+                )
+                return
 
-        operand_mask = self.segment_id_to_mask(operand_id)
+            operand_mask = self.segment_id_to_mask(operand_id)
+        else:
+            if not self._is_selection_roi_valid():
+                QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "Selection Operations",
+                    "Click 'Place / Show ROI' to position an ROI before applying.",
+                )
+                return
+            operand_mask = self.roi_node_to_mask(self._sel_op_roi_node)
+
         if operand_mask.sum() == 0:
             slicer.util.showStatusMessage(
-                "Operand segment is empty; the operation may have no effect.", 3000
+                "Operand is empty; the operation may have no effect.", 3000
             )
 
         operation = self.ui.cbSelectionOperation.currentIndex
@@ -1347,6 +1367,154 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Refresh observers and operand list when the node/segment selection changes."""
         self._observe_active_segmentation()
         self.populate_operand_selector()
+
+    # -- ROI operand --
+
+    @staticmethod
+    def _aabb_to_voxel_box(bounds_ras, ras_to_ijk_fn, shape):
+        """
+        Given a world AABB (xmin, xmax, ymin, ymax, zmin, zmax) in RAS, a function
+        mapping an RAS point to (i, j, k) integer voxel coords, and the target
+        volume shape (z, y, x), return a bool mask with the corresponding
+        voxel-space box filled. Coordinates are clamped to the volume; if the
+        resulting box is empty the mask is all-False.
+        """
+        xmin, xmax, ymin, ymax, zmin, zmax = bounds_ras
+        corners_ras = [
+            (xmin, ymin, zmin), (xmax, ymin, zmin),
+            (xmin, ymax, zmin), (xmax, ymax, zmin),
+            (xmin, ymin, zmax), (xmax, ymin, zmax),
+            (xmin, ymax, zmax), (xmax, ymax, zmax),
+        ]
+        ijk = np.array([ras_to_ijk_fn(list(c)) for c in corners_ras])
+
+        # ijk columns are (i, j, k) == (x, y, z); shape is (z, y, x).
+        i_min, i_max = int(ijk[:, 0].min()), int(ijk[:, 0].max())
+        j_min, j_max = int(ijk[:, 1].min()), int(ijk[:, 1].max())
+        k_min, k_max = int(ijk[:, 2].min()), int(ijk[:, 2].max())
+
+        i_min = max(0, i_min)
+        i_max = min(shape[2] - 1, i_max)
+        j_min = max(0, j_min)
+        j_max = min(shape[1] - 1, j_max)
+        k_min = max(0, k_min)
+        k_max = min(shape[0] - 1, k_max)
+
+        mask = np.zeros(shape, dtype=bool)
+        if i_max >= i_min and j_max >= j_min and k_max >= k_min:
+            mask[k_min:k_max + 1, j_min:j_max + 1, i_min:i_max + 1] = True
+        return mask
+
+    def roi_node_to_mask(self, roi_node):
+        """
+        Rasterizes a vtkMRMLMarkupsROINode into a bool numpy mask aligned to the
+        current volume. First version: uses the ROI's world AABB. Axis-aligned
+        ROIs are exact; rotated ROIs are processed by their world AABB and so
+        will slightly over-include.
+        """
+        bounds = [0.0] * 6
+        roi_node.GetBounds(bounds)
+        shape = self.get_image_data().shape
+        return self._aabb_to_voxel_box(bounds, self.ras_to_xyz, shape)
+
+    def _is_selection_roi_valid(self):
+        """True iff the operation ROI node still exists in the MRML scene."""
+        node = self._sel_op_roi_node
+        return node is not None and slicer.mrmlScene.IsNodePresent(node)
+
+    def _configure_selection_roi_display(self, display_node):
+        """Style the operation ROI distinctly from the bbox prompt."""
+        display_node.SetHandlesInteractive(True)
+        display_node.SetFillOpacity(0.1)
+        display_node.SetOutlineOpacity(0.8)
+        # Orange, to stand apart from the blue bbox prompt.
+        color = (1.0, 0.55, 0.1)
+        display_node.SetSelectedColor(*color)
+        display_node.SetColor(*color)
+        display_node.SetActiveColor(*color)
+        display_node.SetSliceProjectionColor(*color)
+        display_node.SetGlyphScale(0)
+        display_node.SetTextScale(0)
+
+    def _initialize_selection_roi_geometry(self, node):
+        """Place a freshly created ROI at the volume center with half-extent radii."""
+        volume_node = self.get_volume_node()
+        if volume_node is None:
+            return
+        ras_bounds = [0.0] * 6
+        volume_node.GetRASBounds(ras_bounds)
+        center = [
+            0.5 * (ras_bounds[0] + ras_bounds[1]),
+            0.5 * (ras_bounds[2] + ras_bounds[3]),
+            0.5 * (ras_bounds[4] + ras_bounds[5]),
+        ]
+        radius = [
+            0.25 * max(1.0, ras_bounds[1] - ras_bounds[0]),
+            0.25 * max(1.0, ras_bounds[3] - ras_bounds[2]),
+            0.25 * max(1.0, ras_bounds[5] - ras_bounds[4]),
+        ]
+        node.SetCenter(center)
+        node.SetRadiusXYZ(radius)
+
+    def _get_or_create_selection_roi(self):
+        """
+        Ensure a vtkMRMLMarkupsROINode named "SelectionOpROI" exists with
+        interactive handles. Returns the node.
+        """
+        name = "SelectionOpROI"
+        node = self._sel_op_roi_node
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            existing = slicer.mrmlScene.GetFirstNodeByName(name)
+            if existing is not None and existing.IsA("vtkMRMLMarkupsROINode"):
+                node = existing
+            else:
+                node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode")
+                node.SetName(name)
+                self._initialize_selection_roi_geometry(node)
+            node.CreateDefaultDisplayNodes()
+            display_node = node.GetDisplayNode()
+            if display_node is not None:
+                self._configure_selection_roi_display(display_node)
+            self._sel_op_roi_node = node
+
+        node.SetDisplayVisibility(True)
+        return node
+
+    def _destroy_selection_roi(self):
+        """Remove the operation ROI node from the scene if it exists."""
+        node = self._sel_op_roi_node
+        if node is not None and slicer.mrmlScene.IsNodePresent(node):
+            slicer.mrmlScene.RemoveNode(node)
+        self._sel_op_roi_node = None
+
+    def on_place_roi_clicked(self, checked=False):
+        """Create or show the operation ROI in the 3D view."""
+        self._get_or_create_selection_roi()
+        self._refresh_apply_enabled()
+        slicer.util.showStatusMessage(
+            "Drag the ROI handles in the 3D view, then click Apply Operation.",
+            5000,
+        )
+
+    def on_clear_roi_clicked(self, checked=False):
+        """Remove the operation ROI."""
+        self._destroy_selection_roi()
+        self._refresh_apply_enabled()
+
+    def _refresh_apply_enabled(self):
+        """Enable Apply only when the current operand source has a usable operand."""
+        if self.ui.cbOperandSource.currentIndex == 0:
+            enabled = self.ui.cbSelectionOperand.count > 0
+        else:
+            enabled = self._is_selection_roi_valid()
+        self.ui.pbApplySelectionOp.setEnabled(enabled)
+
+    def _on_operand_source_changed(self, index):
+        """Toggle the operand-segment vs ROI rows and refresh Apply enable state."""
+        source_is_segment = index == 0
+        self.ui.operandSegmentContainer.setVisible(source_is_segment)
+        self.ui.operandRoiContainer.setVisible(not source_is_segment)
+        self._refresh_apply_enabled()
 
     ###############################################################################
     # Server communication and sync functions
