@@ -569,7 +569,7 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                     return
             self.fail("Operand segment not found in the selector.")
 
-        widget.ui.cbOperandSource.setCurrentIndex(0)
+        widget.ui.cbOperandSource.setCurrentIndex(2)  # 2 = Segment
         expected = {
             0: mask_a_bool | mask_b_bool,
             1: mask_a_bool & ~mask_b_bool,
@@ -599,7 +599,7 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         )
 
         # --- ROI operand integration ---
-        widget.ui.cbOperandSource.setCurrentIndex(1)
+        widget.ui.cbOperandSource.setCurrentIndex(0)  # 0 = ROI box
         widget.on_place_roi_clicked()
         roi_node = widget._sel_op_roi_node
         self.assertIsNotNone(roi_node)
@@ -756,7 +756,7 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         pos_ijk = [128, 105, 89]
         pos_ras = ijk_to_ras_pt(pos_ijk)
 
-        widget.ui.cbOperandSource.setCurrentIndex(2)
+        widget.ui.cbOperandSource.setCurrentIndex(1)  # 1 = Magic wand
         # Ensure Grow/Shrink is at default for the baseline call.
         widget.ui.sbGrowShrinkWand.value = 0
 
@@ -819,6 +819,20 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             mask_a, segmentation_node, seg_a_id, widget.get_volume_node()
         )
         widget.previous_states["segment_data"] = mask_a_bool
+        # Simulate the user pressing "Show 3D" before Apply so we can verify
+        # that Undo preserves the closed surface representation.
+        segmentation_node.CreateClosedSurfaceRepresentation()
+        closed_surface_name = (
+            slicer.vtkSegmentationConverter
+            .GetSegmentationClosedSurfaceRepresentationName()
+        )
+        self.assertTrue(
+            segmentation_node.GetSegmentation().ContainsRepresentation(
+                closed_surface_name
+            ),
+            msg="Closed surface representation should exist before Apply.",
+        )
+
         widget.ui.cbSelectionOperation.setCurrentIndex(1)  # Subtract
         widget.on_apply_selection_op_clicked()
         slicer.app.processEvents()
@@ -840,6 +854,12 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             ),
             msg="Undo should restore the target segment to its pre-Apply state.",
         )
+        self.assertTrue(
+            segmentation_node.GetSegmentation().ContainsRepresentation(
+                closed_surface_name
+            ),
+            msg="Undo should preserve the closed surface representation (Show 3D).",
+        )
 
         # Seed Clear Seeds with an orphan node using a historical name to
         # verify _destroy_wand_seed sweeps the whole family.
@@ -857,10 +877,10 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         # Restore Grow/Shrink to default for the cleanup.
         widget.ui.sbGrowShrinkWand.value = 0
 
-        # Cleanup ROI and restore segment operand source.
+        # Cleanup ROI and restore Segment operand source for downstream tests.
         widget.on_clear_roi_clicked()
         self.assertFalse(widget._is_selection_roi_valid())
-        widget.ui.cbOperandSource.setCurrentIndex(0)
+        widget.ui.cbOperandSource.setCurrentIndex(2)  # 2 = Segment
 
         segmentation.RemoveSegment(seg_a_id)
         segmentation.RemoveSegment(seg_b_id)

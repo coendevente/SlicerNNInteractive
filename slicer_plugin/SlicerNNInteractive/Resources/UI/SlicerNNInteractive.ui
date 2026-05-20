@@ -343,17 +343,17 @@
                 </property>
                 <item>
                  <property name="text">
-                  <string>Segment</string>
-                 </property>
-                </item>
-                <item>
-                 <property name="text">
                   <string>ROI box</string>
                  </property>
                 </item>
                 <item>
                  <property name="text">
                   <string>Magic wand</string>
+                 </property>
+                </item>
+                <item>
+                 <property name="text">
+                  <string>Segment</string>
                  </property>
                 </item>
                </widget>

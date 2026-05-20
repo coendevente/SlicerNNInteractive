@@ -1266,8 +1266,35 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
+        # Operand source order: 0=ROI box, 1=Magic wand, 2=Segment.
         source = self.ui.cbOperandSource.currentIndex
         if source == 0:
+            if not self._is_selection_roi_valid():
+                QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "Selection Operations",
+                    "Click 'Place / Show ROI' to position an ROI before applying.",
+                )
+                return
+            operand_mask = self.roi_node_to_mask(self._sel_op_roi_node)
+        elif source == 1:
+            if not self._is_selection_wand_seed_valid():
+                QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "Selection Operations",
+                    "Click 'Add Seed' and place a seed before applying.",
+                )
+                return
+            operand_mask = self._compute_magic_wand_mask()
+            if operand_mask is None:
+                QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "Selection Operations",
+                    "Magic wand failed (no positive seed, server unreachable, "
+                    "or seeds out of volume).",
+                )
+                return
+        else:
             operand_id = self.ui.cbSelectionOperand.currentData
             if not operand_id:
                 QMessageBox.warning(
@@ -1286,32 +1313,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return
 
             operand_mask = self.segment_id_to_mask(operand_id)
-        elif source == 1:
-            if not self._is_selection_roi_valid():
-                QMessageBox.warning(
-                    slicer.util.mainWindow(),
-                    "Selection Operations",
-                    "Click 'Place / Show ROI' to position an ROI before applying.",
-                )
-                return
-            operand_mask = self.roi_node_to_mask(self._sel_op_roi_node)
-        else:
-            if not self._is_selection_wand_seed_valid():
-                QMessageBox.warning(
-                    slicer.util.mainWindow(),
-                    "Selection Operations",
-                    "Click 'Place / Show Seed' and place a seed before applying.",
-                )
-                return
-            operand_mask = self._compute_magic_wand_mask()
-            if operand_mask is None:
-                QMessageBox.warning(
-                    slicer.util.mainWindow(),
-                    "Selection Operations",
-                    "Magic wand failed (no positive seed, server unreachable, "
-                    "or seeds out of volume).",
-                )
-                return
 
         if operand_mask.sum() == 0:
             slicer.util.showStatusMessage(
@@ -1862,21 +1863,31 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _refresh_apply_enabled(self):
         """Enable Apply only when the current operand source has a usable operand."""
+        # Source order: 0=ROI box, 1=Magic wand, 2=Segment.
         source = self.ui.cbOperandSource.currentIndex
         if source == 0:
-            enabled = self.ui.cbSelectionOperand.count > 0
-        elif source == 1:
             enabled = self._is_selection_roi_valid()
-        else:
+        elif source == 1:
             enabled = self._is_selection_wand_seed_valid()
+        else:
+            enabled = self.ui.cbSelectionOperand.count > 0
         self.ui.pbApplySelectionOp.setEnabled(enabled)
 
     def _on_operand_source_changed(self, index):
-        """Toggle the three operand rows; preview stays manual via Preview btn."""
-        self.ui.operandSegmentContainer.setVisible(index == 0)
-        self.ui.operandRoiContainer.setVisible(index == 1)
-        self.ui.operandMagicWandContainer.setVisible(index == 2)
-        if index != 2:
+        """
+        Toggle the three operand rows and clean up after the modes we are
+        leaving so a ROI / Magic wand preview never lingers across switches.
+        Source order: 0=ROI box, 1=Magic wand, 2=Segment.
+        """
+        self.ui.operandRoiContainer.setVisible(index == 0)
+        self.ui.operandMagicWandContainer.setVisible(index == 1)
+        self.ui.operandSegmentContainer.setVisible(index == 2)
+        # Leaving ROI -> destroy the ROI box (and its preview).
+        if index != 0:
+            self._destroy_selection_roi()
+        # Leaving Magic wand -> destroy seeds and the mask preview.
+        if index != 1:
+            self._destroy_wand_seed()
             self._clear_wand_preview_segment()
         self._refresh_apply_enabled()
 
@@ -2212,7 +2223,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         write it into the preview segment. Safe to call when the wand is not
         the active operand source -- it will just clear the preview.
         """
-        if self.ui.cbOperandSource.currentIndex != 2:
+        # Magic wand source index is 1 in the current ordering.
+        if self.ui.cbOperandSource.currentIndex != 1:
             self._clear_wand_preview_segment()
             return
         if not self._is_selection_wand_seed_valid():
@@ -2281,11 +2293,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
 
         self.segment_editor_node.SetSelectedSegmentID(segment_id)
-        slicer.util.updateSegmentBinaryLabelmapFromArray(
-            pre_state, seg_node, segment_id, self.get_volume_node()
-        )
-        seg_node.Modified()
-        self.previous_states["segment_data"] = pre_state.astype(bool)
+        # show_segmentation re-applies the binary labelmap AND rebuilds the
+        # closed surface representation when 3D was being shown, so Show 3D
+        # survives Undo. It also updates previous_states and saves to the
+        # editor's undo history.
+        self.show_segmentation(pre_state)
         self._clear_wand_preview_segment()
 
         result = self.upload_segment_to_server()
