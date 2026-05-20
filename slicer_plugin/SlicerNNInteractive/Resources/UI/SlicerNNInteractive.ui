@@ -734,6 +734,52 @@
      </property>
      <layout class="QVBoxLayout" name="segmentEditorLayout">
       <item>
+       <layout class="QHBoxLayout" name="horizontalLayout_segOpacity">
+        <item>
+         <widget class="QLabel" name="lblSegOpacity">
+          <property name="text">
+           <string>Opacity:</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QSlider" name="sldSegmentOpacity">
+          <property name="toolTip">
+           <string>Display opacity of the currently selected segment (2D fill, outline, and 3D combined).</string>
+          </property>
+          <property name="minimum">
+           <number>0</number>
+          </property>
+          <property name="maximum">
+           <number>100</number>
+          </property>
+          <property name="value">
+           <number>100</number>
+          </property>
+          <property name="orientation">
+           <enum>Qt::Horizontal</enum>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="lblSegOpacityValue">
+          <property name="minimumSize">
+           <size>
+            <width>48</width>
+            <height>0</height>
+           </size>
+          </property>
+          <property name="text">
+           <string>100 %</string>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
        <widget class="qMRMLSegmentEditorWidget" name="editor_widget">
         <property name="defaultTerminologyEntrySettingsKey">
          <string notr="true"/>

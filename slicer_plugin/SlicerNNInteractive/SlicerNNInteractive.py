@@ -262,11 +262,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbPreviewWand.clicked.connect(self.on_preview_wand_clicked)
         self.ui.pbClearPreviewWand.clicked.connect(self.on_clear_preview_wand_clicked)
         self.ui.pbUndoSelectionOp.clicked.connect(self.on_undo_selection_op_clicked)
+        self.ui.sldSegmentOpacity.valueChanged.connect(self._on_segment_opacity_changed)
         self.populate_operand_selector()
         self._install_selection_op_observers()
         # Initialize operand-row visibility and Apply enable state for the
-        # default source (Segment).
+        # default source.
         self._on_operand_source_changed(self.ui.cbOperandSource.currentIndex)
+        self._sync_opacity_slider_from_segment()
 
     def setup_shortcuts(self):
         """
@@ -1012,6 +1014,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.editor_widget.setSegmentationNode(segmentation_node)
         self.segment_editor_node.SetSelectedSegmentID(new_segment_id)
 
+        # Apply the user's persisted opacity preference to the new segment so
+        # the slider value survives across sessions / new segments.
+        display_node = segmentation_node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetSegmentOpacity(
+                new_segment_id, self._get_preferred_segment_opacity()
+            )
+
         return segmentation_node, new_segment_id
 
     def clear_current_segment(self):
@@ -1165,6 +1175,62 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         debug_print(f"selected_segment_changed: {selected_segment_changed}")
 
         return selected_segment_changed
+
+    # -- Per-segment display opacity (right-side panel slider) --
+
+    def _current_segmentation_display_node(self):
+        seg_node = self.get_segmentation_node()
+        if seg_node is None:
+            return None
+        return seg_node.GetDisplayNode()
+
+    def _sync_opacity_slider_from_segment(self):
+        """Push the active segment's current opacity onto the slider UI."""
+        display_node = self._current_segmentation_display_node()
+        seg_id = self.get_current_segment_id()
+        enabled = display_node is not None and bool(seg_id)
+        self.ui.sldSegmentOpacity.setEnabled(enabled)
+        if not enabled:
+            self.ui.lblSegOpacityValue.setText("--")
+            return
+        # vtkMRMLSegmentationDisplayNode exposes SetSegmentOpacity (master) but
+        # not a matching GetSegmentOpacity; read back via the 3D dimension,
+        # which SetSegmentOpacity also writes to.
+        value = display_node.GetSegmentOpacity3D(seg_id)
+        pct = int(round(float(value) * 100))
+        blocked = self.ui.sldSegmentOpacity.blockSignals(True)
+        try:
+            self.ui.sldSegmentOpacity.setValue(pct)
+        finally:
+            self.ui.sldSegmentOpacity.blockSignals(blocked)
+        self.ui.lblSegOpacityValue.setText(f"{pct} %")
+
+    def _on_segment_opacity_changed(self, value):
+        """Slider drag -- push opacity to the current segment and persist as
+        a user preference applied to future newly-created segments."""
+        self.ui.lblSegOpacityValue.setText(f"{int(value)} %")
+        fraction = float(value) / 100.0
+        self._save_preferred_segment_opacity(fraction)
+        display_node = self._current_segmentation_display_node()
+        seg_id = self.get_current_segment_id()
+        if display_node is None or not seg_id:
+            return
+        display_node.SetSegmentOpacity(seg_id, fraction)
+
+    def _get_preferred_segment_opacity(self):
+        """Read the persisted preferred segment opacity (0..1). Default 1.0."""
+        settings = qt.QSettings()
+        try:
+            v = float(settings.value("SlicerNNInteractive/segment_opacity", 1.0))
+        except (TypeError, ValueError):
+            v = 1.0
+        return max(0.0, min(1.0, v))
+
+    def _save_preferred_segment_opacity(self, value):
+        """Persist the slider's current value as a user preference."""
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/segment_opacity", float(value)
+        )
 
     ###############################################################################
     # Selection operations (boolean editing)
@@ -1440,11 +1506,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def on_segmentation_modified(self, caller, event):
         """Refresh the operand selector when segments are added/removed/renamed."""
         self.populate_operand_selector()
+        self._sync_opacity_slider_from_segment()
 
     def on_segment_editor_node_modified(self, caller, event):
         """Refresh observers and operand list when the node/segment selection changes."""
         self._observe_active_segmentation()
         self.populate_operand_selector()
+        self._sync_opacity_slider_from_segment()
 
     # -- ROI operand --
 
