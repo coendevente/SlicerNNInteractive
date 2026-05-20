@@ -100,6 +100,15 @@ class SlicerNNInteractive(ScriptedLoadableModule):
 
 
 class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+    # Every historical name a magic wand seed node has had. Used to sweep
+    # orphans on Clear Seeds / setup so reloads do not leak stale fiducials.
+    _WAND_SEED_NODE_NAMES = (
+        "SelectionOpWandSeeds",          # current
+        "SelectionOpWandSeedsPositive",  # multi-seed v1 (positive)
+        "SelectionOpWandSeedsNegative",  # multi-seed v1 (negative)
+        "SelectionOpWandSeed",           # original single-point
+    )
+
     ###############################################################################
     # Setup and initialization functions
     ###############################################################################
@@ -113,6 +122,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Sphere/ellipsoid visualization for the operation ROI.
         self._sel_op_roi_preview_node = None
         self._sel_op_roi_preview_transform_node = None
+        # Magic wand seeds: a multi-point Fiducial node feeding nnInteractive's
+        # point prompt.
+        self._sel_op_wand_seed_node = None
+        # Live preview of the magic wand region (hidden segmentation node).
+        self._sel_op_wand_preview_segment_node = None
+        self._wand_preview_segment_id = None
+        # Selection Operations-private undo stack: list of (segment_id, mask_uint8).
+        self._sel_op_undo_stack = []
+        self._sel_op_undo_stack_limit = 10
 
     def setup(self):
         """
@@ -126,6 +144,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.layout.addWidget(ui_widget)
         self.ui = slicer.util.childWidgetVariables(ui_widget)
         self.scribble_segment_node_name = "ScribbleSegmentNode (do not touch)"
+        self.wand_preview_segment_node_name = "MagicWandPreviewSegmentNode (do not touch)"
 
         # Set up editor widget
         self.ui.editor_widget.setMaximumNumberOfUndoStates(10)
@@ -188,6 +207,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         _ = self.get_current_segment_id()
         self.previous_states = {}
 
+        # Sweep any orphaned magic wand seed nodes left behind by earlier
+        # versions / earlier reloads so the scene is clean on module load.
+        self._destroy_wand_seed()
+
     def init_ui_functionality(self):
         """
         Connect UI elements to functions.
@@ -234,6 +257,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.cbRoiShape.currentIndexChanged.connect(self._on_roi_shape_changed)
         self.ui.pbPlaceRoi.clicked.connect(self.on_place_roi_clicked)
         self.ui.pbClearRoi.clicked.connect(self.on_clear_roi_clicked)
+        self.ui.pbPlaceWandSeed.clicked.connect(self.on_place_wand_seed_clicked)
+        self.ui.pbClearWandSeed.clicked.connect(self.on_clear_wand_seed_clicked)
+        self.ui.pbPreviewWand.clicked.connect(self.on_preview_wand_clicked)
+        self.ui.pbClearPreviewWand.clicked.connect(self.on_clear_preview_wand_clicked)
+        self.ui.pbUndoSelectionOp.clicked.connect(self.on_undo_selection_op_clicked)
         self.populate_operand_selector()
         self._install_selection_op_observers()
         # Initialize operand-row visibility and Apply enable state for the
@@ -1038,19 +1066,25 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def get_segmentation_node(self):
         """
         Returns the currently referenced segmentation node (from the Segment Editor).
-        If none exists, we create a fresh one.
+        If none exists, we create a fresh one. Internal scaffolding nodes
+        (scribble, magic wand preview) are excluded from this lookup.
         """
+        internal_names = {
+            self.scribble_segment_node_name,
+            self.wand_preview_segment_node_name,
+        }
+
         # If the segmentation widget has a currently selected segmentation node, return it.
         segmentation_node = self.ui.editor_widget.segmentationNode()
         if segmentation_node:
-            if segmentation_node.GetName() != self.scribble_segment_node_name:
+            if segmentation_node.GetName() not in internal_names:
                 return segmentation_node
 
         # Otherwise, fall back to getting the first suitable segmentation node
         segmentation_node = None
         segmentation_nodes = slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
         for segmentation_node in segmentation_nodes:
-            if segmentation_node.GetName() == self.scribble_segment_node_name:
+            if segmentation_node.GetName() in internal_names:
                 segmentation_node = None
                 continue
 
@@ -1252,7 +1286,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return
 
             operand_mask = self.segment_id_to_mask(operand_id)
-        else:
+        elif source == 1:
             if not self._is_selection_roi_valid():
                 QMessageBox.warning(
                     slicer.util.mainWindow(),
@@ -1261,6 +1295,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
                 return
             operand_mask = self.roi_node_to_mask(self._sel_op_roi_node)
+        else:
+            if not self._is_selection_wand_seed_valid():
+                QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "Selection Operations",
+                    "Click 'Place / Show Seed' and place a seed before applying.",
+                )
+                return
+            operand_mask = self._compute_magic_wand_mask()
+            if operand_mask is None:
+                QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "Selection Operations",
+                    "Magic wand failed (no positive seed, server unreachable, "
+                    "or seeds out of volume).",
+                )
+                return
 
         if operand_mask.sum() == 0:
             slicer.util.showStatusMessage(
@@ -1278,8 +1329,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
+        # Snapshot the pre-Apply target so our own Undo can restore it
+        # reliably -- the embedded Segment Editor's history stack is not
+        # always populated for these programmatic edits.
+        pre_state = self.get_segment_data().astype(np.uint8).copy()
+        self._record_selection_op_undo(target_id, pre_state)
+
         self.show_segmentation(result_mask)
         self.setup_prompts()
+        # The wand preview reflected the about-to-apply mask -- clear it now
+        # that the operation has landed on the actual target segment.
+        self._clear_wand_preview_segment()
 
         sync_result = self.upload_segment_to_server()
         if sync_result is None:
@@ -1802,18 +1862,441 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _refresh_apply_enabled(self):
         """Enable Apply only when the current operand source has a usable operand."""
-        if self.ui.cbOperandSource.currentIndex == 0:
+        source = self.ui.cbOperandSource.currentIndex
+        if source == 0:
             enabled = self.ui.cbSelectionOperand.count > 0
-        else:
+        elif source == 1:
             enabled = self._is_selection_roi_valid()
+        else:
+            enabled = self._is_selection_wand_seed_valid()
         self.ui.pbApplySelectionOp.setEnabled(enabled)
 
     def _on_operand_source_changed(self, index):
-        """Toggle the operand-segment vs ROI rows and refresh Apply enable state."""
-        source_is_segment = index == 0
-        self.ui.operandSegmentContainer.setVisible(source_is_segment)
-        self.ui.operandRoiContainer.setVisible(not source_is_segment)
+        """Toggle the three operand rows; preview stays manual via Preview btn."""
+        self.ui.operandSegmentContainer.setVisible(index == 0)
+        self.ui.operandRoiContainer.setVisible(index == 1)
+        self.ui.operandMagicWandContainer.setVisible(index == 2)
+        if index != 2:
+            self._clear_wand_preview_segment()
         self._refresh_apply_enabled()
+
+    # -- Magic wand seed lifecycle and flood fill --
+
+    def _configure_wand_seed_display(self, display_node):
+        """Distinct green so the wand seed is not confused with bbox/ROI."""
+        color = (0.2, 0.85, 0.4)
+        display_node.SetColor(*color)
+        display_node.SetSelectedColor(*color)
+        display_node.SetActiveColor(*color)
+        display_node.SetGlyphScale(0.9)
+        display_node.SetTextScale(0)
+        display_node.SetSliceProjection(True)
+        display_node.SetSliceProjectionColor(*color)
+
+    def _get_or_create_wand_seed(self):
+        """
+        Ensure a vtkMRMLMarkupsFiducialNode exists for magic wand seeds. The
+        node holds an unlimited list of seeds (each click adds another).
+        Returns the node.
+        """
+        name = "SelectionOpWandSeeds"
+        node = self._sel_op_wand_seed_node
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            existing = slicer.mrmlScene.GetFirstNodeByName(name)
+            if existing is not None and existing.IsA("vtkMRMLMarkupsFiducialNode"):
+                node = existing
+            else:
+                node = slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLMarkupsFiducialNode"
+                )
+                node.SetName(name)
+            node.SetMaximumNumberOfControlPoints(-1)
+            node.CreateDefaultDisplayNodes()
+            display_node = node.GetDisplayNode()
+            if display_node is not None:
+                self._configure_wand_seed_display(display_node)
+            if not self.hasObserver(
+                node,
+                slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
+                self._on_wand_seed_placed,
+            ):
+                self.addObserver(
+                    node,
+                    slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
+                    self._on_wand_seed_placed,
+                )
+            self._sel_op_wand_seed_node = node
+
+        node.SetDisplayVisibility(True)
+        return node
+
+    def _destroy_wand_seed(self):
+        """
+        Remove the current wand seed node AND any historically-named orphans
+        from the scene, detach the placement observer, and bail out of Place
+        mode if we were the active placer.
+        """
+        # 1) Detach observer on the tracked node before removal so the placement
+        #    callback never fires on a half-dead node.
+        tracked = self._sel_op_wand_seed_node
+        if tracked is not None and self.hasObserver(
+            tracked,
+            slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
+            self._on_wand_seed_placed,
+        ):
+            self.removeObserver(
+                tracked,
+                slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
+                self._on_wand_seed_placed,
+            )
+
+        # 2) Sweep every historical wand seed name out of the scene. Use a
+        #    while-loop in case multiple nodes share the same name.
+        for name in self._WAND_SEED_NODE_NAMES:
+            existing = slicer.mrmlScene.GetFirstNodeByName(name)
+            while existing is not None:
+                if existing.IsA("vtkMRMLMarkupsFiducialNode"):
+                    slicer.mrmlScene.RemoveNode(existing)
+                else:
+                    break
+                existing = slicer.mrmlScene.GetFirstNodeByName(name)
+        self._sel_op_wand_seed_node = None
+
+        # 3) If we left interaction mode in Place for a fiducial, bail out so
+        #    the cursor stops behaving like "about to drop a point".
+        interaction_node = slicer.app.applicationLogic().GetInteractionNode()
+        selection_node = slicer.app.applicationLogic().GetSelectionNode()
+        if (
+            interaction_node.GetCurrentInteractionMode()
+            == slicer.vtkMRMLInteractionNode.Place
+            and selection_node.GetActivePlaceNodeClassName()
+            == "vtkMRMLMarkupsFiducialNode"
+        ):
+            interaction_node.SetCurrentInteractionMode(
+                interaction_node.ViewTransform
+            )
+
+    def _is_selection_wand_seed_valid(self):
+        """True iff at least one wand seed has been placed."""
+        node = self._sel_op_wand_seed_node
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            return False
+        return node.GetNumberOfControlPoints() >= 1
+
+    def _collect_wand_seeds(self):
+        """
+        Collect placed wand seeds, converting RAS positions to (k, j, i) voxel
+        coords. Returns a list of ((k, j, i), True) tuples (all seeds are
+        positive prompts) or [].
+        """
+        arr = self.get_image_data()
+        if arr is None:
+            return []
+        node = self._sel_op_wand_seed_node
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            return []
+        out = []
+        for idx in range(node.GetNumberOfControlPoints()):
+            ras = [0.0, 0.0, 0.0]
+            node.GetNthControlPointPositionWorld(idx, ras)
+            ijk = self.ras_to_xyz(list(ras))
+            ii, jj, kk = int(ijk[0]), int(ijk[1]), int(ijk[2])
+            if (
+                0 <= ii < arr.shape[2]
+                and 0 <= jj < arr.shape[1]
+                and 0 <= kk < arr.shape[0]
+            ):
+                out.append(((kk, jj, ii), True))
+        return out
+
+    def _postprocess_wand_mask(self, mask):
+        """Apply Grow/Shrink post-processing to the AI mask."""
+        if mask is None or not mask.any():
+            return mask
+        n_iter = int(self.ui.sbGrowShrinkWand.value)
+        if n_iter == 0:
+            return mask.astype(bool)
+        try:
+            from scipy import ndimage
+        except Exception:
+            return mask.astype(bool)
+        if n_iter > 0:
+            mask = ndimage.binary_dilation(mask, iterations=n_iter)
+        else:
+            mask = ndimage.binary_erosion(mask, iterations=-n_iter)
+        return mask.astype(bool)
+
+    def _compute_magic_wand_mask(self, seed_node=None):
+        """
+        Ask the nnInteractive server for an AI segmentation built from one or
+        more positive (and optional negative) seed points. The call cycle:
+          1. back up the current target segment,
+          2. POST an empty mask to /upload_segment (resets server interactions),
+          3. POST /add_point_interaction once per seed (positive first, then
+             negative); the last response holds the cumulative mask,
+          4. POST the original target back to /upload_segment (restores state),
+          5. apply local post-processing (Keep largest, Grow/Shrink).
+        The `seed_node` argument is ignored -- seeds come from the two internal
+        nodes -- and kept only for backward call sites.
+        Returns a bool numpy mask aligned to the volume, or None on failure.
+        """
+        volume = self.get_volume_node()
+        arr = self.get_image_data()
+        if volume is None or arr is None or not self.server:
+            return None
+
+        seeds = self._collect_wand_seeds()
+        if not seeds:
+            return None
+
+        pre_target = self.get_segment_data().astype(np.uint8).copy()
+        shape = arr.shape
+
+        # 1) Reset server interactions by uploading an empty mask.
+        empty = np.zeros(shape, dtype=np.uint8)
+        reset_resp = self.request_to_server(
+            f"{self.server}/upload_segment",
+            files=self.mask_to_np_upload_file(empty),
+            headers={"Content-Encoding": "gzip"},
+        )
+        if reset_resp is None:
+            return None
+
+        seg_mask = None
+        try:
+            # 2) Send each seed in order; the LAST response holds the cumulative
+            #    mask. voxel_coord uses (z, y, x) order (== ras_to_xyz()[::-1]).
+            last_response = None
+            for (kk, jj, ii), is_pos in seeds:
+                last_response = self.request_to_server(
+                    f"{self.server}/add_point_interaction",
+                    json={
+                        "voxel_coord": [kk, jj, ii],
+                        "positive_click": bool(is_pos),
+                    },
+                )
+                if last_response is None:
+                    break
+            if last_response is not None:
+                seg_mask = self.unpack_binary_segmentation(
+                    last_response.content, decompress=False
+                ).astype(bool)
+                seg_mask = self._postprocess_wand_mask(seg_mask)
+        finally:
+            # 3) Restore the user's target segment on the server so subsequent
+            #    nnInteractive prompts continue from where they left off.
+            restore_resp = self.request_to_server(
+                f"{self.server}/upload_segment",
+                files=self.mask_to_np_upload_file(pre_target),
+                headers={"Content-Encoding": "gzip"},
+            )
+            if restore_resp is None:
+                slicer.util.showStatusMessage(
+                    "Magic wand could not restore server state; "
+                    "the next prompt may resync automatically.",
+                    4000,
+                )
+
+        return seg_mask
+
+    def _enter_place_mode_for_wand(self, node, status_msg):
+        selection_node = slicer.app.applicationLogic().GetSelectionNode()
+        interaction_node = slicer.app.applicationLogic().GetInteractionNode()
+        selection_node.SetReferenceActivePlaceNodeClassName(
+            "vtkMRMLMarkupsFiducialNode"
+        )
+        selection_node.SetActivePlaceNodeID(node.GetID())
+        interaction_node.SetPlaceModePersistence(0)
+        interaction_node.SetCurrentInteractionMode(interaction_node.Place)
+        slicer.util.showStatusMessage(status_msg, 5000)
+
+    def on_place_wand_seed_clicked(self, checked=False):
+        """Add another magic wand seed (does NOT clear earlier seeds)."""
+        node = self._get_or_create_wand_seed()
+        self._enter_place_mode_for_wand(
+            node,
+            "Click in any view to add a magic wand seed.",
+        )
+        self._refresh_apply_enabled()
+
+    def on_clear_wand_seed_clicked(self, checked=False):
+        """Remove all magic wand seeds (positive and negative) and the preview."""
+        self._destroy_wand_seed()
+        self._clear_wand_preview_segment()
+        self._refresh_apply_enabled()
+
+    def on_clear_preview_wand_clicked(self, checked=False):
+        """Hide the magic wand preview overlay; seeds are kept."""
+        self._clear_wand_preview_segment()
+
+    def _on_wand_seed_placed(self, caller, event):
+        """Seed was placed -- refresh Apply state only (preview is manual)."""
+        self._refresh_apply_enabled()
+
+    # -- Magic wand live preview --
+
+    def _get_or_create_wand_preview_segmentation(self):
+        """
+        Create (or recover) a hidden segmentation node with a single 'preview'
+        segment used to visualize the magic wand region before Apply.
+        """
+        name = self.wand_preview_segment_node_name
+        node = self._sel_op_wand_preview_segment_node
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            existing = slicer.mrmlScene.GetFirstNodeByName(name)
+            if existing is not None and existing.IsA("vtkMRMLSegmentationNode"):
+                node = existing
+            else:
+                node = slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLSegmentationNode"
+                )
+                node.SetName(name)
+            node.HideFromEditorsOn()
+            volume_node = self.get_volume_node()
+            if volume_node is not None:
+                node.SetReferenceImageGeometryParameterFromVolumeNode(volume_node)
+            node.CreateDefaultDisplayNodes()
+            self._sel_op_wand_preview_segment_node = node
+
+        segmentation = node.GetSegmentation()
+        seg_id = self._wand_preview_segment_id
+        if not seg_id or not segmentation.GetSegment(seg_id):
+            seg_id = segmentation.AddEmptySegment(
+                "MagicWandPreview", "MagicWandPreview", [0.95, 0.2, 0.85]
+            )
+            self._wand_preview_segment_id = seg_id
+
+        display_node = node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetSegmentOpacity2DFill(seg_id, 0.35)
+            display_node.SetSegmentOpacity2DOutline(seg_id, 0.9)
+            display_node.SetSegmentVisibility(seg_id, True)
+
+        return node, seg_id
+
+    def _clear_wand_preview_segment(self):
+        """
+        Empty the preview segment's labelmap and hide it. The node itself is
+        kept around so the next show is cheap.
+        """
+        node = self._sel_op_wand_preview_segment_node
+        seg_id = self._wand_preview_segment_id
+        if node is None or not slicer.mrmlScene.IsNodePresent(node) or not seg_id:
+            return
+        volume_node = self.get_volume_node()
+        image = self.get_image_data()
+        if volume_node is None or image is None:
+            return
+        empty = np.zeros(image.shape, dtype=np.uint8)
+        try:
+            slicer.util.updateSegmentBinaryLabelmapFromArray(
+                empty, node, seg_id, volume_node
+            )
+        except Exception:
+            pass
+        display_node = node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetSegmentVisibility(seg_id, False)
+
+    def _destroy_wand_preview(self):
+        """Remove the preview segmentation node entirely (used at cleanup)."""
+        node = self._sel_op_wand_preview_segment_node
+        if node is not None and slicer.mrmlScene.IsNodePresent(node):
+            slicer.mrmlScene.RemoveNode(node)
+        self._sel_op_wand_preview_segment_node = None
+        self._wand_preview_segment_id = None
+
+    def _update_magic_wand_preview(self):
+        """
+        Recompute the wand mask via nnInteractive from the current seed and
+        write it into the preview segment. Safe to call when the wand is not
+        the active operand source -- it will just clear the preview.
+        """
+        if self.ui.cbOperandSource.currentIndex != 2:
+            self._clear_wand_preview_segment()
+            return
+        if not self._is_selection_wand_seed_valid():
+            self._clear_wand_preview_segment()
+            return
+
+        wand_mask = self._compute_magic_wand_mask()
+        if wand_mask is None:
+            self._clear_wand_preview_segment()
+            return
+
+        node, seg_id = self._get_or_create_wand_preview_segmentation()
+        volume_node = self.get_volume_node()
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            wand_mask.astype(np.uint8), node, seg_id, volume_node
+        )
+        display_node = node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetSegmentVisibility(seg_id, True)
+        if int(wand_mask.sum()) > 0:
+            node.GetSegmentation().CollapseBinaryLabelmaps()
+            node.CreateClosedSurfaceRepresentation()
+
+    def on_preview_wand_clicked(self, checked=False):
+        """Run a one-shot AI wand call and write the result into the preview."""
+        if not self._is_selection_wand_seed_valid():
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Selection Operations",
+                "Place a seed before previewing.",
+            )
+            return
+        qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
+        try:
+            self._update_magic_wand_preview()
+        finally:
+            qt.QApplication.restoreOverrideCursor()
+
+    def _record_selection_op_undo(self, segment_id, pre_state_uint8):
+        """Push a (segment_id, mask) snapshot onto our private undo stack."""
+        self._sel_op_undo_stack.append((segment_id, pre_state_uint8))
+        while len(self._sel_op_undo_stack) > self._sel_op_undo_stack_limit:
+            self._sel_op_undo_stack.pop(0)
+
+    def on_undo_selection_op_clicked(self, checked=False):
+        """
+        Revert the last Selection Operations Apply from our private undo stack
+        (the embedded Segment Editor's history is not always populated for these
+        programmatic edits), then resync local state and server.
+        """
+        if not self._sel_op_undo_stack:
+            slicer.util.showStatusMessage(
+                "No Selection Operations Apply to undo.", 3000
+            )
+            return
+
+        segment_id, pre_state = self._sel_op_undo_stack.pop()
+        seg_node = self.get_segmentation_node()
+        segmentation = seg_node.GetSegmentation() if seg_node is not None else None
+        if segmentation is None or not segmentation.GetSegment(segment_id):
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Selection Operations",
+                "The target segment of the previous Apply no longer exists.",
+            )
+            return
+
+        self.segment_editor_node.SetSelectedSegmentID(segment_id)
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            pre_state, seg_node, segment_id, self.get_volume_node()
+        )
+        seg_node.Modified()
+        self.previous_states["segment_data"] = pre_state.astype(bool)
+        self._clear_wand_preview_segment()
+
+        result = self.upload_segment_to_server()
+        if result is None:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Selection Operations",
+                "The segment was reverted locally, but syncing to the server failed.",
+            )
+        else:
+            slicer.util.showStatusMessage("Selection Operation undone.", 3000)
 
     ###############################################################################
     # Server communication and sync functions

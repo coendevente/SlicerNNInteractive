@@ -750,6 +750,113 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         )
         self.assertFalse(outside.any())
 
+        # --- Magic wand operand integration (AI engine via nnInteractive) ---
+        # Place a positive seed at an IJK position known to be inside the brain
+        # region of MRBrainTumor2; convert to RAS through IJKToRAS.
+        pos_ijk = [128, 105, 89]
+        pos_ras = ijk_to_ras_pt(pos_ijk)
+
+        widget.ui.cbOperandSource.setCurrentIndex(2)
+        # Ensure Grow/Shrink is at default for the baseline call.
+        widget.ui.sbGrowShrinkWand.value = 0
+
+        widget.on_place_wand_seed_clicked()
+        pos_node = widget._sel_op_wand_seed_node
+        self.assertIsNotNone(pos_node)
+        # Bypass Place mode for the test: write the control point directly.
+        pos_node.RemoveAllControlPoints()
+        pos_node.AddControlPoint(pos_ras[0], pos_ras[1], pos_ras[2])
+        self.assertTrue(widget._is_selection_wand_seed_valid())
+
+        baseline_mask = widget._compute_magic_wand_mask()
+        self.assertIsNotNone(
+            baseline_mask,
+            msg="Magic wand should return a mask when the server is reachable.",
+        )
+        self.assertEqual(baseline_mask.shape, widget.get_image_data().shape)
+        self.assertGreater(int(baseline_mask.sum()), 0)
+
+        # --- Grow / Shrink ---
+        widget.ui.sbGrowShrinkWand.value = 2
+        grown = widget._compute_magic_wand_mask()
+        widget.ui.sbGrowShrinkWand.value = 0
+        self.assertIsNotNone(grown)
+        self.assertGreaterEqual(int(grown.sum()), int(baseline_mask.sum()))
+
+        widget.ui.sbGrowShrinkWand.value = -2
+        shrunk = widget._compute_magic_wand_mask()
+        widget.ui.sbGrowShrinkWand.value = 0
+        self.assertIsNotNone(shrunk)
+        self.assertLessEqual(int(shrunk.sum()), int(baseline_mask.sum()))
+
+        # --- Magic wand preview (manual) ---
+        widget.on_preview_wand_clicked()
+        slicer.app.processEvents()
+        preview_node = widget._sel_op_wand_preview_segment_node
+        self.assertIsNotNone(preview_node)
+        self.assertTrue(slicer.mrmlScene.IsNodePresent(preview_node))
+        preview_id = widget._wand_preview_segment_id
+        self.assertIsNotNone(preview_id)
+        preview_mask = slicer.util.arrayFromSegmentBinaryLabelmap(
+            preview_node, preview_id, widget.get_volume_node()
+        )
+        self.assertIsNotNone(preview_mask)
+        self.assertGreater(int(preview_mask.sum()), 0)
+
+        # --- Clear Preview: hides the overlay without touching the seeds ---
+        widget.on_clear_preview_wand_clicked()
+        slicer.app.processEvents()
+        cleared_preview = slicer.util.arrayFromSegmentBinaryLabelmap(
+            preview_node, preview_id, widget.get_volume_node()
+        )
+        if cleared_preview is not None:
+            self.assertEqual(int(cleared_preview.sum()), 0)
+        self.assertTrue(widget._is_selection_wand_seed_valid())
+
+        # Apply Subtract through the Magic wand path; expected mask_a & ~baseline_mask.
+        widget.segment_editor_node.SetSelectedSegmentID(seg_a_id)
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            mask_a, segmentation_node, seg_a_id, widget.get_volume_node()
+        )
+        widget.previous_states["segment_data"] = mask_a_bool
+        widget.ui.cbSelectionOperation.setCurrentIndex(1)  # Subtract
+        widget.on_apply_selection_op_clicked()
+        slicer.app.processEvents()
+        self.assertTrue(
+            np.array_equal(
+                widget.get_segment_data().astype(bool),
+                mask_a_bool & ~baseline_mask,
+            ),
+            msg="Magic wand subtract produced an unexpected mask.",
+        )
+
+        # --- Undo: roll back the just-applied subtract ---
+        widget.on_undo_selection_op_clicked()
+        slicer.app.processEvents()
+        self.assertTrue(
+            np.array_equal(
+                widget.get_segment_data().astype(bool),
+                mask_a_bool,
+            ),
+            msg="Undo should restore the target segment to its pre-Apply state.",
+        )
+
+        # Seed Clear Seeds with an orphan node using a historical name to
+        # verify _destroy_wand_seed sweeps the whole family.
+        orphan = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode")
+        orphan.SetName("SelectionOpWandSeedsNegative")
+        orphan.AddControlPoint(0.0, 0.0, 0.0)
+
+        widget.on_clear_wand_seed_clicked()
+        self.assertFalse(widget._is_selection_wand_seed_valid())
+        for legacy_name in widget._WAND_SEED_NODE_NAMES:
+            self.assertIsNone(
+                slicer.mrmlScene.GetFirstNodeByName(legacy_name),
+                msg=f"Clear Seeds should remove orphan node named {legacy_name}.",
+            )
+        # Restore Grow/Shrink to default for the cleanup.
+        widget.ui.sbGrowShrinkWand.value = 0
+
         # Cleanup ROI and restore segment operand source.
         widget.on_clear_roi_clicked()
         self.assertFalse(widget._is_selection_roi_valid())
