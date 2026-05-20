@@ -186,6 +186,7 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                         prompt_name
                     )
 
+            self._test_lasso_cross_slice_safe(widget)
             self._test_selection_operations(widget)
         finally:
             self.tearDown()
@@ -505,6 +506,43 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             print(f"[FAIL] {prompt_name}")
             raise
         print(f"[PASS] {prompt_name}")
+
+    def _test_lasso_cross_slice_safe(self, widget):
+        """
+        Lasso control points spanning multiple IJK slices used to raise a
+        ValueError when on_interaction_node_modified auto-submitted them. The
+        handler must catch that, clear the lasso, and recover.
+        """
+        print("Testing lasso cross-slice safety...")
+        volume_node = widget.get_volume_node()
+        self.assertIsNotNone(volume_node)
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        volume_node.GetIJKToRASMatrix(ijk_to_ras)
+
+        def ijk_to_ras_pt(ijk):
+            out = [0.0, 0.0, 0.0, 1.0]
+            ijk_to_ras.MultiplyPoint([ijk[0], ijk[1], ijk[2], 1.0], out)
+            return out[:3]
+
+        lasso_node = widget.prompt_types["lasso"]["node"]
+        self.assertIsNotNone(lasso_node)
+        lasso_node.RemoveAllControlPoints()
+        # Three points on three different slices so no IJK axis is constant.
+        for ijk in [(120, 120, 80), (130, 130, 82), (125, 140, 84)]:
+            ras = ijk_to_ras_pt(ijk)
+            lasso_node.AddControlPoint(ras[0], ras[1], ras[2])
+        self.assertGreaterEqual(lasso_node.GetNumberOfControlPoints(), 3)
+
+        # Must not raise; the handler should swallow the ValueError.
+        widget.submit_lasso_if_present()
+        slicer.app.processEvents()
+
+        self.assertEqual(
+            lasso_node.GetNumberOfControlPoints(), 0,
+            msg="Cross-slice lasso should be cleared by submit_lasso_if_present.",
+        )
+        self.assertFalse(widget.ui.pbInteractionLassoCancel.isVisible())
+        print("[PASS] lasso cross-slice safety")
 
     def _test_selection_operations(self, widget):
         """

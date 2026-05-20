@@ -804,7 +804,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if len(xyzs) < 3:
             return
 
-        mask = self.lasso_points_to_mask(xyzs)
+        # The lasso prompt only supports points on a single slice plane.
+        # If on_interaction_node_modified auto-submits a lasso whose control
+        # points span multiple slices, lasso_points_to_mask raises -- swallow
+        # the error, clear the lasso, and tell the user.
+        try:
+            mask = self.lasso_points_to_mask(xyzs)
+        except ValueError:
+            slicer.util.showStatusMessage(
+                "Lasso points must lie on a single slice plane; cleared.",
+                4000,
+            )
+            caller.RemoveAllControlPoints()
+            self.ui.pbInteractionLassoCancel.setVisible(False)
+            return
 
         volume_node = self.get_volume_node()
         if volume_node:
