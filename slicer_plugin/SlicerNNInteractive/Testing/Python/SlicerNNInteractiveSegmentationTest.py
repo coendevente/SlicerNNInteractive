@@ -649,6 +649,88 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                 msg=f"ROI boolean op {operation} produced an unexpected mask.",
             )
 
+        # --- ROI shape variants: Sphere and Ellipsoid ---
+        # Re-anchor the ROI to the original cube center/radius from the Box loop.
+        roi_node.SetCenter(center_ras)
+        roi_node.SetRadiusXYZ(radius_ras)
+        widget.ui.cbRoiShape.setCurrentIndex(0)
+        box_shape_mask = widget.roi_node_to_mask(roi_node)
+        self.assertTrue(
+            np.array_equal(box_shape_mask, box_mask),
+            msg="Explicit cbRoiShape=Box should match the default Box mask.",
+        )
+
+        # Sphere: inscribed in the cube ROI; must be a proper non-empty subset
+        # of the Box mask.
+        widget.ui.cbRoiShape.setCurrentIndex(1)
+        sphere_mask = widget.roi_node_to_mask(roi_node)
+        self.assertGreater(int(sphere_mask.sum()), 0)
+        self.assertLess(
+            int(sphere_mask.sum()), int(box_shape_mask.sum()),
+            msg="Sphere should contain fewer voxels than its bounding box.",
+        )
+        self.assertTrue(
+            np.array_equal(sphere_mask & box_shape_mask, sphere_mask),
+            msg="Sphere mask should be a subset of the Box mask.",
+        )
+        # Apply Subtract through the Sphere path.
+        widget.segment_editor_node.SetSelectedSegmentID(seg_a_id)
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            mask_a, segmentation_node, seg_a_id, widget.get_volume_node()
+        )
+        widget.previous_states["segment_data"] = mask_a_bool
+        widget.ui.cbSelectionOperation.setCurrentIndex(1)  # Subtract
+        widget.on_apply_selection_op_clicked()
+        slicer.app.processEvents()
+        self.assertTrue(
+            np.array_equal(
+                widget.get_segment_data().astype(bool),
+                mask_a_bool & ~sphere_mask,
+            ),
+            msg="Sphere subtract produced an unexpected mask.",
+        )
+
+        # Ellipsoid: anisotropic radii (stretch one axis) to clearly separate
+        # from the Sphere / Box cases.
+        ell_radius_ras = [radius_ras[0], radius_ras[1], radius_ras[2] * 2.0]
+        roi_node.SetRadiusXYZ(ell_radius_ras)
+        widget.ui.cbRoiShape.setCurrentIndex(2)
+        ellipsoid_mask = widget.roi_node_to_mask(roi_node)
+        self.assertGreater(int(ellipsoid_mask.sum()), 0)
+        widget.ui.cbRoiShape.setCurrentIndex(0)
+        ell_box_mask = widget.roi_node_to_mask(roi_node)
+        self.assertGreater(int(ell_box_mask.sum()), 0)
+        self.assertLess(
+            int(ellipsoid_mask.sum()), int(ell_box_mask.sum()),
+            msg="Ellipsoid should contain fewer voxels than its bounding box.",
+        )
+        self.assertTrue(
+            np.array_equal(ellipsoid_mask & ell_box_mask, ellipsoid_mask),
+            msg="Ellipsoid mask should be a subset of its bounding box.",
+        )
+        # Apply Subtract through the Ellipsoid path.
+        widget.ui.cbRoiShape.setCurrentIndex(2)
+        widget.segment_editor_node.SetSelectedSegmentID(seg_a_id)
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            mask_a, segmentation_node, seg_a_id, widget.get_volume_node()
+        )
+        widget.previous_states["segment_data"] = mask_a_bool
+        widget.ui.cbSelectionOperation.setCurrentIndex(1)  # Subtract
+        widget.on_apply_selection_op_clicked()
+        slicer.app.processEvents()
+        self.assertTrue(
+            np.array_equal(
+                widget.get_segment_data().astype(bool),
+                mask_a_bool & ~ellipsoid_mask,
+            ),
+            msg="Ellipsoid subtract produced an unexpected mask.",
+        )
+
+        # Restore the ROI to its cube radius and the shape selector to Box for
+        # the cleanup that follows.
+        roi_node.SetRadiusXYZ(radius_ras)
+        widget.ui.cbRoiShape.setCurrentIndex(0)
+
         # --- _aabb_to_voxel_box pure-logic coverage ---
         def fake_ras_to_ijk(pos):
             return [

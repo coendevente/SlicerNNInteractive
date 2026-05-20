@@ -389,7 +389,7 @@
             </item>
             <item>
              <widget class="QWidget" name="operandRoiContainer" native="true">
-              <layout class="QHBoxLayout" name="horizontalLayout_selops_roi">
+              <layout class="QVBoxLayout" name="verticalLayout_selops_roi">
                <property name="leftMargin">
                 <number>0</number>
                </property>
@@ -403,36 +403,73 @@
                 <number>0</number>
                </property>
                <item>
-                <widget class="QPushButton" name="pbPlaceRoi">
-                 <property name="minimumSize">
-                  <size>
-                   <width>0</width>
-                   <height>30</height>
-                  </size>
-                 </property>
-                 <property name="toolTip">
-                  <string>Create or show the operation ROI in the 3D view; drag its handles to position it.</string>
-                 </property>
-                 <property name="text">
-                  <string>Place / Show ROI</string>
-                 </property>
-                </widget>
+                <layout class="QHBoxLayout" name="horizontalLayout_selops_roi_buttons">
+                 <item>
+                  <widget class="QPushButton" name="pbPlaceRoi">
+                   <property name="minimumSize">
+                    <size>
+                     <width>0</width>
+                     <height>30</height>
+                    </size>
+                   </property>
+                   <property name="toolTip">
+                    <string>Create or show the operation ROI in the 3D view; drag its handles to position it.</string>
+                   </property>
+                   <property name="text">
+                    <string>Place / Show ROI</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QPushButton" name="pbClearRoi">
+                   <property name="minimumSize">
+                    <size>
+                     <width>0</width>
+                     <height>30</height>
+                    </size>
+                   </property>
+                   <property name="toolTip">
+                    <string>Remove the operation ROI from the scene.</string>
+                   </property>
+                   <property name="text">
+                    <string>Clear ROI</string>
+                   </property>
+                  </widget>
+                 </item>
+                </layout>
                </item>
                <item>
-                <widget class="QPushButton" name="pbClearRoi">
-                 <property name="minimumSize">
-                  <size>
-                   <width>0</width>
-                   <height>30</height>
-                  </size>
-                 </property>
-                 <property name="toolTip">
-                  <string>Remove the operation ROI from the scene.</string>
-                 </property>
-                 <property name="text">
-                  <string>Clear ROI</string>
-                 </property>
-                </widget>
+                <layout class="QHBoxLayout" name="horizontalLayout_selops_roi_shape">
+                 <item>
+                  <widget class="QLabel" name="lblRoiShape">
+                   <property name="text">
+                    <string>ROI shape:</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QComboBox" name="cbRoiShape">
+                   <property name="toolTip">
+                    <string>Shape of the ROI operand: an oriented box, an inscribed sphere, or an ellipsoid aligned with the ROI axes.</string>
+                   </property>
+                   <item>
+                    <property name="text">
+                     <string>Box</string>
+                    </property>
+                   </item>
+                   <item>
+                    <property name="text">
+                     <string>Sphere</string>
+                    </property>
+                   </item>
+                   <item>
+                    <property name="text">
+                     <string>Ellipsoid</string>
+                    </property>
+                   </item>
+                  </widget>
+                 </item>
+                </layout>
                </item>
               </layout>
              </widget>

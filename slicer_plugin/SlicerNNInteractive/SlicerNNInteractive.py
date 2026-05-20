@@ -110,6 +110,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         VTKObservationMixin.__init__(self)  # needed for parameter node observation
         # Operation ROI used as an alternative operand for Selection Operations.
         self._sel_op_roi_node = None
+        # Sphere/ellipsoid visualization for the operation ROI.
+        self._sel_op_roi_preview_node = None
+        self._sel_op_roi_preview_transform_node = None
 
     def setup(self):
         """
@@ -228,6 +231,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbSyncToServer.clicked.connect(self.on_sync_to_server_clicked)
         self.ui.pbApplySelectionOp.clicked.connect(self.on_apply_selection_op_clicked)
         self.ui.cbOperandSource.currentIndexChanged.connect(self._on_operand_source_changed)
+        self.ui.cbRoiShape.currentIndexChanged.connect(self._on_roi_shape_changed)
         self.ui.pbPlaceRoi.clicked.connect(self.on_place_roi_clicked)
         self.ui.pbClearRoi.clicked.connect(self.on_clear_roi_clicked)
         self.populate_operand_selector()
@@ -1529,7 +1533,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         x = M[0, 0] * ii + M[0, 1] * jj + M[0, 2] * kk + M[0, 3]
         y = M[1, 0] * ii + M[1, 1] * jj + M[1, 2] * kk + M[1, 3]
         z = M[2, 0] * ii + M[2, 1] * jj + M[2, 2] * kk + M[2, 3]
-        inside = (np.abs(x) <= rx) & (np.abs(y) <= ry) & (np.abs(z) <= rz)
+
+        shape_idx = self.ui.cbRoiShape.currentIndex  # 0=Box, 1=Sphere, 2=Ellipsoid
+        if shape_idx == 1:
+            # Sphere: inscribed in the (possibly non-cube) ROI box.
+            r = min(rx, ry, rz)
+            inside = (x * x + y * y + z * z) <= (r * r)
+        elif shape_idx == 2:
+            # Ellipsoid aligned with the ROI axes.
+            inside = (
+                (x / rx) ** 2 + (y / ry) ** 2 + (z / rz) ** 2
+            ) <= 1.0
+        else:
+            # Box (oriented bounding box, default).
+            inside = (np.abs(x) <= rx) & (np.abs(y) <= ry) & (np.abs(z) <= rz)
         if inside.any():
             mask[
                 kk[inside].astype(np.int64),
@@ -1601,14 +1618,158 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._sel_op_roi_node = node
 
         node.SetDisplayVisibility(True)
+
+        # Ensure shape preview tracks this ROI's pose and size.
+        if not self.hasObserver(
+            node, vtk.vtkCommand.ModifiedEvent, self._on_selection_roi_modified
+        ):
+            self.addObserver(
+                node, vtk.vtkCommand.ModifiedEvent, self._on_selection_roi_modified
+            )
+        self._get_or_create_selection_roi_preview()
+        self._update_selection_roi_preview()
         return node
 
     def _destroy_selection_roi(self):
-        """Remove the operation ROI node from the scene if it exists."""
+        """Remove the operation ROI node (and its preview) from the scene."""
         node = self._sel_op_roi_node
-        if node is not None and slicer.mrmlScene.IsNodePresent(node):
-            slicer.mrmlScene.RemoveNode(node)
+        if node is not None:
+            if self.hasObserver(
+                node, vtk.vtkCommand.ModifiedEvent, self._on_selection_roi_modified
+            ):
+                self.removeObserver(
+                    node, vtk.vtkCommand.ModifiedEvent, self._on_selection_roi_modified
+                )
+            if slicer.mrmlScene.IsNodePresent(node):
+                slicer.mrmlScene.RemoveNode(node)
         self._sel_op_roi_node = None
+        self._destroy_selection_roi_preview()
+
+    # -- ROI shape preview (sphere / ellipsoid visualization) --
+
+    def _get_or_create_selection_roi_preview(self):
+        """
+        Create (or recover) the hidden Model + LinearTransform nodes that
+        visualize the actual sphere/ellipsoid acted upon by the boolean
+        operation. The model carries a unit sphere mesh; the transform places
+        and scales it to match the current ROI + cbRoiShape.
+        """
+        model_name = "SelectionOpROIPreview"
+        transform_name = "SelectionOpROIPreviewTransform"
+
+        transform_node = self._sel_op_roi_preview_transform_node
+        if transform_node is None or not slicer.mrmlScene.IsNodePresent(transform_node):
+            existing = slicer.mrmlScene.GetFirstNodeByName(transform_name)
+            if existing is not None and existing.IsA("vtkMRMLLinearTransformNode"):
+                transform_node = existing
+            else:
+                transform_node = slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLLinearTransformNode"
+                )
+                transform_node.SetName(transform_name)
+            transform_node.HideFromEditorsOn()
+            self._sel_op_roi_preview_transform_node = transform_node
+
+        model_node = self._sel_op_roi_preview_node
+        if model_node is None or not slicer.mrmlScene.IsNodePresent(model_node):
+            existing = slicer.mrmlScene.GetFirstNodeByName(model_name)
+            if existing is not None and existing.IsA("vtkMRMLModelNode"):
+                model_node = existing
+            else:
+                model_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
+                model_node.SetName(model_name)
+
+            # Unit sphere; transform handles all scale/rotation/translation.
+            sphere = vtk.vtkSphereSource()
+            sphere.SetRadius(1.0)
+            sphere.SetThetaResolution(24)
+            sphere.SetPhiResolution(24)
+            sphere.Update()
+            model_node.SetAndObservePolyData(sphere.GetOutput())
+
+            model_node.HideFromEditorsOn()
+            model_node.CreateDefaultDisplayNodes()
+            display_node = model_node.GetDisplayNode()
+            if display_node is not None:
+                color = (1.0, 0.55, 0.1)
+                display_node.SetColor(*color)
+                display_node.SetEdgeColor(*color)
+                display_node.SetOpacity(0.25)
+                display_node.SetSliceIntersectionVisibility(True)
+                display_node.SetSliceIntersectionThickness(2)
+                display_node.SetVisibility2D(True)
+                display_node.SetVisibility(True)
+            self._sel_op_roi_preview_node = model_node
+
+        # (Re)attach model to transform.
+        model_node.SetAndObserveTransformNodeID(transform_node.GetID())
+        return model_node, transform_node
+
+    def _update_selection_roi_preview(self):
+        """
+        Recompute the preview transform (and visibility) from the current ROI
+        + cbRoiShape selection. Safe to call even when the ROI is absent.
+        """
+        if not self._is_selection_roi_valid():
+            self._set_preview_visible(False)
+            return
+
+        shape_idx = self.ui.cbRoiShape.currentIndex  # 0=Box, 1=Sphere, 2=Ellipsoid
+        if shape_idx == 0:
+            self._set_preview_visible(False)
+            return
+
+        radius = [0.0, 0.0, 0.0]
+        self._sel_op_roi_node.GetRadiusXYZ(radius)
+        rx, ry, rz = radius
+        if min(rx, ry, rz) <= 0.0:
+            self._set_preview_visible(False)
+            return
+
+        if shape_idx == 1:
+            r = min(rx, ry, rz)
+            sx = sy = sz = r
+        else:
+            sx, sy, sz = rx, ry, rz
+
+        # World = ObjectToWorld @ Scale.
+        o2w_vtk = self._sel_op_roi_node.GetObjectToWorldMatrix()
+        scaled = vtk.vtkMatrix4x4()
+        scaled.DeepCopy(o2w_vtk)
+        # Multiply each column of the 3x3 part by its scale.
+        scale = (sx, sy, sz)
+        for col in range(3):
+            for row in range(3):
+                scaled.SetElement(
+                    row, col, o2w_vtk.GetElement(row, col) * scale[col]
+                )
+
+        model_node, transform_node = self._get_or_create_selection_roi_preview()
+        transform_node.SetMatrixTransformToParent(scaled)
+        self._set_preview_visible(True)
+
+    def _set_preview_visible(self, visible):
+        """Toggle visibility of the preview model node (no-op if absent)."""
+        model_node = self._sel_op_roi_preview_node
+        if model_node is None or not slicer.mrmlScene.IsNodePresent(model_node):
+            return
+        display_node = model_node.GetDisplayNode()
+        if display_node is None:
+            return
+        display_node.SetVisibility(bool(visible))
+        display_node.SetVisibility2D(bool(visible))
+
+    def _destroy_selection_roi_preview(self):
+        """Remove the preview model + transform nodes from the scene."""
+        for attr in ("_sel_op_roi_preview_node", "_sel_op_roi_preview_transform_node"):
+            node = getattr(self, attr, None)
+            if node is not None and slicer.mrmlScene.IsNodePresent(node):
+                slicer.mrmlScene.RemoveNode(node)
+            setattr(self, attr, None)
+
+    def _on_selection_roi_modified(self, caller, event):
+        """ROI moved/resized/rotated -- keep preview transform in sync."""
+        self._update_selection_roi_preview()
 
     def on_place_roi_clicked(self, checked=False):
         """Create or show the operation ROI in the 3D view."""
@@ -1623,6 +1784,21 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Remove the operation ROI."""
         self._destroy_selection_roi()
         self._refresh_apply_enabled()
+
+    def _on_roi_shape_changed(self, index):
+        """Status-bar hint clarifying what each ROI shape means, plus preview refresh."""
+        if index == 1:
+            slicer.util.showStatusMessage(
+                "Sphere mode uses the inscribed sphere "
+                "(radius = min of the ROI's three half-extents).",
+                5000,
+            )
+        elif index == 2:
+            slicer.util.showStatusMessage(
+                "Ellipsoid mode uses the ellipsoid aligned with the ROI axes.",
+                5000,
+            )
+        self._update_selection_roi_preview()
 
     def _refresh_apply_enabled(self):
         """Enable Apply only when the current operand source has a usable operand."""
