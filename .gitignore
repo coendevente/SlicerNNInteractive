@@ -73,7 +73,10 @@ ENV/
 # mypy
 .mypy_cache/
 
-# temp 
+# Packaged Slicer extension (built for distribution, not source)
+slicer_plugin/SlicerNNInteractive.zip
+
+# temp
 temp/
 
 # log files
