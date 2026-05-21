@@ -207,6 +207,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         _ = self.get_current_segment_id()
         self.previous_states = {}
 
+        # (numpy_axis, center) describing the slice plane of the last lasso
+        # prompt. Set only by lasso_points_to_mask and consumed (reset to None)
+        # by show_segmentation, so only lasso results get slice-range clipped.
+        self._last_lasso_slice = None
+
         # Sweep any orphaned magic wand seed nodes left behind by earlier
         # versions / earlier reloads so the scene is clean on module load.
         self._destroy_wand_seed()
@@ -263,6 +268,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbClearPreviewWand.clicked.connect(self.on_clear_preview_wand_clicked)
         self.ui.pbUndoSelectionOp.clicked.connect(self.on_undo_selection_op_clicked)
         self.ui.sldSegmentOpacity.valueChanged.connect(self._on_segment_opacity_changed)
+        self.ui.cbEnableLassoClip.toggled.connect(self._on_lasso_clip_enabled_changed)
+        self.ui.sbLassoClipN.valueChanged.connect(self._on_lasso_clip_n_changed)
+        # Load persisted lasso-clip prefs into the widgets (block signals so
+        # setting the value does not immediately re-save it).
+        blocked = self.ui.cbEnableLassoClip.blockSignals(True)
+        self.ui.cbEnableLassoClip.setChecked(self._get_lasso_clip_enabled())
+        self.ui.cbEnableLassoClip.blockSignals(blocked)
+        blocked = self.ui.sbLassoClipN.blockSignals(True)
+        self.ui.sbLassoClipN.setValue(self._get_lasso_clip_n())
+        self.ui.sbLassoClipN.blockSignals(blocked)
         self.populate_operand_selector()
         self._install_selection_op_observers()
         # Initialize operand-row visibility and Apply enable state for the
@@ -1050,6 +1065,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Updates the currently selected segment with the given binary mask array.
         """
         t0 = time.time()
+        segmentation_mask = self._apply_lasso_slice_clip(segmentation_mask)
+        self._last_lasso_slice = None  # consume; non-lasso paths must not clip
         self.previous_states["segment_data"] = segmentation_mask
 
         segmentationNode, selectedSegmentID = (
@@ -1231,6 +1248,60 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         qt.QSettings().setValue(
             "SlicerNNInteractive/segment_opacity", float(value)
         )
+
+    # -- Lasso slice-range clipping (keep only the lasso slice +/- N) --
+
+    def _get_lasso_clip_enabled(self):
+        """Read whether lasso slice-range clipping is enabled. Default False."""
+        v = qt.QSettings().value("SlicerNNInteractive/lasso_clip_enabled", False)
+        if isinstance(v, str):
+            return v.lower() == "true"
+        return bool(v)
+
+    def _get_lasso_clip_n(self):
+        """Read the persisted +/- N slices for lasso clipping. Default 0."""
+        try:
+            return max(
+                0, int(qt.QSettings().value("SlicerNNInteractive/lasso_clip_n", 0))
+            )
+        except (TypeError, ValueError):
+            return 0
+
+    def _on_lasso_clip_enabled_changed(self, checked):
+        """Persist the lasso-clip enable checkbox."""
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/lasso_clip_enabled", bool(checked)
+        )
+
+    def _on_lasso_clip_n_changed(self, value):
+        """Persist the lasso-clip +/- N slices spin box."""
+        qt.QSettings().setValue("SlicerNNInteractive/lasso_clip_n", int(value))
+
+    def _apply_lasso_slice_clip(self, mask):
+        """If enabled and the last prompt was a lasso, keep only the slices in
+        [center-N, center+N] along the lasso plane axis and zero out the rest.
+        mask is (z, y, x) uint8. Returns a new array, or the original on no-op.
+        """
+        if not self._get_lasso_clip_enabled():
+            return mask
+        info = self._last_lasso_slice
+        if info is None:
+            return mask
+        axis, center = info
+        if axis not in (0, 1, 2):
+            return mask
+        n = self._get_lasso_clip_n()
+        dim = mask.shape[axis]
+        lo = max(0, center - n)
+        hi = min(dim, center + n + 1)  # exclusive upper bound
+        if lo >= hi:
+            return mask
+        clipped = np.zeros_like(mask)
+        idx = [slice(None)] * 3
+        idx[axis] = slice(lo, hi)
+        idx = tuple(idx)
+        clipped[idx] = mask[idx]
+        return clipped
 
     ###############################################################################
     # Selection operations (boolean editing)
@@ -2766,6 +2837,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             z_coords = pts[:, 2]
             rr, cc = polygon(z_coords, y_coords, shape=(shape[0], shape[1]))
             mask[rr, cc, const_val] = 1
+
+        # Record the lasso plane so show_segmentation can clip the result to
+        # this slice +/- N. xyz axis i maps to numpy mask axis (2 - i).
+        self._last_lasso_slice = (2 - const_axis, const_val)
 
         return mask
 

@@ -780,6 +780,43 @@
        </layout>
       </item>
       <item>
+       <layout class="QHBoxLayout" name="horizontalLayout_lassoClip">
+        <item>
+         <widget class="QCheckBox" name="cbEnableLassoClip">
+          <property name="text">
+           <string>Limit lasso result to +/- N slices</string>
+          </property>
+          <property name="toolTip">
+           <string>When checked, a lasso result is cropped to the lasso slice plus/minus N slices along the lasso plane axis. Only affects the Lasso tool.</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="lblLassoClipN">
+          <property name="text">
+           <string>+/- slices:</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QSpinBox" name="sbLassoClipN">
+          <property name="toolTip">
+           <string>0 keeps only the lasso slice.</string>
+          </property>
+          <property name="minimum">
+           <number>0</number>
+          </property>
+          <property name="maximum">
+           <number>200</number>
+          </property>
+          <property name="value">
+           <number>0</number>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
        <widget class="qMRMLSegmentEditorWidget" name="editor_widget">
         <property name="defaultTerminologyEntrySettingsKey">
          <string notr="true"/>
