@@ -2589,10 +2589,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             effect.setParameter("SliceCutMode", "Unlimited")
 
         # Watch the input node so Apply enables and the 3D surface refreshes as
-        # soon as a region is carved.
+        # soon as a region is carved. Use AnyEvent (not ModifiedEvent): Scissors
+        # edits the segment labelmap through events that do not fire the node's
+        # plain ModifiedEvent, the same reason the scribble Paint observer uses
+        # AnyEvent.
         if self._lasso3d_input_observer_tag is None:
             self._lasso3d_input_observer_tag = node.AddObserver(
-                vtk.vtkCommand.ModifiedEvent, self._on_lasso3d_input_modified
+                vtk.vtkCommand.AnyEvent, self._on_lasso3d_input_modified
             )
 
         slicer.util.showStatusMessage(
@@ -2827,6 +2830,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             node.CreateClosedSurfaceRepresentation()
         # Hide the raw drawn region so it does not occlude the AI preview in 3D.
         self._set_lasso3d_input_visible(False)
+        # Belt-and-suspenders: a successful preview means a region was drawn, so
+        # Apply must be clickable even if the draw-time observer never fired.
+        self._refresh_apply_enabled()
 
     def on_preview_lasso3d_clicked(self, checked=False):
         """Run a one-shot lasso AI call and write the result into the preview."""

@@ -46,7 +46,7 @@
 - [ ] **待在 Slicer 内端到端验证**（需运行中的 server）：
   1. Reload；`operandLasso3dContainer` 有两行四按钮。
   2. 载入体数据、选目标 segment、开体绘制或显示分段表面。
-  3. 选 "Lasso (3D)" -> 画闭合环 -> 黄色输入区域、Apply 可用。
+  3. 选 "Lasso (3D)" -> 画闭合环 -> 黄色输入区域出现、**Apply 立即变亮**（v2.1 修复：观察器改用 AnyEvent，否则 Scissors 编辑不触发 ModifiedEvent，Apply 会一直灰着）。
   4. "Preview" -> 青色 AI 预览、输入隐藏；"Clear Preview" 撤销并恢复输入。
   5. 选运算 -> Apply -> 目标 segment 变化、提示已同步 server。
   6. Undo 还原；切换来源/进入其它 prompt 时套索停用、节点清理；关闭重载无 `Lasso3dInputSegmentNode`/`Lasso3dPreviewSegmentNode` 残留。
