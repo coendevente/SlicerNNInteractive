@@ -66,6 +66,17 @@ The whole client is one large `SlicerNNInteractiveWidget`. Key mechanism: the `@
 
 Prompts are driven by Slicer Markups nodes registered in `self.prompt_types` (point = Fiducial, bbox = ROI, lasso = ClosedCurve), each with an `on_placed` observer that fires the corresponding prompt. The **scribble** prompt is different: it uses a hidden background `qMRMLSegmentEditorWidget` with the Paint effect, and sends the *diff* of consecutive strokes.
 
-All segmentation always applies to the currently selected segment in the embedded Segment Editor. The hidden node named `"ScribbleSegmentNode (do not touch)"` is internal scaffolding and is deliberately excluded from `get_segmentation_node()`.
+All segmentation always applies to the currently selected segment in the embedded Segment Editor. Two hidden nodes are internal scaffolding and are deliberately excluded from `get_segmentation_node()`: `"ScribbleSegmentNode (do not touch)"` (Paint scratch space) and `"MagicWandPreviewSegmentNode (do not touch)"` (see Custom features below).
 
 The test class is imported into the module file at the bottom and exposed as `SlicerNNInteractiveTest` so Slicer's `Reload and Test` picks it up.
+
+### Custom features (secondary development)
+
+These were added on top of upstream nnInteractive and live **entirely in the client** (`SlicerNNInteractive.py`); the server (`server/.../main.py`) is unchanged from upstream, so none of them add or call new endpoints. Design notes and reviews for each live in `dev_docs/`, named `feature_name.md` (proposal) plus `feature_name_review.md` (review) -- e.g. `dev_docs/semantic_selection_boolean_operations.md` and its `_review.md`.
+
+- **Selection Operations** -- boolean editing of the current segment (Add = OR, Subtract = AND NOT, Intersect = AND) against one of three operands chosen in `cbOperandSource`: an ROI box (`roi_node_to_mask`, supports box/sphere/ellipsoid and handles oblique volumes via OBB containment), the Magic Wand result, or another segment. Programmatic edits are tracked in a private undo stack (`_sel_op_undo_stack`) because the embedded Segment Editor's history does not capture them.
+- **Magic Wand** -- multi-point positive/negative seeds (`SelectionOpWandSeeds`) drive a client-side mask preview (hidden node `"MagicWandPreviewSegmentNode (do not touch)"`) that, once confirmed, is applied as a Selection Operations operand.
+- **Per-segment opacity** -- the `sldSegmentOpacity` slider; its default persists across sessions via `QSettings` and is applied to newly created segments.
+- **Lasso slice-range clipping** -- when enabled, a lasso result is clipped to the prompt slice +/- N slices. The lasso's constant slice plane is recorded in `_last_lasso_slice` at submit time and consumed once in `show_segmentation`; non-lasso prompts are never clipped.
+
+Cross-session preferences live under the `SlicerNNInteractive/` `QSettings` namespace (server URL, `segment_opacity`, `lasso_clip_enabled`, `lasso_clip_n`).
