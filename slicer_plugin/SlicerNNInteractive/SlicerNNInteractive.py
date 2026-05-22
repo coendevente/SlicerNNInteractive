@@ -1,7 +1,10 @@
 import io
 import gzip
+import logging
 import requests
 import copy
+import subprocess
+import sys
 import threading
 import time
 
@@ -25,53 +28,6 @@ from PythonQt.QtGui import QMessageBox
 
 
 ###############################################################################
-# Decorators and utility functions
-###############################################################################
-
-
-DEBUG_MODE = False
-
-
-def debug_print(*args):
-    if DEBUG_MODE:
-        print(*args)
-
-
-def ensure_synched(func):
-    """
-    Decorator that ensures the image and segment are synced before calling
-    the actual prompt function.
-    """
-
-    def inner(self, *args, **kwargs):
-        failed_to_sync = False
-
-        if self.image_changed():
-            debug_print(
-                "Image changed (or not previously set). Calling upload_segment_to_server()"
-            )
-            result = self.upload_image_to_server()
-
-            failed_to_sync = result is None
-
-        if not failed_to_sync and self.selected_segment_changed():
-            debug_print(
-                "Segment changed (or not previously set). Calling upload_segment_to_server()"
-            )
-            self.remove_all_but_last_prompt()
-            result = self.upload_segment_to_server()
-
-            failed_to_sync = result is None
-        else:
-            debug_print("Segment did not change!")
-
-        if not failed_to_sync:
-            return func(self, *args, **kwargs)
-
-    return inner
-
-
-###############################################################################
 # SlicerNNInteractive
 ###############################################################################
 
@@ -85,7 +41,7 @@ class SlicerNNInteractive(ScriptedLoadableModule):
             translate("qSlicerAbstractCoreModule", "Segmentation")
         ]
         self.parent.dependencies = []  # List other modules if needed
-        self.parent.contributors = ["Coen de Vente", "Kiran Vaidhya Venkadesh", "Bram van Ginneken", "Clara I. Sanchez"]
+        self.parent.contributors = ["Coen de Vente", "Andras Lasso", "Kiran Vaidhya Venkadesh", "Bram van Ginneken", "Clara I. Sanchez"]
         self.parent.helpText = """
             This is an 3D Slicer extension for using nnInteractive.
 
@@ -100,6 +56,62 @@ class SlicerNNInteractive(ScriptedLoadableModule):
 
 
 class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+
+    INTERNAL_SERVER_URL = "http://127.0.0.1:1527"
+
+    def ensure_synched(func):
+        """
+        Decorator that ensures the image and segment are synced before calling
+        the actual prompt function.
+        """
+        def inner(self, *args, **kwargs):
+            self.install_dependencies()
+
+            if self._internal_server_mode and not self._server_launching_dependencies_installed:
+                return
+
+            if self._internal_server_mode and not self._is_internal_server_running():
+                started = self.start_internal_server()
+                if started:
+                    progressbar = slicer.util.createProgressDialog(autoClose=False)
+                    progressbar.minimum = 0
+                    progressbar.maximum = 0
+                    progressbar.setLabelText("Waiting for nnInteractive server to start...")
+                    slicer.app.processEvents()
+                    ready = self._wait_for_server_ready(timeout=120)
+                    progressbar.close()
+                    if not ready:
+                        error_detail = getattr(self, "_server_last_error", "").strip()
+                        if error_detail:
+                            msg = f"nnInteractive server failed to start.\n\nServer output:\n{error_detail}"
+                        else:
+                            msg = (
+                                "nnInteractive server did not start in time. "
+                                "Please try again or start it manually using the 'Start Server' button."
+                            )
+                        slicer.util.errorDisplay(msg)
+                        return
+
+            failed_to_sync = False
+
+            if self.image_changed():
+                logging.debug("Image changed (or not previously set). Calling upload_image_to_server()")
+                result = self.upload_image_to_server()
+                failed_to_sync = result is None
+
+            if not failed_to_sync and self.selected_segment_changed():
+                logging.debug("Segment changed (or not previously set). Calling upload_segment_to_server()")
+                self.remove_all_but_last_prompt()
+                result = self.upload_segment_to_server()
+                failed_to_sync = result is None
+            else:
+                logging.debug("Segment did not change!")
+
+            if not failed_to_sync:
+                return func(self, *args, **kwargs)
+
+        return inner
+
     ###############################################################################
     # Setup and initialization functions
     ###############################################################################
@@ -108,14 +120,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Called when the user opens the module the first time and the widget is initialized."""
         ScriptedLoadableModuleWidget.__init__(self, parent)
         VTKObservationMixin.__init__(self)  # needed for parameter node observation
+        self._server_connection_dependencies_installed = False
+        self._server_launching_dependencies_installed = False
+        self._server_process = None
+        self._internal_server_mode = True
+        self._server_log_lock = threading.Lock()
+        self._server_log_buffer = []
+        self._server_log_threads = []
+        self._server_log_timer = None
 
     def setup(self):
         """
         Overridden setup method. Initializes UI and setups up prompts.
         """
         ScriptedLoadableModuleWidget.setup(self)
-
-        self.install_dependencies()
 
         ui_widget = slicer.util.loadUI(self.resourcePath("UI/SlicerNNInteractive.ui"))
         self.layout.addWidget(ui_widget)
@@ -187,12 +205,35 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Connect UI elements to functions.
         """
-        self.ui.uploadProgressGroup.setVisible(False)
 
-        # Load the saved server URL (default to an empty string if not set)
-        savedServer = slicer.util.settingsValue("SlicerNNInteractive/server", "")
+        # On macOS, internal server is not supported; force external mode
+        is_macos = sys.platform == "darwin"
+        if is_macos:
+            self._internal_server_mode = False
+            self.ui.rbInternalServer.setEnabled(False)
+            self.ui.rbInternalServer.setToolTip(
+                "<html>Internal server is not available on macOS. "
+                "An external server must be set up - see "
+                "<a href='https://github.com/coendevente/SlicerNNInteractive#server-side'>server-side setup instructions</a>.</html>"
+            )
+            self.ui.rbExternalServer.setChecked(True)
+            self.ui.internalServerWidget.setEnabled(False)
+            self.ui.externalServerWidget.setEnabled(True)
+        else:
+            saved_mode = slicer.util.settingsValue("SlicerNNInteractive/serverMode", "internal")
+            self._internal_server_mode = (saved_mode == "internal")
+            self.ui.rbInternalServer.setChecked(self._internal_server_mode)
+            self.ui.rbExternalServer.setChecked(not self._internal_server_mode)
+            self.ui.internalServerWidget.setEnabled(self._internal_server_mode)
+            self.ui.externalServerWidget.setEnabled(not self._internal_server_mode)
+            self.ui.rbInternalServer.toggled.connect(self.on_server_mode_changed)
+        self.ui.pbStartStopServer.clicked.connect(self.on_start_stop_server_clicked)
+        self.update_start_stop_button()
+
+        # Load saved external server URL
+        savedServer = slicer.util.settingsValue("SlicerNNInteractive/server", "http://localhost:1527")
         self.ui.Server.text = savedServer
-        self.server = savedServer.rstrip("/")
+        self.server = self.INTERNAL_SERVER_URL if self._internal_server_mode else savedServer.rstrip("/")
 
         self.ui.Server.editingFinished.connect(self.update_server)
         self.ui.pbTestServer.clicked.connect(self.test_server_connection)
@@ -219,8 +260,180 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self.ui.pbInteractionLassoCancel.clicked.connect(self.on_lasso_cancel_clicked)
 
-        self.addObserver(slicer.app.applicationLogic().GetInteractionNode(), 
+        self.addObserver(slicer.app.applicationLogic().GetInteractionNode(),
             slicer.vtkMRMLInteractionNode.InteractionModeChangedEvent, self.on_interaction_node_modified)
+
+        self.ui.pbClearServerOutput.clicked.connect(
+            lambda: self.ui.serverOutputTextEdit.clear()
+        )
+        self._init_server_log_polling()
+
+    def on_server_mode_changed(self, internal_selected):
+
+        # On macOS, internal server is not supported.
+        # Do not save the current choice in settings, as users actually prefer an external server,
+        # there is just no other option for now.
+        is_macos = sys.platform == "darwin"
+        if is_macos:
+            return
+
+        self._internal_server_mode = internal_selected
+        settings = qt.QSettings()
+        settings.setValue("SlicerNNInteractive/serverMode", "internal" if internal_selected else "external")
+        self.ui.internalServerWidget.setEnabled(internal_selected)
+        self.ui.externalServerWidget.setEnabled(not internal_selected)
+        if internal_selected:
+            self.server = self.INTERNAL_SERVER_URL
+        else:
+            self.stop_internal_server()
+            self.server = self.ui.Server.text.rstrip("/")
+
+    def on_start_stop_server_clicked(self):
+        if self._is_internal_server_running():
+            self.stop_internal_server()
+        else:
+            self.start_internal_server()
+
+    def start_internal_server(self):
+        if self._is_internal_server_running():
+            return True
+        # Installed/built layout: nninteractive_slicer_server/ sits next to this script.
+        # Source-tree layout (development): server/ is two directories above slicer_plugin/.
+        server_main = Path(__file__).parent / "nninteractive_slicer_server" / "main.py"
+        if not server_main.exists():
+            server_main = Path(__file__).parents[2] / "server" / "nninteractive_slicer_server" / "main.py"
+        if not server_main.exists():
+            logging.error(f"Server script not found: {server_main}")
+            self.update_start_stop_button()
+            return False
+        server_cmd = [sys.executable, str(server_main)]
+        try:
+            kwargs = {}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            self._server_process = subprocess.Popen(
+                server_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **kwargs,
+            )
+            logging.info(f"Started nnInteractive server (PID: {self._server_process.pid})")
+            self._start_server_log_pump()
+            self.update_start_stop_button()
+            return True
+        except Exception as e:
+            logging.error(f"Failed to start internal server: {e}")
+            self._server_process = None
+            self.update_start_stop_button()
+            return False
+
+    def stop_internal_server(self):
+        if self._server_process is not None:
+            try:
+                self._server_process.terminate()
+                self._server_process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._server_process.kill()
+                except Exception:
+                    pass
+            self._server_process = None
+        try:
+            self.update_start_stop_button()
+        except Exception:
+            pass
+
+    def _append_server_log(self, text):
+        if not text:
+            return
+        with self._server_log_lock:
+            self._server_log_buffer.append(text)
+
+    def _consume_server_logs(self):
+        with self._server_log_lock:
+            if not self._server_log_buffer:
+                return ""
+            combined = "\n".join(self._server_log_buffer)
+            self._server_log_buffer = []
+            return combined
+
+    def _read_server_stream(self, stream):
+        try:
+            while True:
+                raw_line = stream.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if line:
+                    self._append_server_log(line)
+        except Exception as e:
+            self._append_server_log(f"[log reader error: {e}]")
+
+    def _start_server_log_pump(self):
+        self._server_log_threads = []
+        if self._server_process is None:
+            return
+        for stream in [self._server_process.stdout, self._server_process.stderr]:
+            if stream is None:
+                continue
+            t = threading.Thread(
+                target=self._read_server_stream,
+                args=(stream,),
+                daemon=True,
+            )
+            t.start()
+            self._server_log_threads.append(t)
+
+    def _init_server_log_polling(self):
+        if self._server_log_timer is not None:
+            return
+        self._server_log_timer = qt.QTimer()
+        self._server_log_timer.setInterval(250)
+        self._server_log_timer.connect("timeout()", self._poll_server_logs)
+        self._server_log_timer.start()
+
+    def _poll_server_logs(self):
+        text = self._consume_server_logs()
+        if not text:
+            return
+        try:
+            self.ui.serverOutputTextEdit.appendPlainText(text)
+        except Exception:
+            pass
+
+    def _is_internal_server_running(self):
+        return self._server_process is not None and self._server_process.poll() is None
+
+    def update_start_stop_button(self):
+        try:
+            if self._is_internal_server_running():
+                self.ui.pbStartStopServer.setText("Stop Server")
+            else:
+                self.ui.pbStartStopServer.setText("Start Server")
+        except Exception:
+            pass
+
+    def _wait_for_server_ready(self, timeout=120):
+        self._server_last_error = ""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._is_internal_server_running():
+                # Process died - let reader threads drain, then capture output
+                for t in self._server_log_threads:
+                    t.join(timeout=1.0)
+                self._server_last_error = self._consume_server_logs()
+                self._server_process = None
+                self.update_start_stop_button()
+                return False
+            try:
+                requests.get(self.server, timeout=1)
+                self.update_start_stop_button()
+                return True
+            except Exception:
+                pass
+            slicer.app.processEvents()
+            time.sleep(0.5)
+        return False
 
     def setup_shortcuts(self):
         """
@@ -239,7 +452,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.shortcut_items = {}
 
         for shortcut_key, shortcut_event in shortcuts.items():
-            debug_print(f"Added shortcut for {shortcut_key}: {shortcut_event}")
+            logging.debug(f"Added shortcut for {shortcut_key}: {shortcut_event}")
             shortcut = qt.QShortcut(
                 qt.QKeySequence(shortcut_key), slicer.util.mainWindow()
             )
@@ -258,56 +471,92 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def install_dependencies(self):
         """
-        Checks for (and installs if needed) python packages needed by the module.
+        Installs Python packages needed by the module.
+        Connection dependencies (requests_toolbelt, scikit-image) are always installed.
+        Server-launching dependencies (NNUNet, nnInteractive, server runtime) are only
+        installed when the internal server mode is active.
         """
-        dependencies = {
-            "requests_toolbelt": "requests_toolbelt",
-            "skimage": "scikit-image",
-            "matplotlib": "matplotlib",
-        }
+        if not self._server_connection_dependencies_installed:
+            self._install_server_connection_dependencies()
 
-        for dependency in dependencies:
-            if self.check_dependency_installed(dependency, dependencies[dependency]):
-                continue
-            self.run_with_progress_bar(
-                self.pip_install_wrapper,
-                (dependencies[dependency],),
-                "Installing dependencies: %s" % dependency,
+        if self._internal_server_mode and not self._server_launching_dependencies_installed:
+            self._install_server_launching_dependencies()
+
+    def _install_server_connection_dependencies(self):
+        deps = [
+            ("requests_toolbelt", "requests_toolbelt"),
+            ("skimage", "scikit-image"),
+        ]
+        for import_name, pkg in deps:
+            if not self.check_dependency_installed(import_name, pkg):
+                slicer.util.pip_install(pkg)
+        self._server_connection_dependencies_installed = True
+
+    def _install_server_launching_dependencies(self):
+        if not self.isNNUNetModuleInstalled():
+            raise RuntimeError(
+                "The internal server requires the NNUNet extension."
+                " Please install the NNUNet extension and restart to proceed."
             )
+
+        if not self._installNNUNetIfNeeded():
+            raise RuntimeError("The internal server requires the NNUNet Python package.")
+
+        deps = [
+            ("requests_toolbelt", "requests_toolbelt"),
+            ("skimage", "scikit-image"),
+            # Dependencies for the local nninteractive server (server/nninteractive_slicer_server/main.py).
+            # nnInteractive>=1.1.5 requires nnunetv2>=2.7.0 (compatible with the installed version).
+            ("nnInteractive", "nnInteractive>=1.1.5"),
+            ("uvicorn", "uvicorn"),
+            ("xxhash", "xxhash"),
+            ("fastapi", "fastapi"),
+            ("multipart", "python-multipart"),
+            ("huggingface_hub", "huggingface_hub"),
+        ]
+        for import_name, pkg in deps:
+            if not self.check_dependency_installed(import_name, pkg):
+                slicer.util.pip_install(pkg)
+        self._server_launching_dependencies_installed = True
+        # Internal server launching dependencies include server connection dependencies
+        self._server_connection_dependencies_installed = True
+
+    @staticmethod
+    def isNNUNetModuleInstalled():
+        try:
+            import SlicerNNUNetLib
+            return True
+        except ImportError:
+            return False
+
+    def _installNNUNetIfNeeded(self) -> bool:
+        from SlicerNNUNetLib import InstallLogic
+        logic = InstallLogic()
+        return logic.setupPythonRequirements()
 
     def check_dependency_installed(self, import_name, module_name_and_version):
         """
-        Checks if a package is installed with the correct version.
+        Checks if a package is importable and satisfies the version requirement.
+        Accepts any PEP 440 specifier (e.g. 'pkg==1.2', 'pkg>=1.1.5', 'pkg').
         """
-        if "==" in module_name_and_version:
-            module_name, module_version = module_name_and_version.split("==")
-        else:
-            module_name = module_name_and_version
-            module_version = None
+        from packaging.requirements import Requirement
+        from packaging.version import Version
+        import importlib.metadata as metadata
 
-        spec = importlib.util.find_spec(import_name)
-        if spec is None:
-            # Not installed
+        req = Requirement(module_name_and_version)
+
+        if importlib.util.find_spec(import_name) is None:
             return False
 
-        if module_version is not None:
-            import importlib.metadata as metadata
+        if req.specifier:
             try:
-                version = metadata.version(module_name)
-                if version != module_version:
-                    # Version mismatch
+                installed = Version(metadata.version(req.name))
+                if installed not in req.specifier:
                     return False
             except metadata.PackageNotFoundError:
-                debug_print(f"Could not determine version for {module_name}.")
+                logging.debug(f"Could not determine version for {req.name}.")
 
         return True
-
-    def pip_install_wrapper(self, command, event):
-        """
-        Installs pip packages.
-        """
-        slicer.util.pip_install(command)
-        event.set()
 
     def run_with_progress_bar(self, target, args, title):
         """
@@ -346,6 +595,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._qt_event_filters = []
 
         self.remove_shortcut_items()
+        if self._server_log_timer is not None:
+            self._server_log_timer.stop()
+            self._server_log_timer = None
+        self.stop_internal_server()
 
     def __del__(self):
         """
@@ -365,7 +618,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             if skip_if_exists and slicer.mrmlScene.GetFirstNodeByName(
                 prompt_type["name"]
             ):
-                debug_print("Skipping", prompt_name)
+                logging.debug("Skipping %s", prompt_name)
                 continue
             node = slicer.mrmlScene.AddNewNodeByClass(prompt_type["node_class"])
             node.SetName(prompt_type["name"])
@@ -641,7 +894,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         volume_node = self.get_volume_node()
         if volume_node:
-            self.point_prompt(xyz=xyz, positive_click=self.is_positive)
+            with slicer.util.tryWithErrorDisplay(_("Segmentation failed."), waitCursor=True):
+                self.point_prompt(xyz=xyz, positive_click=self.is_positive)
 
     @ensure_synched
     def point_prompt(self, xyz=None, positive_click=False):
@@ -657,9 +911,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         unpacked_segmentation = self.unpack_binary_segmentation(
             seg_response.content, decompress=False
         )
-        debug_print("unpacked_segmentation.sum():", unpacked_segmentation.sum())
-        debug_print(seg_response)
-        debug_print(f"{positive_click} point prompt triggered! {xyz}")
+        logging.debug(f"unpacked_segmentation.sum(): {unpacked_segmentation.sum()}")
+        logging.debug(seg_response)
+        logging.debug(f"{positive_click} point prompt triggered! {xyz}")
 
         self.show_segmentation(unpacked_segmentation)
 
@@ -690,11 +944,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     xyz[2] * 2 - outer_point_two[2],
                 ]
 
-                self.bbox_prompt(
-                    outer_point_one=outer_point_one,
-                    outer_point_two=outer_point_two,
-                    positive_click=self.is_positive,
-                )
+                with slicer.util.tryWithErrorDisplay(_("Segmentation failed."), waitCursor=True):
+                    self.bbox_prompt(
+                        outer_point_one=outer_point_one,
+                        outer_point_two=outer_point_two,
+                        positive_click=self.is_positive,
+                    )
 
                 def _next():
                     self.setup_prompts()
@@ -762,9 +1017,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         volume_node = self.get_volume_node()
         if volume_node:
-            self.lasso_or_scribble_prompt(
-                mask=mask, positive_click=self.is_positive, tp="lasso"
-            )
+            with slicer.util.tryWithErrorDisplay(_("Segmentation failed."), waitCursor=True):
+                self.lasso_or_scribble_prompt(
+                    mask=mask, positive_click=self.is_positive, tp="lasso"
+                )
 
             def _next():
                 self.setup_prompts()
@@ -827,7 +1083,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 ),
                 "label_name": segment_id,
             }
-        debug_print(f"Scribble mode (hidden editor) activated on '{segment_id}'")
+        logging.debug(f"Scribble mode (hidden editor) activated on '{segment_id}'")
 
     #
     #  -- Lasso/scribble
@@ -870,18 +1126,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
                 self.show_segmentation(unpacked_segmentation)
             else:
-                debug_print(
+                logging.debug(
                     f"lasso_or_scribble_prompt upload failed with status code: {seg_response.status_code}"
                 )
         except Exception as e:
-            debug_print(f"Error in lasso_or_scribble_prompt: {e}")
+            logging.debug(f"Error in lasso_or_scribble_prompt: {e}")
 
     def on_scribble_finished(self, caller, event):
         """
         Called when the user completes a scribble stroke in the Paint effect.
         We calculate the diff in the drawn region and send it to the server.
         """
-        debug_print("Scribble stroke finished - labelmap modified!")
+        logging.debug("Scribble stroke finished - labelmap modified!")
 
         # Clean up observer if you only want it once
         if hasattr(self, "_scribble_labelmap_callback_tag"):
@@ -906,9 +1162,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         diff_mask = mask - prev_scribble_mask
         self._prev_scribble_mask = mask
 
-        self.lasso_or_scribble_prompt(
-            mask=diff_mask, positive_click=self.is_positive, tp="scribble"
-        )
+        with slicer.util.tryWithErrorDisplay(_("Segmentation failed."), waitCursor=True):
+            self.lasso_or_scribble_prompt(
+                mask=diff_mask, positive_click=self.is_positive, tp="scribble"
+            )
 
         self.ui.pbInteractionScribble.click()  # turn it off
         self.ui.pbInteractionScribble.click()  # turn it on
@@ -926,7 +1183,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # we're automatically switching the prompt type to positive.
         self.ui.pbPromptTypePositive.click()
         
-        debug_print("doing make_new_segment")
+        logging.debug("doing make_new_segment")
         segmentation_node = self.get_segmentation_node()
 
         # Generate a new segment name
@@ -967,14 +1224,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         _, selected_segment_id = self.get_selected_segmentation_node_and_segment_id()
 
         if selected_segment_id:
-            debug_print(f"Clearing segment: {selected_segment_id}")
+            logging.debug(f"Clearing segment: {selected_segment_id}")
             self.show_segmentation(
                 np.zeros(self.get_image_data().shape, dtype=np.uint8)
             )
             self.setup_prompts()
             self.upload_segment_to_server()
         else:
-            debug_print("No segment selected to clear.")
+            logging.debug("No segment selected to clear.")
 
     def show_segmentation(self, segmentation_mask):
         """
@@ -1015,7 +1272,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         
         del segmentation_mask
 
-        debug_print(f"show_segmentation took {time.time() - t0}")
+        logging.debug(f"show_segmentation took {time.time() - t0}")
 
     def get_segmentation_node(self):
         """
@@ -1051,7 +1308,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Retrieve the currently selected segmentation node & segment ID.
         If none, create one.
         """
-        debug_print("doing get_selected_segmentation_node_and_segment_id")
+        logging.debug("doing get_selected_segmentation_node_and_segment_id")
         segmentation_node = self.get_segmentation_node()
         selected_segment_id = self.get_current_segment_id()
         if not selected_segment_id:
@@ -1090,14 +1347,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             old_segment_data.astype(bool), segment_data.astype(bool)
         )
 
-        debug_print(f"segment_data.sum(): {segment_data.sum()}")
+        logging.debug(f"segment_data.sum(): {segment_data.sum()}")
 
         if old_segment_data is not None:
-            debug_print(f"old_segment_data.sum(): {old_segment_data.sum()}")
+            logging.debug(f"old_segment_data.sum(): {old_segment_data.sum()}")
         else:
-            debug_print("old_segment_data is None")
+            logging.debug("old_segment_data is None")
 
-        debug_print(f"selected_segment_changed: {selected_segment_changed}")
+        logging.debug(f"selected_segment_changed: {selected_segment_changed}")
 
         return selected_segment_changed
 
@@ -1108,11 +1365,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def update_server(self):
         """
         Reads user-entered server URL from UI, saves to QSettings, updates self.server.
+        Only applies in external server mode.
         """
+        if self._internal_server_mode:
+            return
         self.server = self.ui.Server.text.rstrip("/")
         settings = qt.QSettings()
         settings.setValue("SlicerNNInteractive/server", self.server)
-        debug_print(f"Server URL updated and saved: {self.server}")
+        logging.debug(f"Server URL updated and saved: {self.server}")
 
     def test_server_connection(self):
         """
@@ -1179,7 +1439,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             error_message = None
             try:
                 response = requests.post(*args, **kwargs)
-                debug_print('response:', response)
+                logging.debug(f"response: {response}")
             except requests.exceptions.MissingSchema as e:
                 response = None
                 if self.server == "":
@@ -1207,7 +1467,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 resp_json = response.json()
                 if resp_json.get("status") == "error":
                     if "No image uploaded" in resp_json.get("message", ""):
-                        debug_print("No image has been uploaded to the server. Please upload an image first.")
+                        logging.debug("No image has been uploaded to the server. Please upload an image first.")
                         self.upload_image_to_server()
                         self.upload_segment_to_server()
                         return self.request_to_server(*args, **kwargs)
@@ -1215,7 +1475,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                         response = None
                         raise RuntimeError(f"Server error: {resp_json.get('message', 'Unknown error')}")
 
-            debug_print('1157 took', time.time() - t0)
+            logging.debug(f"1157 took {time.time() - t0}")
 
         return response
 
@@ -1223,17 +1483,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Gets volume data from Slicer, packs it, and uploads it to the server.
         """
-        debug_print("Syncing image with server...")
+        logging.debug("Syncing image with server...")
         try:
             # Retrieve image data, window, and level.
             t0 = time.time()
             image_data = (
                 self.get_image_data()
             )  # Expected to return (image_data, window, level)
-            debug_print(f"self.get_image_data took {time.time() - t0}")
+            logging.debug(f"self.get_image_data took {time.time() - t0}")
 
             if image_data is None:
-                debug_print("No image data available to upload.")
+                logging.debug("No image data available to upload.")
                 return
 
             t0 = time.time()
@@ -1244,7 +1504,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             buffer = io.BytesIO()
             np.save(buffer, image_data)
             raw_data = buffer.getvalue()
-            debug_print(f"len(raw_data): {len(raw_data)}")
+            logging.debug(f"len(raw_data): {len(raw_data)}")
 
             files = {"file": ("volume.npy", raw_data, "application/octet-stream")}
 
@@ -1282,13 +1542,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
             return result
         except Exception as e:
-            debug_print(f"Error in upload_image_to_server: {e}")
+            logging.debug(f"Error in upload_image_to_server: {e}")
 
     def upload_segment_to_server(self):
         """
         Grabs current segmentation labelmap, gzips it, and sends it to the server.
         """
-        debug_print("Syncing segment with server...")
+        logging.debug("Syncing segment with server...")
         try:
             segment_data = self.get_segment_data()
             files = self.mask_to_np_upload_file(segment_data)
@@ -1300,7 +1560,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
             return result
         except Exception as e:
-            debug_print(f"Error in upload_image_to_server: {e}")
+            logging.debug(f"Error in upload_image_to_server: {e}")
 
     ###############################################################################
     # Utility / converters functions
@@ -1340,7 +1600,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         image_data = self.get_image_data()
         if image_data is None:
-            debug_print("No volume node found")
+            logging.debug("No volume node found")
             return
 
         old_image_data = self.previous_states.get("image_data", None)
@@ -1415,7 +1675,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if point_type == "control_point":
             n = caller.GetNumberOfControlPoints()
             if n < 0:
-                debug_print("No control points found")
+                logging.debug("No control points found")
                 return
 
             pos = [0, 0, 0]
@@ -1430,7 +1690,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             if vtk_pts is not None:
                 vtk_pts_data = vtk_to_numpy(vtk_pts.GetData())
                 xyz = [self.ras_to_xyz(pos) for pos in vtk_pts_data]
-                debug_print(xyz)
+                logging.debug(xyz)
                 return xyz
 
             return []
@@ -1501,7 +1761,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbPromptTypeNegative.setStyleSheet(self.unselected_style)
         self.ui.pbPromptTypePositive.setChecked(True)
         self.ui.pbPromptTypeNegative.setChecked(False)
-        debug_print("Prompt type set to POSITIVE")
+        logging.debug("Prompt type set to POSITIVE")
 
     def on_prompt_type_negative_clicked(self, checked=False):
         """
@@ -1514,17 +1774,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbPromptTypeNegative.setStyleSheet(self.selected_style)
         self.ui.pbPromptTypePositive.setChecked(False)
         self.ui.pbPromptTypeNegative.setChecked(True)
-        debug_print("Prompt type set to NEGATIVE")
+        logging.debug("Prompt type set to NEGATIVE")
 
     def toggle_prompt_type(self, checked=False):
         """
         Toggle between positive and negative (triggered by 'T' key).
         """
-        debug_print("Toggling prompt type (positive <> negative)")
+        logging.debug("Toggling prompt type (positive <> negative)")
         if self.current_prompt_type_positive:
             self.on_prompt_type_negative_clicked()
         else:
             self.on_prompt_type_positive_clicked()
+
+    ensure_synched = staticmethod(ensure_synched)
 
 
 ###############################################################################

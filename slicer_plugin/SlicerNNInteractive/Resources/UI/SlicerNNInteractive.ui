@@ -30,6 +30,12 @@
      </item>
      <item>
       <widget class="QTabWidget" name="tabWidget">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
        <property name="currentIndex">
         <number>0</number>
        </property>
@@ -40,6 +46,12 @@
         <layout class="QVBoxLayout" name="verticalLayout_11">
          <item>
           <widget class="QGroupBox" name="menuGroup">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
            <property name="title">
             <string/>
            </property>
@@ -75,6 +87,12 @@
          </item>
          <item>
           <widget class="QGroupBox" name="promptTypeGroup">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
            <property name="title">
             <string>Prompt &amp;Type:</string>
            </property>
@@ -129,6 +147,12 @@
          </item>
          <item>
           <widget class="QGroupBox" name="pointPromptsGroup">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
            <property name="title">
             <string>Interaction Tools:</string>
            </property>
@@ -272,29 +296,6 @@
            </layout>
           </widget>
          </item>
-         <item>
-          <widget class="QGroupBox" name="uploadProgressGroup">
-           <property name="title">
-            <string>Upload progress:</string>
-           </property>
-           <layout class="QVBoxLayout" name="verticalLayout_12b">
-            <item>
-             <layout class="QVBoxLayout" name="verticalLayout_tools">
-              <item>
-               <widget class="QProgressBar" name="uploadProgressBar">
-                <property name="visible">
-                 <bool>true</bool>
-                </property>
-                <property name="value">
-                 <number>0</number>
-                </property>
-               </widget>
-              </item>
-             </layout>
-            </item>
-           </layout>
-          </widget>
-         </item>
         </layout>
        </widget>
        <widget class="QWidget" name="tabConfig">
@@ -309,54 +310,142 @@
            </property>
            <layout class="QVBoxLayout" name="verticalLayout_5">
             <item>
-             <layout class="QHBoxLayout" name="horizontalLayout_server">
-              <item>
-               <widget class="QLabel" name="label">
-                <property name="text">
-                 <string>Server URL:</string>
-                </property>
-               </widget>
-              </item>
-              <item>
-               <widget class="QLineEdit" name="Server">
-                <property name="text">
-                 <string>http://localhost:1527</string>
-                </property>
-               </widget>
-              </item>
-             </layout>
+             <widget class="QRadioButton" name="rbInternalServer">
+              <property name="text">
+               <string>Internal server</string>
+              </property>
+              <property name="checked">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QWidget" name="internalServerWidget">
+              <layout class="QVBoxLayout" name="verticalLayout_internal">
+               <property name="leftMargin">
+                <number>20</number>
+               </property>
+               <property name="topMargin">
+                <number>0</number>
+               </property>
+               <property name="rightMargin">
+                <number>0</number>
+               </property>
+               <property name="bottomMargin">
+                <number>4</number>
+               </property>
+               <item>
+                <widget class="QPushButton" name="pbStartStopServer">
+                 <property name="minimumSize">
+                  <size>
+                   <width>0</width>
+                   <height>30</height>
+                  </size>
+                 </property>
+                 <property name="text">
+                  <string>Start Server</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item>
+             <widget class="QRadioButton" name="rbExternalServer">
+              <property name="text">
+               <string>External server</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QWidget" name="externalServerWidget">
+              <layout class="QVBoxLayout" name="verticalLayout_external">
+               <property name="leftMargin">
+                <number>20</number>
+               </property>
+               <property name="topMargin">
+                <number>0</number>
+               </property>
+               <property name="rightMargin">
+                <number>0</number>
+               </property>
+               <property name="bottomMargin">
+                <number>4</number>
+               </property>
+               <item>
+                <layout class="QHBoxLayout" name="horizontalLayout_server">
+                 <item>
+                  <widget class="QLabel" name="label">
+                   <property name="text">
+                    <string>Server URL:</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QLineEdit" name="Server">
+                   <property name="text">
+                    <string>http://localhost:1527</string>
+                   </property>
+                  </widget>
+                 </item>
+                </layout>
+               </item>
+               <item>
+                <widget class="QPushButton" name="pbTestServer">
+                 <property name="minimumSize">
+                  <size>
+                   <width>0</width>
+                   <height>30</height>
+                  </size>
+                 </property>
+                 <property name="toolTip">
+                  <string>Test if the the server is reachable.</string>
+                 </property>
+                 <property name="text">
+                  <string>Test Connection</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </widget>
             </item>
            </layout>
           </widget>
          </item>
          <item>
-          <widget class="QPushButton" name="pbTestServer">
-           <property name="minimumSize">
-            <size>
-             <width>0</width>
-             <height>30</height>
-            </size>
+          <widget class="QGroupBox" name="serverOutputGroup">
+           <property name="title">
+            <string>Server output</string>
            </property>
-           <property name="toolTip">
-            <string>Test if the the server is reachable.</string>
-           </property>
-           <property name="text">
-            <string>Test Connection</string>
-           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_serverOutput">
+            <item>
+             <widget class="QPlainTextEdit" name="serverOutputTextEdit">
+              <property name="readOnly">
+               <bool>true</bool>
+              </property>
+              <property name="minimumSize">
+               <size>
+                <width>0</width>
+                <height>120</height>
+               </size>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="pbClearServerOutput">
+              <property name="minimumSize">
+               <size>
+                <width>0</width>
+                <height>24</height>
+               </size>
+              </property>
+              <property name="text">
+               <string>Clear</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
           </widget>
-         </item>
-         <item>
-          <spacer name="verticalSpacer">
-           <property name="orientation">
-            <enum>Qt::Vertical</enum>
-           </property>
-           <property name="sizeHint" stdset="0">
-            <size>
-             <width>20</width>
-             <height>40</height>
-            </size>
-           </property>
-          </spacer>
          </item>
         </layout>
        </widget>
@@ -372,6 +461,12 @@
      <layout class="QVBoxLayout" name="segmentEditorLayout">
       <item>
        <widget class="qMRMLSegmentEditorWidget" name="editor_widget">
+        <property name="sizePolicy">
+         <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+          <horstretch>0</horstretch>
+          <verstretch>0</verstretch>
+         </sizepolicy>
+        </property>
         <property name="defaultTerminologyEntrySettingsKey">
          <string notr="true"/>
         </property>
