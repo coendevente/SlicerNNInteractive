@@ -128,6 +128,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Live preview of the magic wand region (hidden segmentation node).
         self._sel_op_wand_preview_segment_node = None
         self._wand_preview_segment_id = None
+        # Lasso (3D) operand: a hidden Segment Editor runs the native Scissors
+        # effect to draw a 3D region (input node); the nnInteractive lasso AI
+        # refines it into the preview node. Mirrors the Magic wand seed/preview.
+        self._sel_op_lasso3d_input_segment_node = None
+        self._lasso3d_input_segment_id = None
+        self._sel_op_lasso3d_preview_segment_node = None
+        self._lasso3d_preview_segment_id = None
+        self._lasso3d_editor_widget = None
+        self._lasso3d_editor_node = None
+        self._lasso3d_input_observer_tag = None
+        self._lasso3d_in_update = False
         # Selection Operations-private undo stack: list of (segment_id, mask_uint8).
         self._sel_op_undo_stack = []
         self._sel_op_undo_stack_limit = 10
@@ -145,6 +156,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui = slicer.util.childWidgetVariables(ui_widget)
         self.scribble_segment_node_name = "ScribbleSegmentNode (do not touch)"
         self.wand_preview_segment_node_name = "MagicWandPreviewSegmentNode (do not touch)"
+        self.lasso3d_input_segment_node_name = "Lasso3dInputSegmentNode (do not touch)"
+        self.lasso3d_preview_segment_node_name = "Lasso3dPreviewSegmentNode (do not touch)"
 
         # Set up editor widget
         self.ui.editor_widget.setMaximumNumberOfUndoStates(10)
@@ -266,6 +279,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbClearWandSeed.clicked.connect(self.on_clear_wand_seed_clicked)
         self.ui.pbPreviewWand.clicked.connect(self.on_preview_wand_clicked)
         self.ui.pbClearPreviewWand.clicked.connect(self.on_clear_preview_wand_clicked)
+        self.ui.pbDrawLasso3d.clicked.connect(self.on_draw_lasso3d_clicked)
+        self.ui.pbClearLasso3d.clicked.connect(self.on_clear_lasso3d_clicked)
+        self.ui.pbPreviewLasso3d.clicked.connect(self.on_preview_lasso3d_clicked)
+        self.ui.pbClearPreviewLasso3d.clicked.connect(
+            self.on_clear_preview_lasso3d_clicked
+        )
         self.ui.pbUndoSelectionOp.clicked.connect(self.on_undo_selection_op_clicked)
         self.ui.sldSegmentOpacity.valueChanged.connect(self._on_segment_opacity_changed)
         self.ui.cbEnableLassoClip.toggled.connect(self._on_lasso_clip_enabled_changed)
@@ -402,6 +421,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Clean up resources when the module is closed.
         """
         self.removeObservers()
+
+        # Tear down the hidden lasso (3D) Scissors editor and region/preview nodes.
+        self._destroy_lasso3d()
 
         if hasattr(self, "_qt_event_filters"):
             for slice_view, event_filter in self._qt_event_filters:
@@ -598,6 +620,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Stop scribble if placing markup
         if interactionNode.GetCurrentInteractionMode() == slicer.vtkMRMLInteractionNode.Place:
             self.ui.pbInteractionScribble.setChecked(False)
+            # Also disarm the lasso (3D) Scissors tool so it does not eat clicks.
+            if self.ui.pbDrawLasso3d.isChecked():
+                self.ui.pbDrawLasso3d.setChecked(False)
+                self._deactivate_lasso3d_scissors()
 
     def remove_all_but_last_prompt(self):
         """
@@ -1112,6 +1138,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         internal_names = {
             self.scribble_segment_node_name,
             self.wand_preview_segment_node_name,
+            self.lasso3d_input_segment_node_name,
+            self.lasso3d_preview_segment_node_name,
         }
 
         # If the segmentation widget has a currently selected segmentation node, return it.
@@ -1416,7 +1444,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
-        # Operand source order: 0=ROI box, 1=Magic wand, 2=Segment.
+        # Operand source order: 0=ROI box, 1=Magic wand, 2=Segment, 3=Lasso (3D).
         source = self.ui.cbOperandSource.currentIndex
         if source == 0:
             if not self._is_selection_roi_valid():
@@ -1442,6 +1470,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     "Selection Operations",
                     "Magic wand failed (no positive seed, server unreachable, "
                     "or seeds out of volume).",
+                )
+                return
+        elif source == 3:
+            if not self._is_selection_lasso3d_valid():
+                QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "Selection Operations",
+                    "Draw a lasso region in the 3D view before applying.",
+                )
+                return
+            operand_mask = self._compute_lasso3d_mask()
+            if operand_mask is None:
+                QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "Selection Operations",
+                    "Lasso (3D) failed (empty region, server unreachable, "
+                    "or out of volume).",
                 )
                 return
         else:
@@ -1491,6 +1536,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # The wand preview reflected the about-to-apply mask -- clear it now
         # that the operation has landed on the actual target segment.
         self._clear_wand_preview_segment()
+        # Same for the lasso (3D) region/preview, and disarm the Scissors tool.
+        self.ui.pbDrawLasso3d.setChecked(False)
+        self._deactivate_lasso3d_scissors()
+        self._clear_lasso3d_input_segment()
+        self._clear_lasso3d_preview_segment()
 
         sync_result = self.upload_segment_to_server()
         if sync_result is None:
@@ -2015,25 +2065,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _refresh_apply_enabled(self):
         """Enable Apply only when the current operand source has a usable operand."""
-        # Source order: 0=ROI box, 1=Magic wand, 2=Segment.
+        # Source order: 0=ROI box, 1=Magic wand, 2=Segment, 3=Lasso (3D).
         source = self.ui.cbOperandSource.currentIndex
         if source == 0:
             enabled = self._is_selection_roi_valid()
         elif source == 1:
             enabled = self._is_selection_wand_seed_valid()
+        elif source == 3:
+            enabled = self._is_selection_lasso3d_valid()
         else:
             enabled = self.ui.cbSelectionOperand.count > 0
         self.ui.pbApplySelectionOp.setEnabled(enabled)
 
     def _on_operand_source_changed(self, index):
         """
-        Toggle the three operand rows and clean up after the modes we are
-        leaving so a ROI / Magic wand preview never lingers across switches.
-        Source order: 0=ROI box, 1=Magic wand, 2=Segment.
+        Toggle the operand rows and clean up after the modes we are leaving so a
+        ROI / Magic wand / Lasso preview never lingers across switches.
+        Source order: 0=ROI box, 1=Magic wand, 2=Segment, 3=Lasso (3D).
         """
         self.ui.operandRoiContainer.setVisible(index == 0)
         self.ui.operandMagicWandContainer.setVisible(index == 1)
         self.ui.operandSegmentContainer.setVisible(index == 2)
+        self.ui.operandLasso3dContainer.setVisible(index == 3)
         # Leaving ROI -> destroy the ROI box (and its preview).
         if index != 0:
             self._destroy_selection_roi()
@@ -2041,6 +2094,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if index != 1:
             self._destroy_wand_seed()
             self._clear_wand_preview_segment()
+        # Leaving Lasso (3D) -> disarm Scissors and clear region + preview.
+        if index != 3:
+            self.ui.pbDrawLasso3d.setChecked(False)
+            self._deactivate_lasso3d_scissors()
+            self._clear_lasso3d_input_segment()
+            self._clear_lasso3d_preview_segment()
         self._refresh_apply_enabled()
 
     # -- Magic wand seed lifecycle and flood fill --
@@ -2414,6 +2473,401 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._update_magic_wand_preview()
         finally:
             qt.QApplication.restoreOverrideCursor()
+
+    # -- Lasso (3D): native Scissors draws a region, nnInteractive lasso AI --
+    #    refines it into a preview, mirroring the Magic wand seed/preview flow.
+
+    def _get_or_create_lasso3d_segmentation(self, attr, name, seg_id_attr,
+                                            seg_name, color):
+        """
+        Shared helper to create (or recover) a hidden single-segment node used
+        either as the Scissors input region or as the AI preview.
+        """
+        node = getattr(self, attr)
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            existing = slicer.mrmlScene.GetFirstNodeByName(name)
+            if existing is not None and existing.IsA("vtkMRMLSegmentationNode"):
+                node = existing
+            else:
+                node = slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLSegmentationNode"
+                )
+                node.SetName(name)
+            node.HideFromEditorsOn()
+            volume_node = self.get_volume_node()
+            if volume_node is not None:
+                node.SetReferenceImageGeometryParameterFromVolumeNode(volume_node)
+            node.CreateDefaultDisplayNodes()
+            setattr(self, attr, node)
+
+        segmentation = node.GetSegmentation()
+        seg_id = getattr(self, seg_id_attr)
+        if not seg_id or not segmentation.GetSegment(seg_id):
+            seg_id = segmentation.AddEmptySegment(seg_name, seg_name, color)
+            setattr(self, seg_id_attr, seg_id)
+
+        display_node = node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetSegmentOpacity2DFill(seg_id, 0.35)
+            display_node.SetSegmentOpacity2DOutline(seg_id, 0.9)
+            display_node.SetSegmentVisibility(seg_id, True)
+
+        return node, seg_id
+
+    def _get_or_create_lasso3d_input_segmentation(self):
+        """Hidden node holding the raw 3D region the user draws with Scissors."""
+        return self._get_or_create_lasso3d_segmentation(
+            "_sel_op_lasso3d_input_segment_node",
+            self.lasso3d_input_segment_node_name,
+            "_lasso3d_input_segment_id",
+            "Lasso3dInput",
+            [0.95, 0.85, 0.2],
+        )
+
+    def _get_or_create_lasso3d_preview_segmentation(self):
+        """Hidden node holding the nnInteractive lasso AI result (the preview)."""
+        return self._get_or_create_lasso3d_segmentation(
+            "_sel_op_lasso3d_preview_segment_node",
+            self.lasso3d_preview_segment_node_name,
+            "_lasso3d_preview_segment_id",
+            "Lasso3dPreview",
+            [0.2, 0.85, 0.95],
+        )
+
+    def _setup_lasso3d_editor(self):
+        """
+        Lazily create a background (headless) Segment Editor used to drive the
+        native Scissors effect on the lasso input segment. Mirrors the hidden
+        scribble editor.
+        """
+        if self._lasso3d_editor_widget is not None:
+            return
+        import qSlicerSegmentationsModuleWidgetsPythonQt
+
+        self._lasso3d_editor_widget = (
+            qSlicerSegmentationsModuleWidgetsPythonQt.qMRMLSegmentEditorWidget()
+        )
+        self._lasso3d_editor_widget.setMRMLScene(slicer.mrmlScene)
+        self._lasso3d_editor_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentEditorNode"
+        )
+        self._lasso3d_editor_widget.setMRMLSegmentEditorNode(self._lasso3d_editor_node)
+
+    def _set_lasso3d_input_visible(self, visible):
+        """Show/hide the drawn input region (hidden while the AI preview shows)."""
+        node = self._sel_op_lasso3d_input_segment_node
+        seg_id = self._lasso3d_input_segment_id
+        if node is None or not seg_id:
+            return
+        display_node = node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetSegmentVisibility(seg_id, visible)
+
+    def _activate_lasso3d_scissors(self):
+        """
+        Bind the hidden editor to the lasso INPUT segment and turn on the native
+        Scissors effect, configured for a free-form 3D-view lasso that fills the
+        region extruded along the camera direction.
+        """
+        volume_node = self.get_volume_node()
+        if volume_node is None:
+            return
+        node, seg_id = self._get_or_create_lasso3d_input_segmentation()
+        self._set_lasso3d_input_visible(True)
+        self._setup_lasso3d_editor()
+
+        self._lasso3d_editor_widget.setSegmentationNode(node)
+        self._lasso3d_editor_widget.setSourceVolumeNode(volume_node)
+        self._lasso3d_editor_node.SetSelectedSegmentID(seg_id)
+
+        self._lasso3d_editor_widget.setActiveEffectByName("Scissors")
+        self._lasso3d_editor_widget.updateWidgetFromMRML()
+        effect = self._lasso3d_editor_widget.activeEffect()
+        if effect is not None:
+            effect.setParameter("Operation", "FillInside")
+            effect.setParameter("Shape", "FreeForm")
+            effect.setParameter("SliceCutMode", "Unlimited")
+
+        # Watch the input node so Apply enables and the 3D surface refreshes as
+        # soon as a region is carved.
+        if self._lasso3d_input_observer_tag is None:
+            self._lasso3d_input_observer_tag = node.AddObserver(
+                vtk.vtkCommand.ModifiedEvent, self._on_lasso3d_input_modified
+            )
+
+        slicer.util.showStatusMessage(
+            "Lasso (3D): drag a closed loop in the 3D view, then click Preview. "
+            "Enable volume rendering or show a segment surface to aim at.",
+            5000,
+        )
+
+    def _deactivate_lasso3d_scissors(self):
+        """Release the Scissors view interactions and stop watching the input."""
+        if self._lasso3d_editor_widget is not None:
+            self._lasso3d_editor_widget.setActiveEffectByName("")
+        node = self._sel_op_lasso3d_input_segment_node
+        if (
+            self._lasso3d_input_observer_tag is not None
+            and node is not None
+            and slicer.mrmlScene.IsNodePresent(node)
+        ):
+            node.RemoveObserver(self._lasso3d_input_observer_tag)
+        self._lasso3d_input_observer_tag = None
+
+    def _on_lasso3d_input_modified(self, caller, event):
+        """
+        React to Scissors carving the input region: enable Apply and rebuild the
+        3D closed surface so the drawn region shows solid in the 3D view.
+        """
+        if self._lasso3d_in_update:
+            return
+        self._lasso3d_in_update = True
+        try:
+            self._refresh_apply_enabled()
+            node = self._sel_op_lasso3d_input_segment_node
+            seg_id = self._lasso3d_input_segment_id
+            if node is None or not seg_id:
+                return
+            volume_node = self.get_volume_node()
+            if volume_node is None:
+                return
+            mask = slicer.util.arrayFromSegmentBinaryLabelmap(
+                node, seg_id, volume_node
+            )
+            if mask is not None and int(mask.sum()) > 0:
+                node.GetSegmentation().CollapseBinaryLabelmaps()
+                node.CreateClosedSurfaceRepresentation()
+        finally:
+            self._lasso3d_in_update = False
+
+    def on_draw_lasso3d_clicked(self, checked=False):
+        """Toggle the native Scissors lasso on the hidden input segment."""
+        # Drawing uses a Segment Editor effect, not a markup placement, so make
+        # sure no markup placement / scribble is competing for view clicks.
+        interaction_node = slicer.app.applicationLogic().GetInteractionNode()
+        interaction_node.SetCurrentInteractionMode(interaction_node.ViewTransform)
+        self.ui.pbInteractionScribble.setChecked(False)
+
+        if not checked:
+            self._deactivate_lasso3d_scissors()
+            return
+
+        if self.get_volume_node() is None:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Selection Operations",
+                "Load a volume before drawing a lasso region.",
+            )
+            self.ui.pbDrawLasso3d.setChecked(False)
+            return
+
+        self._activate_lasso3d_scissors()
+
+    def on_clear_lasso3d_clicked(self, checked=False):
+        """Clear the drawn input region and any AI preview."""
+        self._clear_lasso3d_input_segment()
+        self._clear_lasso3d_preview_segment()
+        self._refresh_apply_enabled()
+
+    def _clear_lasso3d_segment(self, node, seg_id):
+        """Empty a lasso labelmap and hide its segment; keep the node."""
+        if node is None or not slicer.mrmlScene.IsNodePresent(node) or not seg_id:
+            return
+        volume_node = self.get_volume_node()
+        image = self.get_image_data()
+        if volume_node is None or image is None:
+            return
+        empty = np.zeros(image.shape, dtype=np.uint8)
+        self._lasso3d_in_update = True
+        try:
+            slicer.util.updateSegmentBinaryLabelmapFromArray(
+                empty, node, seg_id, volume_node
+            )
+        except Exception:
+            pass
+        finally:
+            self._lasso3d_in_update = False
+        display_node = node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetSegmentVisibility(seg_id, False)
+
+    def _clear_lasso3d_input_segment(self):
+        """Empty the drawn input region and hide it; keep the node."""
+        self._clear_lasso3d_segment(
+            self._sel_op_lasso3d_input_segment_node, self._lasso3d_input_segment_id
+        )
+
+    def _clear_lasso3d_preview_segment(self):
+        """Empty the AI preview labelmap and hide it; keep the node."""
+        self._clear_lasso3d_segment(
+            self._sel_op_lasso3d_preview_segment_node,
+            self._lasso3d_preview_segment_id,
+        )
+
+    def _lasso3d_input_to_mask(self):
+        """Return the drawn input region as a uint8 mask aligned to the volume."""
+        node = self._sel_op_lasso3d_input_segment_node
+        seg_id = self._lasso3d_input_segment_id
+        if node is None or not slicer.mrmlScene.IsNodePresent(node) or not seg_id:
+            return None
+        volume_node = self.get_volume_node()
+        if volume_node is None:
+            return None
+        mask = slicer.util.arrayFromSegmentBinaryLabelmap(node, seg_id, volume_node)
+        if mask is None:
+            return None
+        return mask.astype(np.uint8)
+
+    def _compute_lasso3d_mask(self):
+        """
+        Send the drawn 3D region to nnInteractive as a positive lasso prompt and
+        return the AI segmentation, without disturbing the user's target session.
+        Mirrors _compute_magic_wand_mask: back up target, reset, send, restore.
+        Returns a bool numpy mask aligned to the volume, or None on failure.
+        """
+        volume = self.get_volume_node()
+        arr = self.get_image_data()
+        if volume is None or arr is None or not self.server:
+            return None
+
+        region = self._lasso3d_input_to_mask()
+        if region is None or int(region.sum()) == 0:
+            return None
+
+        pre_target = self.get_segment_data().astype(np.uint8).copy()
+        shape = arr.shape
+
+        # 1) Reset server interactions by uploading an empty mask.
+        empty = np.zeros(shape, dtype=np.uint8)
+        reset_resp = self.request_to_server(
+            f"{self.server}/upload_segment",
+            files=self.mask_to_np_upload_file(empty),
+            headers={"Content-Encoding": "gzip"},
+        )
+        if reset_resp is None:
+            return None
+
+        seg_mask = None
+        try:
+            # 2) Send the drawn region as a positive lasso interaction.
+            buffer = io.BytesIO()
+            np.save(buffer, region.astype(np.uint8))
+            compressed_data = gzip.compress(buffer.getvalue())
+
+            from requests_toolbelt import MultipartEncoder
+
+            encoder = MultipartEncoder(
+                fields={
+                    "file": (
+                        "volume.npy.gz",
+                        compressed_data,
+                        "application/octet-stream",
+                    ),
+                    "positive_click": "True",
+                }
+            )
+            resp = self.request_to_server(
+                f"{self.server}/add_lasso_interaction",
+                data=encoder,
+                headers={
+                    "Content-Type": encoder.content_type,
+                    "Content-Encoding": "gzip",
+                },
+            )
+            if resp is not None and resp.status_code == 200:
+                seg_mask = self.unpack_binary_segmentation(
+                    resp.content, decompress=False
+                ).astype(bool)
+        finally:
+            # 3) Restore the user's target segment on the server so subsequent
+            #    nnInteractive prompts continue from where they left off.
+            restore_resp = self.request_to_server(
+                f"{self.server}/upload_segment",
+                files=self.mask_to_np_upload_file(pre_target),
+                headers={"Content-Encoding": "gzip"},
+            )
+            if restore_resp is None:
+                slicer.util.showStatusMessage(
+                    "Lasso (3D) could not restore server state; "
+                    "the next prompt may resync automatically.",
+                    4000,
+                )
+
+        return seg_mask
+
+    def _update_lasso3d_preview(self):
+        """
+        Run the lasso AI on the drawn region and write the result into the
+        preview segment. Safe to call when lasso is not the active operand
+        source -- it will just clear the preview. Mirrors the magic wand.
+        """
+        # Lasso (3D) source index is 3 in the current ordering.
+        if self.ui.cbOperandSource.currentIndex != 3:
+            self._clear_lasso3d_preview_segment()
+            return
+        if not self._is_selection_lasso3d_valid():
+            self._clear_lasso3d_preview_segment()
+            return
+
+        ai_mask = self._compute_lasso3d_mask()
+        if ai_mask is None:
+            self._clear_lasso3d_preview_segment()
+            return
+
+        node, seg_id = self._get_or_create_lasso3d_preview_segmentation()
+        volume_node = self.get_volume_node()
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            ai_mask.astype(np.uint8), node, seg_id, volume_node
+        )
+        display_node = node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetSegmentVisibility(seg_id, True)
+        if int(ai_mask.sum()) > 0:
+            node.GetSegmentation().CollapseBinaryLabelmaps()
+            node.CreateClosedSurfaceRepresentation()
+        # Hide the raw drawn region so it does not occlude the AI preview in 3D.
+        self._set_lasso3d_input_visible(False)
+
+    def on_preview_lasso3d_clicked(self, checked=False):
+        """Run a one-shot lasso AI call and write the result into the preview."""
+        if not self._is_selection_lasso3d_valid():
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Selection Operations",
+                "Draw a lasso region in the 3D view before previewing.",
+            )
+            return
+        qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
+        try:
+            self._update_lasso3d_preview()
+        finally:
+            qt.QApplication.restoreOverrideCursor()
+
+    def on_clear_preview_lasso3d_clicked(self, checked=False):
+        """Hide the AI preview overlay; the drawn region is kept and re-shown."""
+        self._clear_lasso3d_preview_segment()
+        self._set_lasso3d_input_visible(True)
+
+    def _destroy_lasso3d(self):
+        """Remove the lasso input/preview nodes and hidden editor (cleanup)."""
+        self._deactivate_lasso3d_scissors()
+        for attr in (
+            "_sel_op_lasso3d_input_segment_node",
+            "_sel_op_lasso3d_preview_segment_node",
+            "_lasso3d_editor_node",
+        ):
+            node = getattr(self, attr)
+            if node is not None and slicer.mrmlScene.IsNodePresent(node):
+                slicer.mrmlScene.RemoveNode(node)
+            setattr(self, attr, None)
+        self._lasso3d_input_segment_id = None
+        self._lasso3d_preview_segment_id = None
+        self._lasso3d_editor_widget = None
+
+    def _is_selection_lasso3d_valid(self):
+        """True when a non-empty input region has been drawn (Apply runs the AI)."""
+        region = self._lasso3d_input_to_mask()
+        return region is not None and int(region.sum()) > 0
 
     def _record_selection_op_undo(self, segment_id, pre_state_uint8):
         """Push a (segment_id, mask) snapshot onto our private undo stack."""

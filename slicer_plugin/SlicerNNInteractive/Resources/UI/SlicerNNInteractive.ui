@@ -356,6 +356,11 @@
                   <string>Segment</string>
                  </property>
                 </item>
+                <item>
+                 <property name="text">
+                  <string>Lasso (3D)</string>
+                 </property>
+                </item>
                </widget>
               </item>
              </layout>
@@ -592,6 +597,109 @@
                   </widget>
                  </item>
                 </layout>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item>
+             <widget class="QWidget" name="operandLasso3dContainer" native="true">
+              <layout class="QVBoxLayout" name="verticalLayout_selops_lasso3d">
+               <property name="leftMargin">
+                <number>0</number>
+               </property>
+               <property name="topMargin">
+                <number>0</number>
+               </property>
+               <property name="rightMargin">
+                <number>0</number>
+               </property>
+               <property name="bottomMargin">
+                <number>0</number>
+               </property>
+               <item>
+                <layout class="QHBoxLayout" name="horizontalLayout_selops_lasso3d_buttons">
+                 <item>
+                  <widget class="QPushButton" name="pbDrawLasso3d">
+                   <property name="minimumSize">
+                    <size>
+                     <width>0</width>
+                     <height>30</height>
+                    </size>
+                   </property>
+                   <property name="toolTip">
+                    <string>Toggle on, then drag a closed loop in the 3D view to carve a 3D region; extruded along the camera direction.</string>
+                   </property>
+                   <property name="text">
+                    <string>&amp;Draw lasso (3D)</string>
+                   </property>
+                   <property name="checkable">
+                    <bool>true</bool>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QPushButton" name="pbClearLasso3d">
+                   <property name="minimumSize">
+                    <size>
+                     <width>0</width>
+                     <height>30</height>
+                    </size>
+                   </property>
+                   <property name="toolTip">
+                    <string>Clear the drawn region (and any preview).</string>
+                   </property>
+                   <property name="text">
+                    <string>Clear Region</string>
+                   </property>
+                  </widget>
+                 </item>
+                </layout>
+               </item>
+               <item>
+                <layout class="QHBoxLayout" name="horizontalLayout_selops_lasso3d_preview">
+                 <item>
+                  <widget class="QPushButton" name="pbPreviewLasso3d">
+                   <property name="minimumSize">
+                    <size>
+                     <width>0</width>
+                     <height>30</height>
+                    </size>
+                   </property>
+                   <property name="toolTip">
+                    <string>Run nnInteractive on the drawn region and preview the AI result before Apply.</string>
+                   </property>
+                   <property name="text">
+                    <string>&amp;Preview</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QPushButton" name="pbClearPreviewLasso3d">
+                   <property name="minimumSize">
+                    <size>
+                     <width>0</width>
+                     <height>30</height>
+                    </size>
+                   </property>
+                   <property name="toolTip">
+                    <string>Hide the AI preview overlay; the drawn region is kept.</string>
+                   </property>
+                   <property name="text">
+                    <string>Clear Preview</string>
+                   </property>
+                  </widget>
+                 </item>
+                </layout>
+               </item>
+               <item>
+                <widget class="QLabel" name="lblLasso3dHint">
+                 <property name="text">
+                  <string>Draw in the 3D view. Enable volume rendering or show a segment surface first so there is something to aim at.</string>
+                 </property>
+                 <property name="wordWrap">
+                  <bool>true</bool>
+                 </property>
+                </widget>
                </item>
               </layout>
              </widget>
