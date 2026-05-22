@@ -29,7 +29,7 @@ from fastapi import FastAPI, Response, UploadFile, File, Form
 ###############################################################################
 REPO_ID = "nnInteractive/nnInteractive"
 MODEL_NAME = "nnInteractive_v1.0"  # Updated models may be available in the future
-DOWNLOAD_DIR = ".nninteractive_weights"  # Specify the download directory
+DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), ".nninteractive_weights")
 
 app = FastAPI()
 
@@ -105,10 +105,10 @@ def process_mask_and_click_input(file_bytes, positive_click):
 
 
 def get_error_if_img_not_set():
-    if PROMPT_MANAGER.img is None:
+    if PROMPT_MANAGER is None or PROMPT_MANAGER.img is None:
         warnings.warn("There is no image in the server. Be sure to send it before")
         return {"status": "error", "message": "No image uploaded"}
-    
+
     return
 
 
@@ -244,9 +244,15 @@ class PromptManager:
 
 
 ###############################################################################
-# Global prompt manager instance
+# Global prompt manager instance (initialized on startup)
 ###############################################################################
-PROMPT_MANAGER = PromptManager()
+PROMPT_MANAGER = None
+
+
+@app.on_event("startup")
+async def startup_event():
+    global PROMPT_MANAGER
+    PROMPT_MANAGER = PromptManager()
 
 
 ###############################################################################
@@ -426,10 +432,17 @@ async def add_scribble_interaction(
 
 
 def main():
+    global DOWNLOAD_DIR
     parser = argparse.ArgumentParser(description="Run the nnInteractive Slicer server.")
     parser.add_argument("--host", default="0.0.0.0", help="Host interface to bind to.")
     parser.add_argument("--port", type=int, default=1527, help="Port to listen on.")
+    parser.add_argument(
+        "--weights-dir",
+        default=DOWNLOAD_DIR,
+        help="Directory for model weights (default: ~/.nninteractive_weights).",
+    )
     args = parser.parse_args()
+    DOWNLOAD_DIR = args.weights_dir
 
     uvicorn.run(app, host=args.host, port=args.port)
 
