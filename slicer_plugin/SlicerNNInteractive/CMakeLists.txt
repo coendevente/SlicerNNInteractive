@@ -40,3 +40,14 @@ slicerMacroBuildScriptedModule(
   RESOURCES ${MODULE_PYTHON_RESOURCES}
   WITH_GENERIC_TESTS
   )
+
+#-----------------------------------------------------------------------------
+# Install the server Python package alongside the module script so that
+# SlicerNNInteractive.py can locate it via Path(__file__).parent at runtime.
+set(NNINTERACTIVE_SERVER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../server/nninteractive_slicer_server")
+
+install(
+  DIRECTORY "${NNINTERACTIVE_SERVER_DIR}"
+  DESTINATION "${Slicer_INSTALL_QTSCRIPTEDMODULES_LIB_DIR}"
+  COMPONENT RuntimeLibraries
+  )
