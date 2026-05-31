@@ -215,6 +215,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.all_prompt_buttons = {}
         self.setup_prompts()
 
+        self.enable_slice_intersections()
         self.init_ui_functionality()
 
         _ = self.get_current_segment_id()
@@ -228,6 +229,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Sweep any orphaned magic wand seed nodes left behind by earlier
         # versions / earlier reloads so the scene is clean on module load.
         self._destroy_wand_seed()
+
+    @staticmethod
+    def enable_slice_intersections():
+        """Show the other slice planes in each 2D slice view."""
+        for slice_display_node in slicer.util.getNodesByClass(
+            "vtkMRMLSliceDisplayNode"
+        ):
+            slice_display_node.SetIntersectingSlicesVisibility(1)
+
+        # Force an immediate visual refresh after changing display node state.
+        for slice_node in slicer.util.getNodesByClass("vtkMRMLSliceNode"):
+            slice_node.Modified()
 
     def init_ui_functionality(self):
         """
