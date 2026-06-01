@@ -148,6 +148,7 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             widget = self._create_widget(volume_node)
             self._test_multi_plane_display_volumes(widget, volume_node)
             self._test_native_series_inference_sync(widget, volume_node)
+            self._test_high_res_output_geometry(widget, volume_node)
             missing = [name for name, _ in self.PROMPTS if not self._reference_path(name).exists()]
             if missing and not self.generate_mode:
                 self.fail(
@@ -429,6 +430,104 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                 slicer.mrmlScene.RemoveNode(working_volume)
 
         print("[PASS] native-series inference sync")
+
+    def _test_high_res_output_geometry(self, widget, source_volume):
+        print("Testing high-resolution output geometry...")
+        source_dims = widget.get_image_data().shape  # (z, y, x), feature off
+        iso = max(0.3, 0.75 * min(source_volume.GetSpacing()))
+
+        # Regression: toggling the feature on with an EMPTY current segment must
+        # not crash (an empty segment cannot be exported to a reference geometry).
+        widget.clear_current_segment()
+        slicer.app.processEvents()
+        widget.ui.sbOutputSpacing.setValue(iso)
+        widget.ui.cbEnableHighResOutput.setChecked(True)
+        slicer.app.processEvents()
+        self.assertTrue(widget._high_res_output_enabled())
+        self.assertIsNotNone(widget.get_output_volume_node())
+        widget.ui.cbEnableHighResOutput.setChecked(False)
+        widget.ui.sbOutputSpacing.setValue(0.0)
+        slicer.app.processEvents()
+
+        # Backward compatibility: feature off -> output volume is the source.
+        self.assertFalse(widget._output_geometry_active())
+        self.assertEqual(
+            widget.get_output_volume_node().GetID(), source_volume.GetID()
+        )
+
+        try:
+            widget.ui.sbOutputSpacing.setValue(iso)
+            widget.ui.cbEnableHighResOutput.setChecked(True)
+            slicer.app.processEvents()
+            self.assertTrue(widget._high_res_output_enabled())
+            output_volume = widget.get_output_volume_node()
+            self.assertNotEqual(output_volume.GetID(), source_volume.GetID())
+            self.assertTrue(widget._output_geometry_active())
+
+            output_dims = slicer.util.arrayFromVolume(output_volume).shape
+            self.assertTrue(
+                any(o > s for o, s in zip(output_dims, source_dims)),
+                msg="Finer output spacing should increase voxel dimensions.",
+            )
+
+            # Simulate a server result on the source grid (native inference off).
+            block = np.zeros(source_dims, dtype=np.uint8)
+            block[
+                source_dims[0] // 4: source_dims[0] // 2,
+                source_dims[1] // 4: source_dims[1] // 2,
+                source_dims[2] // 4: source_dims[2] // 2,
+            ] = 1
+            widget._handle_server_segmentation_result(block)
+            slicer.app.processEvents()
+
+            stored = widget.get_segment_data()
+            self.assertEqual(
+                stored.shape,
+                output_dims,
+                msg="Segment must be stored on the high-resolution output grid.",
+            )
+            self.assertGreater(int(stored.sum()), 0)
+
+            # Round-trip back to the source grid must overlap the original block.
+            src_roundtrip = widget.get_segment_data(
+                reference_volume_node=source_volume
+            )
+            self.assertEqual(src_roundtrip.shape, source_dims)
+            a = src_roundtrip.astype(bool)
+            b = block.astype(bool)
+            dice = 2.0 * np.logical_and(a, b).sum() / (a.sum() + b.sum())
+            self.assertGreater(
+                dice,
+                0.9,
+                msg="Source-grid round-trip should overlap the original block.",
+            )
+
+            # Output -> inference resample path on upload must work.
+            self.assertIsNotNone(widget.upload_segment_to_server())
+
+            # Disable: output volume becomes the source again, legacy storage.
+            widget.ui.cbEnableHighResOutput.setChecked(False)
+            slicer.app.processEvents()
+            self.assertEqual(
+                widget.get_output_volume_node().GetID(), source_volume.GetID()
+            )
+            legacy = np.zeros(source_dims, dtype=np.uint8)
+            legacy[1:5, 1:5, 1:5] = 1
+            widget._handle_server_segmentation_result(legacy)
+            slicer.app.processEvents()
+            self.assertEqual(
+                widget.get_segment_data().shape,
+                source_dims,
+                msg="With the feature off, storage must match the source grid.",
+            )
+        finally:
+            widget.ui.cbEnableHighResOutput.setChecked(False)
+            widget.ui.sbOutputSpacing.setValue(0.0)
+            widget._remove_output_geometry_node()
+            widget.clear_current_segment()
+            slicer.app.processEvents()
+
+        print("[PASS] high-resolution output geometry")
 
     def _trigger_point_prompt(self, widget, ijk, positive=True):
         dims = widget.get_image_data().shape  # (k, j, i)

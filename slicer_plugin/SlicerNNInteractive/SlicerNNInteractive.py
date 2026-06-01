@@ -37,6 +37,15 @@ PLANE_DISPLAY_SELECTOR_NAMES = {
     "Green": "cbGreenDisplayVolume",
 }
 
+# Hidden, geometry-only scalar volume that defines the canonical segmentation
+# output grid when the high-resolution output feature is enabled.
+OUTPUT_GEOMETRY_NODE_NAME = "NNInteractiveOutputGeometry (do not touch)"
+# Voxel-count guardrails for the isotropic output grid (kept opt-in + bounded).
+OUTPUT_GEOMETRY_SOFT_VOXEL_BUDGET = 50_000_000
+OUTPUT_GEOMETRY_HARD_VOXEL_BUDGET = 150_000_000
+OUTPUT_SPACING_MIN_MM = 0.3
+OUTPUT_SPACING_MAX_MM = 10.0
+
 
 def debug_print(*args):
     if DEBUG_MODE:
@@ -168,6 +177,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # sticky reapply consumes this snapshot, not the live selectors, so that
         # selector edits made without re-clicking Apply are not silently applied.
         self._plane_display_snapshot = None
+        # High-resolution output geometry: an optional isotropic grid that the
+        # canonical segment is stored on, decoupled from the coarse source grid.
+        self._output_geometry_node = None
+        self._output_geometry_spacing = None
+        self._output_geometry_source_id = None
         # Selection Operations-private undo stack: list of (segment_id, mask_uint8).
         self._sel_op_undo_stack = []
         self._sel_op_undo_stack_limit = 10
@@ -193,6 +207,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.inference_preview_segment_node_name = (
             "NativeSeriesInferencePreviewSegmentNode (do not touch)"
         )
+        self.output_geometry_node_name = OUTPUT_GEOMETRY_NODE_NAME
 
         # Set up editor widget
         self.ui.editor_widget.setMaximumNumberOfUndoStates(10)
@@ -433,6 +448,155 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             and source_volume.GetID() != working_volume.GetID()
         )
 
+    # -- High-resolution output geometry -------------------------------------
+
+    def _high_res_output_enabled(self):
+        """True when the user opted into a high-resolution output grid."""
+        if not hasattr(self, "ui"):
+            return False
+        return self.ui.cbEnableHighResOutput.isChecked()
+
+    def _get_output_spacing(self, source_volume=None):
+        """Isotropic output spacing in mm (0/empty -> finest source spacing)."""
+        value = 0.0
+        if hasattr(self, "ui"):
+            try:
+                value = float(self.ui.sbOutputSpacing.value)
+            except Exception:
+                value = 0.0
+        else:
+            value = float(
+                slicer.util.settingsValue(
+                    "SlicerNNInteractive/output_spacing", 0.0, converter=float
+                )
+            )
+        if value <= 0.0:
+            if source_volume is None:
+                source_volume = self.get_volume_node()
+            value = min(source_volume.GetSpacing()) if source_volume else 1.0
+        return max(OUTPUT_SPACING_MIN_MM, min(OUTPUT_SPACING_MAX_MM, value))
+
+    def get_output_volume_node(self):
+        """
+        Return the scalar volume whose grid the canonical segment is stored on.
+
+        Defaults to the Segment Editor source volume (fully backward compatible).
+        When the high-resolution output feature is on, returns a hidden isotropic
+        geometry volume so masks are stored at fine resolution in every plane.
+        """
+        source_volume = self.get_volume_node()
+        if source_volume is None:
+            return None
+        if not self._high_res_output_enabled():
+            return source_volume
+        node = self._ensure_output_geometry_node(source_volume)
+        if node is None:
+            slicer.util.showStatusMessage(
+                "Could not build the high-resolution output grid; "
+                "using the source grid.",
+                4000,
+            )
+            return source_volume
+        return node
+
+    def _output_geometry_active(self):
+        """True when the canonical output grid differs from the source grid."""
+        source_volume = self.get_volume_node()
+        output_volume = self.get_output_volume_node()
+        return (
+            source_volume is not None
+            and output_volume is not None
+            and source_volume.GetID() != output_volume.GetID()
+        )
+
+    def _output_grid_shape(self):
+        """numpy (z, y, x) shape of the canonical output grid, or None."""
+        output_volume = self.get_output_volume_node()
+        if output_volume is None:
+            return None
+        return slicer.util.arrayFromVolume(output_volume).shape
+
+    def _to_output_grid(self, mask):
+        """Resample a source-grid mask onto the output grid (no-op if equal)."""
+        return self._resample_mask_between_volumes(
+            mask, self.get_volume_node(), self.get_output_volume_node()
+        )
+
+    def _ensure_output_geometry_node(self, source_volume):
+        """Build or reuse the isotropic output-geometry volume for source_volume."""
+        iso = self._get_output_spacing(source_volume)
+        node = self._output_geometry_node
+        if (
+            node is not None
+            and slicer.mrmlScene.IsNodePresent(node)
+            and self._output_geometry_spacing is not None
+            and abs(self._output_geometry_spacing - iso) < 1e-6
+            and self._output_geometry_source_id == source_volume.GetID()
+        ):
+            return node
+        return self._build_output_geometry_node(source_volume, iso)
+
+    def _build_output_geometry_node(self, source_volume, iso):
+        """Create a hidden isotropic, source-aligned geometry-only scalar volume."""
+        image = source_volume.GetImageData()
+        if image is None:
+            return None
+        spacing = source_volume.GetSpacing()
+        dims = image.GetDimensions()
+        extents = [dims[a] * spacing[a] for a in range(3)]
+
+        def voxel_dims(spacing_iso):
+            return [max(1, int(np.ceil(extents[a] / spacing_iso))) for a in range(3)]
+
+        new_dims = voxel_dims(iso)
+        total = new_dims[0] * new_dims[1] * new_dims[2]
+        if total > OUTPUT_GEOMETRY_HARD_VOXEL_BUDGET:
+            factor = (total / float(OUTPUT_GEOMETRY_HARD_VOXEL_BUDGET)) ** (1.0 / 3.0)
+            iso = iso * factor
+            new_dims = voxel_dims(iso)
+            total = new_dims[0] * new_dims[1] * new_dims[2]
+            slicer.util.showStatusMessage(
+                "Output spacing coarsened to %.2f mm to fit the memory budget."
+                % iso,
+                5000,
+            )
+        elif total > OUTPUT_GEOMETRY_SOFT_VOXEL_BUDGET:
+            slicer.util.showStatusMessage(
+                "High-resolution output grid is large: %d x %d x %d voxels."
+                % (new_dims[0], new_dims[1], new_dims[2]),
+                5000,
+            )
+
+        src_ijk_to_ras = vtk.vtkMatrix4x4()
+        source_volume.GetIJKToRASMatrix(src_ijk_to_ras)
+        new_matrix = vtk.vtkMatrix4x4()
+        new_matrix.DeepCopy(src_ijk_to_ras)
+        for axis in range(3):
+            scale = iso / spacing[axis]
+            for row in range(3):
+                new_matrix.SetElement(
+                    row, axis, src_ijk_to_ras.GetElement(row, axis) * scale
+                )
+
+        new_image = vtk.vtkImageData()
+        new_image.SetDimensions(new_dims[0], new_dims[1], new_dims[2])
+        new_image.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
+        new_image.GetPointData().GetScalars().Fill(0)
+
+        node = self._output_geometry_node
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLScalarVolumeNode", self.output_geometry_node_name
+            )
+            node.HideFromEditorsOn()
+        node.SetAndObserveImageData(new_image)
+        node.SetIJKToRASMatrix(new_matrix)
+        node.SetAndObserveTransformNodeID(source_volume.GetTransformNodeID())
+        self._output_geometry_node = node
+        self._output_geometry_spacing = iso
+        self._output_geometry_source_id = source_volume.GetID()
+        return node
+
     def _refresh_native_series_inference_ui(self):
         """Update controls after enabling, disabling, or changing the working volume."""
         enabled = self.ui.cbEnableNativeSeriesInference.isChecked()
@@ -473,10 +637,21 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         A temporary segmentation node delegates the conversion to Slicer's
         segmentation infrastructure, which preserves label semantics.
+
+        Returns a uint8 mask on the target grid, or None if Slicer could not
+        perform the resample (callers must degrade gracefully).
         """
         mask = np.asarray(mask).astype(np.uint8)
         if source_volume.GetID() == target_volume.GetID():
             return mask.copy()
+
+        # An empty segment cannot be exported to a reference geometry (Slicer's
+        # GenerateSharedLabelmap fails), so short-circuit to a target-grid zero
+        # mask. This also speeds up clear/empty paths.
+        if int(mask.sum()) == 0:
+            return np.zeros(
+                slicer.util.arrayFromVolume(target_volume).shape, dtype=np.uint8
+            )
 
         staging_node = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLSegmentationNode"
@@ -502,6 +677,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             if resampled is None:
                 raise RuntimeError("Slicer returned no resampled labelmap.")
             return resampled.astype(np.uint8)
+        except Exception as exc:
+            # Most likely the target grid is too large to resample into. Report
+            # the geometry so the failure can be diagnosed, and let callers fall
+            # back rather than crashing the UI.
+            try:
+                target_dims = slicer.util.arrayFromVolume(target_volume).shape
+            except Exception:
+                target_dims = "unknown"
+            print(
+                "[nni] mask resample failed (target dims=%s): %s"
+                % (target_dims, exc)
+            )
+            return None
         finally:
             slicer.mrmlScene.RemoveNode(staging_node)
 
@@ -532,15 +720,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         return result.astype(np.uint8)
 
     def _get_or_create_inference_preview_segmentation(self):
-        """Create the source-grid overlay used for supplemental inference previews."""
+        """Create the output-grid overlay used for supplemental inference previews."""
         node = self._inference_preview_segment_node
         if node is None or not slicer.mrmlScene.IsNodePresent(node):
             node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
             node.SetName(self.inference_preview_segment_node_name)
             node.HideFromEditorsOn()
-            source_volume = self.get_volume_node()
-            if source_volume is not None:
-                self._set_segmentation_reference_volume(node, source_volume)
+            output_volume = self.get_output_volume_node()
+            if output_volume is not None:
+                self._set_segmentation_reference_volume(node, output_volume)
             node.CreateDefaultDisplayNodes()
             self._inference_preview_segment_node = node
 
@@ -562,24 +750,42 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         return node, segment_id
 
     def _update_inference_preview(self, working_mask):
-        """Resample an nnInteractive result onto the source grid and display it."""
-        source_volume = self.get_volume_node()
+        """Resample an nnInteractive result onto the output grid and display it.
+
+        Resampling working->output (instead of working->source) keeps the full
+        high-resolution detail of a supplemental-series result on the canonical
+        grid, which is the whole point of the high-resolution output feature.
+        """
+        output_volume = self.get_output_volume_node()
         working_volume = self.get_inference_volume_node()
-        source_mask = self._resample_mask_between_volumes(
-            working_mask, working_volume, source_volume
+        output_mask = self._resample_mask_between_volumes(
+            working_mask, working_volume, output_volume
         )
+        if output_mask is None:
+            # High-res output resample failed; fall back to the source grid so
+            # the preview is still produced.
+            self._disable_high_res_output(
+                "High-resolution output resample failed; "
+                "reverted to the source grid."
+            )
+            output_volume = self.get_output_volume_node()
+            output_mask = self._resample_mask_between_volumes(
+                working_mask, working_volume, output_volume
+            )
         self._inference_result_working_mask = np.asarray(working_mask).astype(
             np.uint8
         )
-        self._inference_result_source_mask = source_mask.astype(np.uint8)
+        # Stored on the canonical output grid (named _source for historical reasons).
+        self._inference_result_source_mask = output_mask.astype(np.uint8)
         self._inference_preview_target_segment_id = self.get_current_segment_id()
-        self._inference_preview_source_volume_id = source_volume.GetID()
+        # Track the source volume identity so we can invalidate if it changes.
+        self._inference_preview_source_volume_id = self.get_volume_node().GetID()
         node, segment_id = self._get_or_create_inference_preview_segmentation()
         slicer.util.updateSegmentBinaryLabelmapFromArray(
             self._inference_result_source_mask,
             node,
             segment_id,
-            source_volume,
+            output_volume,
         )
         self._refresh_native_series_inference_ui()
         slicer.util.showStatusMessage(
@@ -625,7 +831,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _handle_server_segmentation_result(self, segmentation_mask):
         """Write normal results directly, but stage supplemental results as previews."""
         if not self._is_native_series_inference_active():
-            self.show_segmentation(segmentation_mask)
+            # The result is on the inference grid (== source here). Resample onto
+            # the canonical output grid before writing (no-op if they are equal).
+            inference_mask = segmentation_mask
+            resampled = self._resample_mask_between_volumes(
+                inference_mask,
+                self.get_inference_volume_node(),
+                self.get_output_volume_node(),
+            )
+            if resampled is None:
+                # Resample to the high-res grid failed; keep the result by
+                # reverting to the source grid rather than dropping it.
+                self._disable_high_res_output(
+                    "High-resolution output resample failed; "
+                    "reverted to the source grid."
+                )
+                resampled = inference_mask
+            self.show_segmentation(resampled)
             return
 
         segmentation_mask = self._apply_lasso_slice_clip(segmentation_mask)
@@ -723,6 +945,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.on_clear_inference_preview_clicked
         )
         self._refresh_native_series_inference_ui()
+
+        # High-resolution output geometry (load persisted prefs with signals
+        # blocked so setting the widgets does not trigger a migration at startup).
+        self.ui.cbEnableHighResOutput.toggled.connect(self._on_high_res_output_changed)
+        self.ui.sbOutputSpacing.valueChanged.connect(self._on_output_spacing_changed)
+        blocked = self.ui.sbOutputSpacing.blockSignals(True)
+        self.ui.sbOutputSpacing.setValue(self._get_output_spacing_setting())
+        self.ui.sbOutputSpacing.blockSignals(blocked)
+        blocked = self.ui.cbEnableHighResOutput.blockSignals(True)
+        self.ui.cbEnableHighResOutput.setChecked(self._get_high_res_enabled_setting())
+        self.ui.cbEnableHighResOutput.blockSignals(blocked)
 
         # Connect Prompt Type buttons
         self.ui.pbPromptTypePositive.clicked.connect(
@@ -897,6 +1130,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Tear down the hidden lasso (3D) Scissors editor and region/preview nodes.
         self._destroy_lasso3d()
         self._destroy_inference_preview()
+        self._remove_output_geometry_node()
 
         if hasattr(self, "_qt_event_filters"):
             for slice_view, event_filter in self._qt_event_filters:
@@ -1592,7 +1826,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             debug_print(f"Clearing segment: {selected_segment_id}")
             self._destroy_inference_preview()
             self.show_segmentation(
-                np.zeros(self.get_image_data().shape, dtype=np.uint8)
+                np.zeros(self._output_grid_shape(), dtype=np.uint8)
             )
             self.setup_prompts()
             self.upload_segment_to_server()
@@ -1620,7 +1854,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 segmentation_mask,
                 segmentationNode,
                 selectedSegmentID,
-                self.get_volume_node(),
+                self.get_output_volume_node(),
             )
             if was_3d_shown:
                 segmentationNode.CreateClosedSurfaceRepresentation()
@@ -1679,7 +1913,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         # Set segmentation node in widget
         self.ui.editor_widget.setSegmentationNode(segmentation_node)
-        segmentation_node.SetReferenceImageGeometryParameterFromVolumeNode(self.get_volume_node())
+        # The canonical output grid (source volume by default, or a high-res
+        # isotropic grid when that feature is enabled).
+        segmentation_node.SetReferenceImageGeometryParameterFromVolumeNode(
+            self.get_output_volume_node()
+        )
 
         return segmentation_node
 
@@ -1706,13 +1944,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Gets the selected segment on a requested scalar-volume geometry.
 
-        The default is the canonical Segment Editor source volume.
+        The default is the canonical output grid (source volume, or the high-res
+        isotropic grid when that feature is enabled).
         """
         segmentation_node, selected_segment_id = (
             self.get_selected_segmentation_node_and_segment_id()
         )
         if reference_volume_node is None:
-            reference_volume_node = self.get_volume_node()
+            reference_volume_node = self.get_output_volume_node()
 
         mask = slicer.util.arrayFromSegmentBinaryLabelmap(
             segmentation_node, selected_segment_id, reference_volume_node
@@ -1826,12 +2065,112 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Persist the lasso-clip +/- N slices spin box."""
         qt.QSettings().setValue("SlicerNNInteractive/lasso_clip_n", int(value))
 
+    def _get_high_res_enabled_setting(self):
+        """Read whether the high-resolution output grid is enabled. Default False."""
+        v = qt.QSettings().value("SlicerNNInteractive/high_res_output_enabled", False)
+        if isinstance(v, str):
+            return v.lower() == "true"
+        return bool(v)
+
+    def _get_output_spacing_setting(self):
+        """Read the persisted isotropic output spacing in mm (0 = auto)."""
+        try:
+            return max(
+                0.0,
+                float(
+                    qt.QSettings().value("SlicerNNInteractive/output_spacing", 0.0)
+                ),
+            )
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _remove_output_geometry_node(self):
+        """Drop the hidden output-geometry volume and reset its bookkeeping."""
+        node = self._output_geometry_node
+        if node is not None and slicer.mrmlScene.IsNodePresent(node):
+            slicer.mrmlScene.RemoveNode(node)
+        self._output_geometry_node = None
+        self._output_geometry_spacing = None
+        self._output_geometry_source_id = None
+
+    def _disable_high_res_output(self, reason):
+        """Turn the high-res output feature off after a failure, without recursion."""
+        self._remove_output_geometry_node()
+        if hasattr(self, "ui"):
+            blocked = self.ui.cbEnableHighResOutput.blockSignals(True)
+            self.ui.cbEnableHighResOutput.setChecked(False)
+            self.ui.cbEnableHighResOutput.blockSignals(blocked)
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/high_res_output_enabled", False
+        )
+        slicer.util.showStatusMessage(reason, 6000)
+        print("[nni] high-resolution output disabled: %s" % reason)
+
+    def _rebuild_output_geometry_and_migrate(self):
+        """Re-derive the current segment onto the (new) output grid after a change."""
+        source_volume = self.get_volume_node()
+        if source_volume is None:
+            return
+        # Capture the current segment on the invariant source grid before the
+        # output grid changes.
+        try:
+            src_mask = self.get_segment_data(reference_volume_node=source_volume)
+        except Exception:
+            src_mask = None
+        # A stale supplemental-series preview lives on the old grid; discard it.
+        self._destroy_inference_preview()
+        if hasattr(self, "previous_states"):
+            self.previous_states.pop("segment_data", None)
+        if not self._high_res_output_enabled():
+            self._remove_output_geometry_node()
+        # Touch the output volume so the geometry node is (re)built when enabled,
+        # then point the segmentation reference geometry at it.
+        output_volume = self.get_output_volume_node()
+        seg_node = self.get_segmentation_node()
+        if seg_node is not None and output_volume is not None:
+            seg_node.SetReferenceImageGeometryParameterFromVolumeNode(output_volume)
+        # Rewrite the current segment onto the new grid. If the resample fails
+        # (e.g. the grid is too large), fall back to the source grid instead of
+        # crashing the toggle handler.
+        if src_mask is not None:
+            migrated = self._to_output_grid(src_mask)
+            if migrated is None:
+                self._disable_high_res_output(
+                    "High-resolution output grid could not be built; "
+                    "reverted to the source grid."
+                )
+                if seg_node is not None:
+                    seg_node.SetReferenceImageGeometryParameterFromVolumeNode(
+                        source_volume
+                    )
+                migrated = src_mask
+            self.show_segmentation(migrated)
+
+    def _on_high_res_output_changed(self, checked):
+        """Persist the high-res output toggle and migrate the current segment."""
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/high_res_output_enabled", bool(checked)
+        )
+        self._rebuild_output_geometry_and_migrate()
+        if hasattr(self, "ui"):
+            self._refresh_native_series_inference_ui()
+
+    def _on_output_spacing_changed(self, value):
+        """Persist the output spacing and, if enabled, rebuild the output grid."""
+        qt.QSettings().setValue("SlicerNNInteractive/output_spacing", float(value))
+        if self._high_res_output_enabled():
+            self._rebuild_output_geometry_and_migrate()
+
     def _apply_lasso_slice_clip(self, mask):
         """If enabled and the last prompt was a lasso, keep only the slices in
         [center-N, center+N] along the lasso plane axis and zero out the rest.
         mask is (z, y, x) uint8. Returns a new array, or the original on no-op.
         """
         if not self._get_lasso_clip_enabled():
+            return mask
+        # The recorded slice index is in source/inference voxels; it does not map
+        # to the high-resolution output grid, so skip clipping when that is active.
+        if self._output_geometry_active():
             return mask
         info = self._last_lasso_slice
         if info is None:
@@ -1944,8 +2283,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Computes a boolean set operation between the current segment and the
         operand mask. Does not write back or upload.
         """
+        # Operands are rasterized on the source grid; the target segment lives on
+        # the canonical output grid. Bridge the operand so shapes match (no-op
+        # when the output grid equals the source grid).
+        bridged = self._to_output_grid(operand_mask)
+        if bridged is None:
+            self._disable_high_res_output(
+                "High-resolution output resample failed; "
+                "reverted to the source grid."
+            )
+            bridged = operand_mask
         return self.compute_boolean_mask(
-            self.get_segment_data(), operand_mask, operation
+            self.get_segment_data(), bridged, operation
         )
 
     def on_apply_selection_op_clicked(self, checked=False):
@@ -3723,8 +4072,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         volumeNode = self.ui.editor_widget.sourceVolumeNode()
 
         if not volumeNode:
-            # Get the most recently added volume node
-            volumeNodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            # Get the most recently added volume node, skipping our hidden
+            # output-geometry node so it never becomes the source volume.
+            geometry_name = getattr(self, "output_geometry_node_name", None)
+            volumeNodes = [
+                node
+                for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+                if node.GetName() != geometry_name
+            ]
             if volumeNodes:
                 volumeNode = volumeNodes[-1]
             # Show this volume node in the segment editor widget

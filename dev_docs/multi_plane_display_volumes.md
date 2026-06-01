@@ -20,7 +20,9 @@ registered scalar volumes as backgrounds:
 This feature deliberately separates:
 
 - **Segmentation source volume**: the volume selected in the embedded Segment
-  Editor. Its voxel grid is the canonical output geometry for saved segments.
+  Editor. Its voxel grid is the *default* canonical output geometry for saved
+  segments. This default can be overridden by the high-resolution output
+  geometry feature (see "High-resolution output geometry" below).
 - **Display volumes**: optional per-view backgrounds used only to improve 2D
   image clarity.
 - **Inference working volume**: an optional registered supplemental volume
@@ -174,3 +176,60 @@ Display selection is scene-local and is not persisted across Slicer sessions.
     the preview is merged into the source segment.
 11. Repeat with Replace, Subtract, and Intersect when validating release
     behavior.
+
+## High-resolution output geometry
+
+By default the canonical segmentation output grid is the (often anisotropic)
+Segment Editor source volume, so a stored mask is fine in the source's native
+plane but coarse and stair-stepped in the other two planes. The
+`High-resolution output (optional)` group decouples the output grid from the
+source volume:
+
+- `Store masks on a high-resolution isotropic grid` enables the feature.
+- `Isotropic spacing (mm, 0 = auto)`: the target isotropic voxel size; `0`
+  uses the finest source spacing. Clamped to `[0.3, 10.0]` mm and coarsened
+  automatically if the resulting grid would exceed a voxel budget.
+
+When enabled, a hidden, source-aligned, geometry-only scalar volume
+(`NNInteractiveOutputGeometry (do not touch)`) is created with isotropic
+spacing covering the source field of view. The segment is stored and resampled
+on this grid:
+
+- `get_output_volume_node()` returns this grid (or the source volume when the
+  feature is off -- a full no-op, backward compatible).
+- The three mask-geometry call sites use it: the segmentation reference
+  geometry, the `show_segmentation` write reference, and the `get_segment_data`
+  default reference.
+- Server results are resampled from the inference grid onto the output grid at
+  the single chokepoint `_handle_server_segmentation_result`; native-series
+  results are resampled working -> output (preserving high-resolution detail
+  instead of collapsing to the coarse source first).
+- Selection-operation operands (ROI, magic wand, segment, lasso 3D) are
+  rasterized on the source grid and bridged to the output grid via
+  `_to_output_grid` inside `apply_boolean_operation`.
+- The server upload still samples the segment on the inference grid, so the
+  round-trip (write output / upload inference / read output) closes.
+
+**Important expectation**: this is the foundation, not a magic sharpener. A
+single inference on the coarse source volume is still coarse; resampling it to a
+fine grid only yields smaller stair-steps. True per-plane sharpness comes from
+running native-series inference on each high-resolution series and merging the
+results (default `Add`), which now land on the shared fine grid at full detail.
+
+Caveats:
+
+- Toggling the feature or changing the spacing re-derives the *current* segment
+  onto the new grid; other segments are not auto-migrated.
+- Lasso slice-range clipping is skipped while this feature is active (the
+  recorded slice index is in source voxels and does not map to the output grid).
+- Resampling uses Slicer's segmentation conversion (nearest-neighbor-like), so
+  coarse -> fine adds stair-stepping and the fine -> coarse upload loses detail.
+- A fine isotropic grid over a large field of view is memory-heavy; the build
+  warns and/or coarsens the spacing to stay within the voxel budget. If Slicer
+  still cannot resample a mask onto the grid, the feature auto-reverts to the
+  source grid (the current result/segment is kept) and a status message is
+  shown, rather than failing the operation.
+- An empty segment is never exported through the segmentation resampler (it
+  would fail); empty masks short-circuit to a zero mask on the target grid.
+- Enable state and spacing persist across sessions via `QSettings`
+  (`SlicerNNInteractive/high_res_output_enabled`, `.../output_spacing`).
