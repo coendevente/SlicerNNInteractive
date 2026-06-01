@@ -273,23 +273,50 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                     msg=f"{slice_view_name} should use its selected display volume.",
                 )
 
-            # Hidden Segment Editor effects, such as Lasso (3D), may reset all
-            # slice backgrounds to the source volume. Sticky per-plane display
-            # mode must restore the user's configured backgrounds afterward.
+            # Drive the real hidden-editor activation path. Lasso (3D) calls
+            # setSourceVolumeNode, which resets every slice background to the
+            # source volume, and then schedules a sticky reapply. Exercising the
+            # real call site (instead of faking the reset with setSliceViewerLayers)
+            # verifies the singleShot timing actually restores the backgrounds.
+            try:
+                widget._activate_lasso3d_scissors()
+                slicer.app.processEvents()
+                for slice_view_name, display_volume in display_volumes.items():
+                    composite_node = (
+                        slicer.app.layoutManager()
+                        .sliceWidget(slice_view_name)
+                        .mrmlSliceCompositeNode()
+                    )
+                    self.assertEqual(
+                        composite_node.GetBackgroundVolumeID(),
+                        display_volume.GetID(),
+                        msg=f"{slice_view_name} sticky display volume was not "
+                        "restored after Lasso (3D) activation.",
+                    )
+            finally:
+                widget._destroy_lasso3d()
+
+            # Regression for the Apply-time snapshot: changing a selector WITHOUT
+            # clicking Apply again must not leak into the sticky reapply. The
+            # background must stay on the volume that was active when Apply ran.
+            unapplied_volume = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLScalarVolumeNode"
+            )
+            unapplied_volume.SetName("UnappliedDisplayVolumeTest")
+            display_volumes["__unapplied__"] = unapplied_volume
+            widget.ui.cbRedDisplayVolume.setCurrentNode(unapplied_volume)
             slicer.util.setSliceViewerLayers(background=source_volume)
             widget._schedule_plane_display_reapply()
             slicer.app.processEvents()
-            for slice_view_name, display_volume in display_volumes.items():
-                composite_node = (
-                    slicer.app.layoutManager()
-                    .sliceWidget(slice_view_name)
-                    .mrmlSliceCompositeNode()
-                )
-                self.assertEqual(
-                    composite_node.GetBackgroundVolumeID(),
-                    display_volume.GetID(),
-                    msg=f"{slice_view_name} sticky display volume was not restored.",
-                )
+            red_composite = (
+                slicer.app.layoutManager().sliceWidget("Red").mrmlSliceCompositeNode()
+            )
+            self.assertEqual(
+                red_composite.GetBackgroundVolumeID(),
+                display_volumes["Red"].GetID(),
+                msg="Sticky reapply must follow the Apply-time snapshot, not an "
+                "unapplied selector change.",
+            )
 
             widget.on_reset_plane_display_volumes_clicked()
             self.assertFalse(widget._plane_display_volumes_active)

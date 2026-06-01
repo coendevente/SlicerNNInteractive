@@ -115,11 +115,17 @@ source volume. Reset clears all three selectors and restores the source volume
 as every standard view's background.
 
 Clicking `Apply view volumes` also enables a sticky per-plane display override.
-Hidden Segment Editor effects such as Scribble and Lasso (3D) may reset slice
-backgrounds while they activate or write labelmaps. The plugin schedules a
-silent reapply after those operations so Red, Yellow, and Green return to the
-configured display volumes. Clicking `Use source volume for all` disables this
-override.
+Hidden Segment Editor effects such as Scribble and Lasso (3D) call
+`setSourceVolumeNode` while activating, which resets every slice background to
+the source volume. The plugin schedules a silent reapply right after those
+activation calls so Red, Yellow, and Green return to the configured display
+volumes. Clicking `Use source volume for all` disables this override.
+
+The sticky reapply follows the selections that were locked in *when Apply was
+clicked* (a snapshot of the three selector node IDs), not the live selector
+values. Changing a selector without clicking Apply again therefore does not
+leak into the reapply. If a snapshotted display volume has been removed from
+the scene, that view falls back to the current source volume.
 
 The nested `Native-series inference` section contains:
 

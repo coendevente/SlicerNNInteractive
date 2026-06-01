@@ -163,6 +163,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # activating effects, so restore the user's selections afterward.
         self._plane_display_volumes_active = False
         self._plane_display_reapply_pending = False
+        # Snapshot locked in when the user clicks Apply: {slice_view_name: nodeID
+        # or None}. None means that view follows the current source volume. The
+        # sticky reapply consumes this snapshot, not the live selectors, so that
+        # selector edits made without re-clicking Apply are not silently applied.
+        self._plane_display_snapshot = None
         # Selection Operations-private undo stack: list of (segment_id, mask_uint8).
         self._sel_op_undo_stack = []
         self._sel_op_undo_stack_limit = 10
@@ -303,10 +308,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
             return False
 
+        snapshot = self._plane_display_snapshot or {}
         missing_views = []
-        for slice_view_name, selector_name in PLANE_DISPLAY_SELECTOR_NAMES.items():
-            selector = getattr(self.ui, selector_name)
-            display_volume = selector.currentNode() or source_volume
+        for slice_view_name in PLANE_DISPLAY_SELECTOR_NAMES:
+            volume_id = snapshot.get(slice_view_name)
+            display_volume = source_volume
+            if volume_id:
+                # A snapshotted volume may have been removed from the scene; fall
+                # back to the source volume instead of failing.
+                display_volume = (
+                    slicer.mrmlScene.GetNodeByID(volume_id) or source_volume
+                )
             if not self._set_slice_view_background(slice_view_name, display_volume):
                 missing_views.append(slice_view_name)
 
@@ -333,10 +345,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         This only changes view backgrounds. Segmentation geometry, prompts, and
         server synchronization continue to use the Segment Editor source volume.
         """
-        self._plane_display_volumes_active = True
-        if not self._apply_plane_display_volumes(show_status=True):
-            if self.get_volume_node() is None:
-                self._plane_display_volumes_active = False
+        # Lock in the current selections so later sticky reapplies follow what was
+        # applied, not whatever the selectors happen to show at reapply time.
+        self._plane_display_snapshot = {}
+        for slice_view_name, selector_name in PLANE_DISPLAY_SELECTOR_NAMES.items():
+            selected = getattr(self.ui, selector_name).currentNode()
+            self._plane_display_snapshot[slice_view_name] = (
+                selected.GetID() if selected is not None else None
+            )
+        # Sticky mode is on only when the apply fully succeeded.
+        self._plane_display_volumes_active = self._apply_plane_display_volumes(
+            show_status=True
+        )
 
     def _reapply_plane_display_volumes_if_active(self):
         """Restore sticky per-plane backgrounds after Segment Editor activity."""
@@ -365,6 +385,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
 
         self._plane_display_volumes_active = False
+        self._plane_display_snapshot = None
         for selector_name in PLANE_DISPLAY_SELECTOR_NAMES.values():
             getattr(self.ui, selector_name).setCurrentNode(None)
 
@@ -1377,6 +1398,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Set reference volume
         volume_node = self.get_volume_node()
         self.scribble_editor_widget.setSourceVolumeNode(volume_node)
+        # setSourceVolumeNode resets every slice background to the source volume,
+        # so restore the sticky per-plane display selections afterward.
         self._schedule_plane_display_reapply()
 
         # Activate paint effect
@@ -1608,8 +1631,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # (see https://github.com/coendevente/SlicerNNInteractive/issues/38)
             segmentationNode.GetSegmentation().CollapseBinaryLabelmaps()
 
-        self._schedule_plane_display_reapply()
-        
+        # Writing the result labelmap does not touch slice-view backgrounds, so no
+        # plane-display reapply is needed here. Only the hidden editors' explicit
+        # setSourceVolumeNode calls reset backgrounds, and they reapply themselves.
         del segmentation_mask
 
         debug_print(f"show_segmentation took {time.time() - t0}")
@@ -3086,6 +3110,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self._lasso3d_editor_widget.setSegmentationNode(node)
         self._lasso3d_editor_widget.setSourceVolumeNode(volume_node)
+        # setSourceVolumeNode resets every slice background to the source volume,
+        # so restore the sticky per-plane display selections afterward.
         self._schedule_plane_display_reapply()
         self._lasso3d_editor_node.SetSelectedSegmentID(seg_id)
 
