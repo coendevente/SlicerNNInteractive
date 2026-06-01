@@ -158,6 +158,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._inference_result_source_mask = None
         self._inference_preview_target_segment_id = None
         self._inference_preview_source_volume_id = None
+        # Applying per-plane display volumes enables a sticky view override.
+        # Hidden Segment Editor widgets may reset slice backgrounds while
+        # activating effects, so restore the user's selections afterward.
+        self._plane_display_volumes_active = False
+        self._plane_display_reapply_pending = False
         # Selection Operations-private undo stack: list of (segment_id, mask_uint8).
         self._sel_op_undo_stack = []
         self._sel_op_undo_stack_limit = 10
@@ -287,20 +292,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         return True
 
-    def on_apply_plane_display_volumes_clicked(self, checked=False):
-        """
-        Show registered supplemental volumes in individual slice views.
-
-        This only changes view backgrounds. Segmentation geometry, prompts, and
-        server synchronization continue to use the Segment Editor source volume.
-        """
+    def _apply_plane_display_volumes(self, show_status=False):
+        """Apply the configured supplemental backgrounds to standard slice views."""
         source_volume = self.get_volume_node()
         if source_volume is None:
-            slicer.util.showStatusMessage(
-                "Load a source volume before configuring slice-view volumes.",
-                4000,
-            )
-            return
+            if show_status:
+                slicer.util.showStatusMessage(
+                    "Load a source volume before configuring slice-view volumes.",
+                    4000,
+                )
+            return False
 
         missing_views = []
         for slice_view_name, selector_name in PLANE_DISPLAY_SELECTOR_NAMES.items():
@@ -310,17 +311,48 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 missing_views.append(slice_view_name)
 
         if missing_views:
+            if show_status:
+                slicer.util.showStatusMessage(
+                    "Slice views unavailable: " + ", ".join(missing_views),
+                    4000,
+                )
+            return False
+
+        if show_status:
             slicer.util.showStatusMessage(
-                "Slice views unavailable: " + ", ".join(missing_views),
+                "Applied registered per-plane display volumes. "
+                "Segmentation source volume is unchanged.",
                 4000,
             )
-            return
+        return True
 
-        slicer.util.showStatusMessage(
-            "Applied registered per-plane display volumes. "
-            "Segmentation source volume is unchanged.",
-            4000,
-        )
+    def on_apply_plane_display_volumes_clicked(self, checked=False):
+        """
+        Show registered supplemental volumes in individual slice views.
+
+        This only changes view backgrounds. Segmentation geometry, prompts, and
+        server synchronization continue to use the Segment Editor source volume.
+        """
+        self._plane_display_volumes_active = True
+        if not self._apply_plane_display_volumes(show_status=True):
+            if self.get_volume_node() is None:
+                self._plane_display_volumes_active = False
+
+    def _reapply_plane_display_volumes_if_active(self):
+        """Restore sticky per-plane backgrounds after Segment Editor activity."""
+        self._plane_display_reapply_pending = False
+        if self._plane_display_volumes_active:
+            self._apply_plane_display_volumes(show_status=False)
+
+    def _schedule_plane_display_reapply(self):
+        """Restore per-plane backgrounds after the current Qt event completes."""
+        if (
+            not self._plane_display_volumes_active
+            or self._plane_display_reapply_pending
+        ):
+            return
+        self._plane_display_reapply_pending = True
+        qt.QTimer.singleShot(0, self._reapply_plane_display_volumes_if_active)
 
     def on_reset_plane_display_volumes_clicked(self, checked=False):
         """Restore the Segment Editor source volume in all standard slice views."""
@@ -332,6 +364,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
+        self._plane_display_volumes_active = False
         for selector_name in PLANE_DISPLAY_SELECTOR_NAMES.values():
             getattr(self.ui, selector_name).setCurrentNode(None)
 
@@ -1344,6 +1377,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Set reference volume
         volume_node = self.get_volume_node()
         self.scribble_editor_widget.setSourceVolumeNode(volume_node)
+        self._schedule_plane_display_reapply()
 
         # Activate paint effect
         self.scribble_editor_widget.setActiveEffectByName("Paint")
@@ -1573,6 +1607,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # If we do this when segmentation_mask.sum() == 0, sometimes Slicer will throw "bogus" OOM errors
             # (see https://github.com/coendevente/SlicerNNInteractive/issues/38)
             segmentationNode.GetSegmentation().CollapseBinaryLabelmaps()
+
+        self._schedule_plane_display_reapply()
         
         del segmentation_mask
 
@@ -3050,6 +3086,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self._lasso3d_editor_widget.setSegmentationNode(node)
         self._lasso3d_editor_widget.setSourceVolumeNode(volume_node)
+        self._schedule_plane_display_reapply()
         self._lasso3d_editor_node.SetSelectedSegmentID(seg_id)
 
         self._lasso3d_editor_widget.setActiveEffectByName("Scissors")
@@ -3311,6 +3348,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if int(ai_mask.sum()) > 0:
             node.GetSegmentation().CollapseBinaryLabelmaps()
             node.CreateClosedSurfaceRepresentation()
+        self._schedule_plane_display_reapply()
         # Hide the raw drawn region so it does not occlude the AI preview in 3D.
         self._set_lasso3d_input_visible(False)
         # Belt-and-suspenders: a successful preview means a region was drawn, so

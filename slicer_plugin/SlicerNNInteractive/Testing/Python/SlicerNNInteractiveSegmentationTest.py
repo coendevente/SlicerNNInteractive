@@ -273,7 +273,26 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                     msg=f"{slice_view_name} should use its selected display volume.",
                 )
 
+            # Hidden Segment Editor effects, such as Lasso (3D), may reset all
+            # slice backgrounds to the source volume. Sticky per-plane display
+            # mode must restore the user's configured backgrounds afterward.
+            slicer.util.setSliceViewerLayers(background=source_volume)
+            widget._schedule_plane_display_reapply()
+            slicer.app.processEvents()
+            for slice_view_name, display_volume in display_volumes.items():
+                composite_node = (
+                    slicer.app.layoutManager()
+                    .sliceWidget(slice_view_name)
+                    .mrmlSliceCompositeNode()
+                )
+                self.assertEqual(
+                    composite_node.GetBackgroundVolumeID(),
+                    display_volume.GetID(),
+                    msg=f"{slice_view_name} sticky display volume was not restored.",
+                )
+
             widget.on_reset_plane_display_volumes_clicked()
+            self.assertFalse(widget._plane_display_volumes_active)
             for slice_view_name, selector_name in view_selectors.items():
                 composite_node = (
                     slicer.app.layoutManager()
