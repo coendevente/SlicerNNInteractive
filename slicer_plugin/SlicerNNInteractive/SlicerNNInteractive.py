@@ -983,6 +983,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         interaction_node = slicer.app.applicationLogic().GetInteractionNode()
         interaction_node.SetCurrentInteractionMode(interaction_node.ViewTransform)
 
+        # Rebuilding prompts re-runs setup_scribble_prompt, whose
+        # setSegmentationNode call pushes the source volume back into every slice
+        # view background. Restore the sticky per-plane display selections after
+        # the whole rebuild (and its callers, e.g. the lasso prompt's _next)
+        # finish. No-op unless the multi-plane display override is active.
+        self._schedule_plane_display_reapply()
+
     def setup_scribble_prompt(self):
         """
         Creates a hidden "Segment Editor" for the scribble prompt.
@@ -2046,6 +2053,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._record_selection_op_undo(target_id, pre_state)
 
         self.show_segmentation(result_mask)
+        # setup_prompts rebuilds the hidden scribble editor, which resets slice
+        # backgrounds; it schedules a sticky per-plane reapply on its own.
         self.setup_prompts()
         # The wand preview reflected the about-to-apply mask -- clear it now
         # that the operation has landed on the actual target segment.
