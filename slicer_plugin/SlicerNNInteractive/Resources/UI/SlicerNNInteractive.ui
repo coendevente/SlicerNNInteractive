@@ -842,6 +842,253 @@
      </property>
      <layout class="QVBoxLayout" name="segmentEditorLayout">
       <item>
+       <widget class="QGroupBox" name="planeDisplayGroup">
+        <property name="title">
+         <string>Multi-plane display (optional)</string>
+        </property>
+        <layout class="QVBoxLayout" name="verticalLayout_planeDisplay">
+         <item>
+          <widget class="QLabel" name="lblPlaneDisplayHelp">
+           <property name="text">
+            <string>Choose registered volumes for clearer 2D views. Segmentation still uses the Segment Editor source volume.</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <layout class="QFormLayout" name="formLayout_planeDisplay">
+           <item row="0" column="0">
+            <widget class="QLabel" name="lblRedDisplayVolume">
+             <property name="text">
+              <string>Red (Axial):</string>
+             </property>
+            </widget>
+           </item>
+           <item row="0" column="1">
+            <widget class="qMRMLNodeComboBox" name="cbRedDisplayVolume">
+             <property name="nodeTypes">
+              <stringlist>
+               <string>vtkMRMLScalarVolumeNode</string>
+              </stringlist>
+             </property>
+             <property name="noneEnabled">
+              <bool>true</bool>
+             </property>
+             <property name="addEnabled">
+              <bool>false</bool>
+             </property>
+             <property name="removeEnabled">
+              <bool>false</bool>
+             </property>
+             <property name="renameEnabled">
+              <bool>false</bool>
+             </property>
+            </widget>
+           </item>
+           <item row="1" column="0">
+            <widget class="QLabel" name="lblYellowDisplayVolume">
+             <property name="text">
+              <string>Yellow (Sagittal):</string>
+             </property>
+            </widget>
+           </item>
+           <item row="1" column="1">
+            <widget class="qMRMLNodeComboBox" name="cbYellowDisplayVolume">
+             <property name="nodeTypes">
+              <stringlist>
+               <string>vtkMRMLScalarVolumeNode</string>
+              </stringlist>
+             </property>
+             <property name="noneEnabled">
+              <bool>true</bool>
+             </property>
+             <property name="addEnabled">
+              <bool>false</bool>
+             </property>
+             <property name="removeEnabled">
+              <bool>false</bool>
+             </property>
+             <property name="renameEnabled">
+              <bool>false</bool>
+             </property>
+            </widget>
+           </item>
+           <item row="2" column="0">
+            <widget class="QLabel" name="lblGreenDisplayVolume">
+             <property name="text">
+              <string>Green (Coronal):</string>
+             </property>
+            </widget>
+           </item>
+           <item row="2" column="1">
+            <widget class="qMRMLNodeComboBox" name="cbGreenDisplayVolume">
+             <property name="nodeTypes">
+              <stringlist>
+               <string>vtkMRMLScalarVolumeNode</string>
+              </stringlist>
+             </property>
+             <property name="noneEnabled">
+              <bool>true</bool>
+             </property>
+             <property name="addEnabled">
+              <bool>false</bool>
+             </property>
+             <property name="removeEnabled">
+              <bool>false</bool>
+             </property>
+             <property name="renameEnabled">
+              <bool>false</bool>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </item>
+         <item>
+         <layout class="QHBoxLayout" name="horizontalLayout_planeDisplayActions">
+           <item>
+            <widget class="QPushButton" name="pbApplyPlaneDisplayVolumes">
+             <property name="toolTip">
+              <string>Use the selected registered volumes as the Red, Yellow, and Green slice-view backgrounds. Empty selections fall back to the current Segment Editor source volume.</string>
+             </property>
+             <property name="text">
+              <string>Apply view volumes</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="pbResetPlaneDisplayVolumes">
+             <property name="toolTip">
+              <string>Restore the current Segment Editor source volume as the background in all three slice views.</string>
+             </property>
+             <property name="text">
+              <string>Use source volume for all</string>
+             </property>
+            </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <widget class="QGroupBox" name="nativeSeriesInferenceGroup">
+          <property name="title">
+           <string>Native-series inference (optional)</string>
+          </property>
+          <layout class="QVBoxLayout" name="verticalLayout_nativeSeriesInference">
+           <item>
+            <widget class="QCheckBox" name="cbEnableNativeSeriesInference">
+             <property name="toolTip">
+              <string>Run nnInteractive on a registered supplemental series. Results are previewed first and synchronized back to the Segment Editor source volume only when confirmed.</string>
+             </property>
+             <property name="text">
+              <string>Analyze a supplemental series</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <layout class="QFormLayout" name="formLayout_nativeSeriesInference">
+             <item row="0" column="0">
+              <widget class="QLabel" name="lblInferenceWorkingVolume">
+               <property name="text">
+                <string>Working volume:</string>
+               </property>
+              </widget>
+             </item>
+             <item row="0" column="1">
+              <widget class="qMRMLNodeComboBox" name="cbInferenceWorkingVolume">
+               <property name="nodeTypes">
+                <stringlist>
+                 <string>vtkMRMLScalarVolumeNode</string>
+                </stringlist>
+               </property>
+               <property name="noneEnabled">
+                <bool>true</bool>
+               </property>
+               <property name="addEnabled">
+                <bool>false</bool>
+               </property>
+               <property name="removeEnabled">
+                <bool>false</bool>
+               </property>
+               <property name="renameEnabled">
+                <bool>false</bool>
+               </property>
+              </widget>
+             </item>
+             <item row="1" column="0">
+              <widget class="QLabel" name="lblInferenceSyncMode">
+               <property name="text">
+                <string>Sync mode:</string>
+               </property>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QComboBox" name="cbInferenceSyncMode">
+               <item>
+                <property name="text">
+                 <string>Add to source</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>Replace source</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>Subtract from source</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>Intersect source</string>
+                </property>
+               </item>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="horizontalLayout_nativeSeriesInferenceActions">
+             <item>
+              <widget class="QPushButton" name="pbSyncInferenceResult">
+               <property name="toolTip">
+                <string>Merge the current supplemental-series preview into the Segment Editor source volume using the selected sync mode.</string>
+               </property>
+               <property name="text">
+                <string>Sync preview to source</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="pbClearInferencePreview">
+               <property name="toolTip">
+                <string>Discard the supplemental-series preview without changing the source segment.</string>
+               </property>
+               <property name="text">
+                <string>Clear preview</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblNativeSeriesInferenceHelp">
+             <property name="text">
+              <string>Prompts run on the working volume. The result remains a preview until synchronized to the source volume.</string>
+             </property>
+             <property name="wordWrap">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
        <layout class="QHBoxLayout" name="horizontalLayout_segOpacity">
         <item>
          <widget class="QLabel" name="lblSegOpacity">
@@ -947,6 +1194,11 @@
    <class>qMRMLSegmentEditorWidget</class>
    <extends>qMRMLWidget</extends>
    <header>qMRMLSegmentEditorWidget.h</header>
+  </customwidget>
+  <customwidget>
+   <class>qMRMLNodeComboBox</class>
+   <extends>QComboBox</extends>
+   <header>qMRMLNodeComboBox.h</header>
   </customwidget>
  </customwidgets>
  <resources/>

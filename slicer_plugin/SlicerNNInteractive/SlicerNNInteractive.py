@@ -31,6 +31,12 @@ from PythonQt.QtGui import QMessageBox
 
 DEBUG_MODE = False
 
+PLANE_DISPLAY_SELECTOR_NAMES = {
+    "Red": "cbRedDisplayVolume",
+    "Yellow": "cbYellowDisplayVolume",
+    "Green": "cbGreenDisplayVolume",
+}
+
 
 def debug_print(*args):
     if DEBUG_MODE:
@@ -45,16 +51,21 @@ def ensure_synched(func):
 
     def inner(self, *args, **kwargs):
         failed_to_sync = False
+        uploaded_image = False
 
-        if self.image_changed():
+        if self.image_changed(do_prev_image_update=False):
             debug_print(
-                "Image changed (or not previously set). Calling upload_segment_to_server()"
+                "Inference image changed (or not previously set). "
+                "Calling upload_image_to_server()"
             )
             result = self.upload_image_to_server()
-
             failed_to_sync = result is None
+            uploaded_image = not failed_to_sync
 
-        if not failed_to_sync and self.selected_segment_changed():
+        if (
+            not failed_to_sync
+            and (uploaded_image or self.selected_segment_changed())
+        ):
             debug_print(
                 "Segment changed (or not previously set). Calling upload_segment_to_server()"
             )
@@ -139,6 +150,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._lasso3d_editor_node = None
         self._lasso3d_input_observer_tag = None
         self._lasso3d_in_update = False
+        # Native-series inference: keep supplemental-series AI results in a
+        # preview until the user explicitly merges them into the source grid.
+        self._inference_preview_segment_node = None
+        self._inference_preview_segment_id = None
+        self._inference_result_working_mask = None
+        self._inference_result_source_mask = None
+        self._inference_preview_target_segment_id = None
+        self._inference_preview_source_volume_id = None
         # Selection Operations-private undo stack: list of (segment_id, mask_uint8).
         self._sel_op_undo_stack = []
         self._sel_op_undo_stack_limit = 10
@@ -154,10 +173,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         ui_widget = slicer.util.loadUI(self.resourcePath("UI/SlicerNNInteractive.ui"))
         self.layout.addWidget(ui_widget)
         self.ui = slicer.util.childWidgetVariables(ui_widget)
+        for selector_name in PLANE_DISPLAY_SELECTOR_NAMES.values():
+            getattr(self.ui, selector_name).setMRMLScene(slicer.mrmlScene)
+        self.ui.cbInferenceWorkingVolume.setMRMLScene(slicer.mrmlScene)
         self.scribble_segment_node_name = "ScribbleSegmentNode (do not touch)"
         self.wand_preview_segment_node_name = "MagicWandPreviewSegmentNode (do not touch)"
         self.lasso3d_input_segment_node_name = "Lasso3dInputSegmentNode (do not touch)"
         self.lasso3d_preview_segment_node_name = "Lasso3dPreviewSegmentNode (do not touch)"
+        self.inference_preview_segment_node_name = (
+            "NativeSeriesInferencePreviewSegmentNode (do not touch)"
+        )
 
         # Set up editor widget
         self.ui.editor_widget.setMaximumNumberOfUndoStates(10)
@@ -242,6 +267,367 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         for slice_node in slicer.util.getNodesByClass("vtkMRMLSliceNode"):
             slice_node.Modified()
 
+    @staticmethod
+    def _set_slice_view_background(slice_view_name, volume_node):
+        """Set one standard slice view's background volume."""
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return False
+
+        slice_widget = layout_manager.sliceWidget(slice_view_name)
+        if slice_widget is None:
+            return False
+
+        composite_node = slice_widget.mrmlSliceCompositeNode()
+        if composite_node is None:
+            return False
+
+        composite_node.SetBackgroundVolumeID(
+            volume_node.GetID() if volume_node is not None else None
+        )
+        return True
+
+    def on_apply_plane_display_volumes_clicked(self, checked=False):
+        """
+        Show registered supplemental volumes in individual slice views.
+
+        This only changes view backgrounds. Segmentation geometry, prompts, and
+        server synchronization continue to use the Segment Editor source volume.
+        """
+        source_volume = self.get_volume_node()
+        if source_volume is None:
+            slicer.util.showStatusMessage(
+                "Load a source volume before configuring slice-view volumes.",
+                4000,
+            )
+            return
+
+        missing_views = []
+        for slice_view_name, selector_name in PLANE_DISPLAY_SELECTOR_NAMES.items():
+            selector = getattr(self.ui, selector_name)
+            display_volume = selector.currentNode() or source_volume
+            if not self._set_slice_view_background(slice_view_name, display_volume):
+                missing_views.append(slice_view_name)
+
+        if missing_views:
+            slicer.util.showStatusMessage(
+                "Slice views unavailable: " + ", ".join(missing_views),
+                4000,
+            )
+            return
+
+        slicer.util.showStatusMessage(
+            "Applied registered per-plane display volumes. "
+            "Segmentation source volume is unchanged.",
+            4000,
+        )
+
+    def on_reset_plane_display_volumes_clicked(self, checked=False):
+        """Restore the Segment Editor source volume in all standard slice views."""
+        source_volume = self.get_volume_node()
+        if source_volume is None:
+            slicer.util.showStatusMessage(
+                "Load a source volume before resetting slice-view volumes.",
+                4000,
+            )
+            return
+
+        for selector_name in PLANE_DISPLAY_SELECTOR_NAMES.values():
+            getattr(self.ui, selector_name).setCurrentNode(None)
+
+        missing_views = [
+            slice_view_name
+            for slice_view_name in PLANE_DISPLAY_SELECTOR_NAMES
+            if not self._set_slice_view_background(slice_view_name, source_volume)
+        ]
+        if missing_views:
+            slicer.util.showStatusMessage(
+                "Slice views unavailable: " + ", ".join(missing_views),
+                4000,
+            )
+            return
+
+        slicer.util.showStatusMessage(
+            "Restored the Segment Editor source volume in all slice views.",
+            4000,
+        )
+
+    def get_inference_volume_node(self):
+        """
+        Return the image grid currently used by nnInteractive.
+
+        The embedded Segment Editor source volume remains the canonical output
+        grid. A supplemental working volume is used only while native-series
+        inference is explicitly enabled.
+        """
+        source_volume = self.get_volume_node()
+        if source_volume is None:
+            return None
+        if not hasattr(self, "ui"):
+            return source_volume
+        if not self.ui.cbEnableNativeSeriesInference.isChecked():
+            return source_volume
+        return self.ui.cbInferenceWorkingVolume.currentNode() or source_volume
+
+    def _is_native_series_inference_active(self):
+        """True when nnInteractive is analyzing a supplemental volume."""
+        source_volume = self.get_volume_node()
+        working_volume = self.get_inference_volume_node()
+        return (
+            source_volume is not None
+            and working_volume is not None
+            and source_volume.GetID() != working_volume.GetID()
+        )
+
+    def _refresh_native_series_inference_ui(self):
+        """Update controls after enabling, disabling, or changing the working volume."""
+        enabled = self.ui.cbEnableNativeSeriesInference.isChecked()
+        active = self._is_native_series_inference_active()
+        has_preview = self._inference_result_source_mask is not None
+        self.ui.cbInferenceWorkingVolume.setEnabled(enabled)
+        self.ui.cbInferenceSyncMode.setEnabled(active)
+        self.ui.pbSyncInferenceResult.setEnabled(active and has_preview)
+        self.ui.pbClearInferencePreview.setEnabled(has_preview)
+
+    def _on_native_series_inference_settings_changed(self, *args):
+        """
+        Discard stale previews and force a server resync after changing the
+        inference image. Switching volumes resets the server interaction chain.
+        """
+        self._destroy_inference_preview()
+        if hasattr(self, "previous_states"):
+            self.previous_states.pop("image_data", None)
+            self.previous_states.pop("image_volume_id", None)
+            self.previous_states.pop("segment_data", None)
+        self._refresh_native_series_inference_ui()
+
+    @staticmethod
+    def _set_segmentation_reference_volume(segmentation_node, volume_node):
+        """Align a staging segmentation node with a scalar volume."""
+        segmentation_node.SetReferenceImageGeometryParameterFromVolumeNode(
+            volume_node
+        )
+        segmentation_node.SetAndObserveTransformNodeID(
+            volume_node.GetTransformNodeID()
+        )
+
+    def _resample_mask_between_volumes(
+        self, mask, source_volume, target_volume
+    ):
+        """
+        Resample a binary numpy mask between registered scalar-volume grids.
+
+        A temporary segmentation node delegates the conversion to Slicer's
+        segmentation infrastructure, which preserves label semantics.
+        """
+        mask = np.asarray(mask).astype(np.uint8)
+        if source_volume.GetID() == target_volume.GetID():
+            return mask.copy()
+
+        staging_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode"
+        )
+        staging_node.SetName("NativeSeriesInferenceResample (temporary)")
+        staging_node.HideFromEditorsOn()
+        self._set_segmentation_reference_volume(staging_node, source_volume)
+        staging_segment_id = staging_node.GetSegmentation().AddEmptySegment(
+            "Resample", "Resample"
+        )
+        try:
+            slicer.util.updateSegmentBinaryLabelmapFromArray(
+                mask,
+                staging_node,
+                staging_segment_id,
+                source_volume,
+            )
+            resampled = slicer.util.arrayFromSegmentBinaryLabelmap(
+                staging_node,
+                staging_segment_id,
+                target_volume,
+            )
+            if resampled is None:
+                raise RuntimeError("Slicer returned no resampled labelmap.")
+            return resampled.astype(np.uint8)
+        finally:
+            slicer.mrmlScene.RemoveNode(staging_node)
+
+    @staticmethod
+    def compute_inference_sync_mask(source_mask, preview_mask, mode):
+        """
+        Merge a supplemental-series preview into the canonical source mask.
+
+        mode: 0=Add, 1=Replace, 2=Subtract, 3=Intersect.
+        """
+        source_mask = np.asarray(source_mask).astype(bool)
+        preview_mask = np.asarray(preview_mask).astype(bool)
+        if source_mask.shape != preview_mask.shape:
+            raise ValueError(
+                "Source and preview masks have different shapes: "
+                f"{source_mask.shape} vs {preview_mask.shape}."
+            )
+        if mode == 0:
+            result = source_mask | preview_mask
+        elif mode == 1:
+            result = preview_mask
+        elif mode == 2:
+            result = source_mask & ~preview_mask
+        elif mode == 3:
+            result = source_mask & preview_mask
+        else:
+            raise ValueError(f"Unknown inference sync mode index: {mode}")
+        return result.astype(np.uint8)
+
+    def _get_or_create_inference_preview_segmentation(self):
+        """Create the source-grid overlay used for supplemental inference previews."""
+        node = self._inference_preview_segment_node
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+            node.SetName(self.inference_preview_segment_node_name)
+            node.HideFromEditorsOn()
+            source_volume = self.get_volume_node()
+            if source_volume is not None:
+                self._set_segmentation_reference_volume(node, source_volume)
+            node.CreateDefaultDisplayNodes()
+            self._inference_preview_segment_node = node
+
+        segmentation = node.GetSegmentation()
+        segment_id = self._inference_preview_segment_id
+        if not segment_id or not segmentation.GetSegment(segment_id):
+            segment_id = segmentation.AddEmptySegment(
+                "NativeSeriesInferencePreview",
+                "NativeSeriesInferencePreview",
+                [1.0, 0.6, 0.1],
+            )
+            self._inference_preview_segment_id = segment_id
+
+        display_node = node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetSegmentOpacity2DFill(segment_id, 0.35)
+            display_node.SetSegmentOpacity2DOutline(segment_id, 0.9)
+            display_node.SetSegmentVisibility(segment_id, True)
+        return node, segment_id
+
+    def _update_inference_preview(self, working_mask):
+        """Resample an nnInteractive result onto the source grid and display it."""
+        source_volume = self.get_volume_node()
+        working_volume = self.get_inference_volume_node()
+        source_mask = self._resample_mask_between_volumes(
+            working_mask, working_volume, source_volume
+        )
+        self._inference_result_working_mask = np.asarray(working_mask).astype(
+            np.uint8
+        )
+        self._inference_result_source_mask = source_mask.astype(np.uint8)
+        self._inference_preview_target_segment_id = self.get_current_segment_id()
+        self._inference_preview_source_volume_id = source_volume.GetID()
+        node, segment_id = self._get_or_create_inference_preview_segmentation()
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            self._inference_result_source_mask,
+            node,
+            segment_id,
+            source_volume,
+        )
+        self._refresh_native_series_inference_ui()
+        slicer.util.showStatusMessage(
+            "Supplemental-series result updated as a preview. "
+            "Sync it to the source volume when ready.",
+            4000,
+        )
+
+    def _destroy_inference_preview(self, checked=False):
+        """Discard the supplemental-series preview without editing the source segment."""
+        node = self._inference_preview_segment_node
+        if node is not None and slicer.mrmlScene.IsNodePresent(node):
+            slicer.mrmlScene.RemoveNode(node)
+        self._inference_preview_segment_node = None
+        self._inference_preview_segment_id = None
+        self._inference_result_working_mask = None
+        self._inference_result_source_mask = None
+        self._inference_preview_target_segment_id = None
+        self._inference_preview_source_volume_id = None
+        if hasattr(self, "ui"):
+            self._refresh_native_series_inference_ui()
+
+    def on_clear_inference_preview_clicked(self, checked=False):
+        """Discard the preview and restore the source mask as the server target."""
+        had_preview = self._inference_result_source_mask is not None
+        self._destroy_inference_preview()
+        if not had_preview:
+            return
+        result = self.upload_segment_to_server()
+        if result is None:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Native-series inference",
+                "The preview was cleared locally, but restoring the source "
+                "mask on the server failed.",
+            )
+            return
+        slicer.util.showStatusMessage(
+            "Supplemental-series preview cleared; source mask restored on server.",
+            4000,
+        )
+
+    def _handle_server_segmentation_result(self, segmentation_mask):
+        """Write normal results directly, but stage supplemental results as previews."""
+        if not self._is_native_series_inference_active():
+            self.show_segmentation(segmentation_mask)
+            return
+
+        segmentation_mask = self._apply_lasso_slice_clip(segmentation_mask)
+        self._last_lasso_slice = None
+        self._update_inference_preview(segmentation_mask)
+
+    def on_sync_inference_result_clicked(self, checked=False):
+        """Merge the current supplemental-series preview into the source segment."""
+        if self._inference_result_source_mask is None:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Native-series inference",
+                "Run at least one prompt on the supplemental series first.",
+            )
+            return
+        if self.get_current_segment_id() != self._inference_preview_target_segment_id:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Native-series inference",
+                "The selected source segment changed after the preview was "
+                "created. Clear the preview and run the prompt again.",
+            )
+            return
+        source_volume = self.get_volume_node()
+        if (
+            source_volume is None
+            or source_volume.GetID() != self._inference_preview_source_volume_id
+        ):
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Native-series inference",
+                "The source volume changed after the preview was created. "
+                "Clear the preview and run the prompt again.",
+            )
+            return
+
+        merged_mask = self.compute_inference_sync_mask(
+            self.get_segment_data(),
+            self._inference_result_source_mask,
+            self.ui.cbInferenceSyncMode.currentIndex,
+        )
+        self.show_segmentation(merged_mask)
+        self._destroy_inference_preview()
+        result = self.upload_segment_to_server()
+        if result is None:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Native-series inference",
+                "The preview was merged locally, but syncing the merged mask "
+                "to the server failed.",
+            )
+            return
+        slicer.util.showStatusMessage(
+            "Supplemental-series preview merged into the source segment.", 4000
+        )
+
     def init_ui_functionality(self):
         """
         Connect UI elements to functions.
@@ -264,6 +650,25 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Top buttons
         self.ui.pbResetSegment.clicked.connect(self.clear_current_segment)
         self.ui.pbNextSegment.clicked.connect(self.make_new_segment)
+        self.ui.pbApplyPlaneDisplayVolumes.clicked.connect(
+            self.on_apply_plane_display_volumes_clicked
+        )
+        self.ui.pbResetPlaneDisplayVolumes.clicked.connect(
+            self.on_reset_plane_display_volumes_clicked
+        )
+        self.ui.cbEnableNativeSeriesInference.toggled.connect(
+            self._on_native_series_inference_settings_changed
+        )
+        self.ui.cbInferenceWorkingVolume.currentNodeChanged.connect(
+            self._on_native_series_inference_settings_changed
+        )
+        self.ui.pbSyncInferenceResult.clicked.connect(
+            self.on_sync_inference_result_clicked
+        )
+        self.ui.pbClearInferencePreview.clicked.connect(
+            self.on_clear_inference_preview_clicked
+        )
+        self._refresh_native_series_inference_ui()
 
         # Connect Prompt Type buttons
         self.ui.pbPromptTypePositive.clicked.connect(
@@ -437,6 +842,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         # Tear down the hidden lasso (3D) Scissors editor and region/preview nodes.
         self._destroy_lasso3d()
+        self._destroy_inference_preview()
 
         if hasattr(self, "_qt_event_filters"):
             for slice_view, event_filter in self._qt_event_filters:
@@ -739,7 +1145,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Called when a point is placed in the scene. Grabs the point position
         and sends it to the server.
         """
-        xyz = self.xyz_from_caller(caller)
+        xyz = self.xyz_from_caller(
+            caller, volume_node=self.get_inference_volume_node()
+        )
 
         volume_node = self.get_volume_node()
         if volume_node:
@@ -763,7 +1171,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         debug_print(seg_response)
         debug_print(f"{positive_click} point prompt triggered! {xyz}")
 
-        self.show_segmentation(unpacked_segmentation)
+        self._handle_server_segmentation_result(unpacked_segmentation)
 
     #
     #  -- Bounding Box
@@ -773,7 +1181,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Every time a control point is placed/moved for the bounding box ROI node.
         Once two corners are placed, we send the bounding box to the server.
         """
-        xyz = self.xyz_from_caller(caller)
+        xyz = self.xyz_from_caller(
+            caller, volume_node=self.get_inference_volume_node()
+        )
 
         if self.prev_caller is not None and caller.GetID() == self.prev_caller.GetID():
             roi_node = slicer.mrmlScene.GetNodeByID(caller.GetID())
@@ -830,7 +1240,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         unpacked_segmentation = self.unpack_binary_segmentation(
             seg_response.content, decompress=False
         )
-        self.show_segmentation(unpacked_segmentation)
+        self._handle_server_segmentation_result(unpacked_segmentation)
 
     #
     #  -- Lasso
@@ -855,7 +1265,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         rasterize them into a mask, and send the mask to the server.
         """
         caller = self.prompt_types["lasso"]["node"]
-        xyzs = self.xyz_from_caller(caller, point_type="curve_point")
+        inference_volume = self.get_inference_volume_node()
+        xyzs = self.xyz_from_caller(
+            caller,
+            point_type="curve_point",
+            volume_node=inference_volume,
+        )
 
         if len(xyzs) < 3:
             return
@@ -865,7 +1280,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # points span multiple slices, lasso_points_to_mask raises -- swallow
         # the error, clear the lasso, and tell the user.
         try:
-            mask = self.lasso_points_to_mask(xyzs)
+            mask = self.lasso_points_to_mask(xyzs, volume_node=inference_volume)
         except ValueError:
             slicer.util.showStatusMessage(
                 "Lasso points must lie on a single slice plane; cleared.",
@@ -878,7 +1293,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         volume_node = self.get_volume_node()
         if volume_node:
             self.lasso_or_scribble_prompt(
-                mask=mask, positive_click=self.is_positive, tp="lasso"
+                mask=mask,
+                positive_click=self.is_positive,
+                tp="lasso",
+                mask_volume_node=inference_volume,
             )
 
             def _next():
@@ -948,10 +1366,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     #  -- Lasso/scribble
     #
     @ensure_synched
-    def lasso_or_scribble_prompt(self, mask, positive_click=False, tp="lasso"):
+    def lasso_or_scribble_prompt(
+        self,
+        mask,
+        positive_click=False,
+        tp="lasso",
+        mask_volume_node=None,
+    ):
         """
         Uploads lasso or scribble prompt to the server.
         """
+        inference_volume = self.get_inference_volume_node()
+        if mask_volume_node is None:
+            mask_volume_node = inference_volume
+        if mask_volume_node.GetID() != inference_volume.GetID():
+            mask = self._resample_mask_between_volumes(
+                mask, mask_volume_node, inference_volume
+            )
         if np.sum(mask) == 0:
             return
         
@@ -983,7 +1414,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 unpacked_segmentation = self.unpack_binary_segmentation(
                     seg_response.content, decompress=False
                 )
-                self.show_segmentation(unpacked_segmentation)
+                self._handle_server_segmentation_result(unpacked_segmentation)
             else:
                 debug_print(
                     f"lasso_or_scribble_prompt upload failed with status code: {seg_response.status_code}"
@@ -1022,7 +1453,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._prev_scribble_mask = mask
 
         self.lasso_or_scribble_prompt(
-            mask=diff_mask, positive_click=self.is_positive, tp="scribble"
+            mask=diff_mask,
+            positive_click=self.is_positive,
+            tp="scribble",
+            mask_volume_node=self.get_volume_node(),
         )
 
         self.ui.pbInteractionScribble.click()  # turn it off
@@ -1037,6 +1471,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Creates a new empty segment in the current segmentation, increments a name,
         and sets it as the selected segment.
         """
+        self._destroy_inference_preview()
         # After creating a new segment, negative prompts do not make sense, so
         # we're automatically switching the prompt type to positive.
         self.ui.pbPromptTypePositive.click()
@@ -1091,6 +1526,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         if selected_segment_id:
             debug_print(f"Clearing segment: {selected_segment_id}")
+            self._destroy_inference_preview()
             self.show_segmentation(
                 np.zeros(self.get_image_data().shape, dtype=np.uint8)
             )
@@ -1153,6 +1589,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.wand_preview_segment_node_name,
             self.lasso3d_input_segment_node_name,
             self.lasso3d_preview_segment_node_name,
+            self.inference_preview_segment_node_name,
         }
 
         # If the segmentation widget has a currently selected segmentation node, return it.
@@ -1198,16 +1635,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         return self.ui.editor_widget.mrmlSegmentEditorNode().GetSelectedSegmentID()
 
-    def get_segment_data(self):
+    def get_segment_data(self, reference_volume_node=None):
         """
-        Gets the labelmap array (binary) of the currently selected segment.
+        Gets the selected segment on a requested scalar-volume geometry.
+
+        The default is the canonical Segment Editor source volume.
         """
         segmentation_node, selected_segment_id = (
             self.get_selected_segmentation_node_and_segment_id()
         )
+        if reference_volume_node is None:
+            reference_volume_node = self.get_volume_node()
 
         mask = slicer.util.arrayFromSegmentBinaryLabelmap(
-            segmentation_node, selected_segment_id, self.get_volume_node()
+            segmentation_node, selected_segment_id, reference_volume_node
         )
         seg_data_bool = mask.astype(bool)
 
@@ -1573,6 +2014,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Pushes the current segment's mask to the server. Useful after editing the
         segment with native Segment Editor effects.
         """
+        if self.image_changed(do_prev_image_update=False):
+            image_result = self.upload_image_to_server()
+            if image_result is None:
+                QMessageBox.warning(
+                    slicer.util.mainWindow(),
+                    "Sync to server",
+                    "Failed to sync the inference image to the server. Please "
+                    "check the server connection in the 'Configuration' tab.",
+                )
+                return
         result = self.upload_segment_to_server()
         if result is None:
             QMessageBox.warning(
@@ -2224,7 +2675,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         coords. Returns a list of ((k, j, i), True) tuples (all seeds are
         positive prompts) or [].
         """
-        arr = self.get_image_data()
+        inference_volume = self.get_inference_volume_node()
+        arr = self.get_inference_image_data()
         if arr is None:
             return []
         node = self._sel_op_wand_seed_node
@@ -2234,7 +2686,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         for idx in range(node.GetNumberOfControlPoints()):
             ras = [0.0, 0.0, 0.0]
             node.GetNthControlPointPositionWorld(idx, ras)
-            ijk = self.ras_to_xyz(list(ras))
+            ijk = self.ras_to_xyz(list(ras), volume_node=inference_volume)
             ii, jj, kk = int(ijk[0]), int(ijk[1]), int(ijk[2])
             if (
                 0 <= ii < arr.shape[2]
@@ -2275,16 +2727,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         nodes -- and kept only for backward call sites.
         Returns a bool numpy mask aligned to the volume, or None on failure.
         """
-        volume = self.get_volume_node()
-        arr = self.get_image_data()
+        volume = self.get_inference_volume_node()
+        arr = self.get_inference_image_data()
         if volume is None or arr is None or not self.server:
+            return None
+        if not self._ensure_inference_image_uploaded():
             return None
 
         seeds = self._collect_wand_seeds()
         if not seeds:
             return None
 
-        pre_target = self.get_segment_data().astype(np.uint8).copy()
+        pre_target = self.get_segment_data(
+            reference_volume_node=volume
+        ).astype(np.uint8).copy()
         shape = arr.shape
 
         # 1) Reset server interactions by uploading an empty mask.
@@ -2317,6 +2773,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     last_response.content, decompress=False
                 ).astype(bool)
                 seg_mask = self._postprocess_wand_mask(seg_mask)
+                seg_mask = self._resample_mask_between_volumes(
+                    seg_mask, volume, self.get_volume_node()
+                ).astype(bool)
         finally:
             # 3) Restore the user's target segment on the server so subsequent
             #    nnInteractive prompts continue from where they left off.
@@ -2741,16 +3200,24 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Mirrors _compute_magic_wand_mask: back up target, reset, send, restore.
         Returns a bool numpy mask aligned to the volume, or None on failure.
         """
-        volume = self.get_volume_node()
-        arr = self.get_image_data()
+        source_volume = self.get_volume_node()
+        volume = self.get_inference_volume_node()
+        arr = self.get_inference_image_data()
         if volume is None or arr is None or not self.server:
+            return None
+        if not self._ensure_inference_image_uploaded():
             return None
 
         region = self._lasso3d_input_to_mask()
         if region is None or int(region.sum()) == 0:
             return None
+        region = self._resample_mask_between_volumes(
+            region, source_volume, volume
+        )
 
-        pre_target = self.get_segment_data().astype(np.uint8).copy()
+        pre_target = self.get_segment_data(
+            reference_volume_node=volume
+        ).astype(np.uint8).copy()
         shape = arr.shape
 
         # 1) Reset server interactions by uploading an empty mask.
@@ -2793,6 +3260,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             if resp is not None and resp.status_code == 200:
                 seg_mask = self.unpack_binary_segmentation(
                     resp.content, decompress=False
+                ).astype(bool)
+                seg_mask = self._resample_mask_between_volumes(
+                    seg_mask, volume, source_volume
                 ).astype(bool)
         finally:
             # 3) Restore the user's target segment on the server so subsequent
@@ -3055,16 +3525,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def upload_image_to_server(self):
         """
-        Gets volume data from Slicer, packs it, and uploads it to the server.
+        Gets inference-working volume data from Slicer and uploads it.
         """
         debug_print("Syncing image with server...")
         try:
             # Retrieve image data, window, and level.
             t0 = time.time()
             image_data = (
-                self.get_image_data()
+                self.get_inference_image_data()
             )  # Expected to return (image_data, window, level)
-            debug_print(f"self.get_image_data took {time.time() - t0}")
+            debug_print(f"self.get_inference_image_data took {time.time() - t0}")
 
             if image_data is None:
                 debug_print("No image data available to upload.")
@@ -3114,17 +3584,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             finally:
                 slicer.progress_window.close()
 
+            if result is not None:
+                self._remember_inference_image_state(image_data)
             return result
         except Exception as e:
             debug_print(f"Error in upload_image_to_server: {e}")
 
     def upload_segment_to_server(self):
         """
-        Grabs current segmentation labelmap, gzips it, and sends it to the server.
+        Sends the canonical segment sampled on the inference-working grid.
         """
         debug_print("Syncing segment with server...")
         try:
-            segment_data = self.get_segment_data()
+            if not self._ensure_inference_image_uploaded():
+                return None
+            segment_data = self.get_segment_data(
+                reference_volume_node=self.get_inference_volume_node()
+            )
             files = self.mask_to_np_upload_file(segment_data)
             url = f"{self.server}/upload_segment"  # Update this with your actual endpoint.
 
@@ -3132,9 +3608,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 url, files=files, headers={"Content-Encoding": "gzip"}
             )
 
+            if result is not None:
+                self.previous_states["segment_data"] = self.get_segment_data()
             return result
         except Exception as e:
             debug_print(f"Error in upload_image_to_server: {e}")
+
+    def _ensure_inference_image_uploaded(self):
+        """Upload the active inference image when the server-side image is stale."""
+        if not self.image_changed(do_prev_image_update=False):
+            return True
+        return self.upload_image_to_server() is not None
 
     ###############################################################################
     # Utility / converters functions
@@ -3142,12 +3626,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def get_image_data(self):
         """
-        Returns the voxel data of the current active (or first available) volume node.
+        Returns voxel data for the canonical Segment Editor source volume.
         """
         volume_node = self.get_volume_node()
         if volume_node:
             return slicer.util.arrayFromVolume(volume_node)
 
+        return None
+
+    def get_inference_image_data(self):
+        """Returns voxel data for the image currently uploaded to nnInteractive."""
+        volume_node = self.get_inference_volume_node()
+        if volume_node:
+            return slicer.util.arrayFromVolume(volume_node)
         return None
 
     def get_volume_node(self):
@@ -3170,23 +3661,37 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def image_changed(self, do_prev_image_update=True):
         """
-        Checks if the volume's voxel data changed since the last time we stored it.
+        Checks if the inference-working volume changed since the last upload.
         """
-        image_data = self.get_image_data()
+        image_data = self.get_inference_image_data()
         if image_data is None:
             debug_print("No volume node found")
             return
 
         old_image_data = self.previous_states.get("image_data", None)
+        inference_volume = self.get_inference_volume_node()
+        old_volume_id = self.previous_states.get("image_volume_id", None)
 
-        image_changed = old_image_data is None or not np.array_equal(
-            old_image_data, image_data
+        image_changed = (
+            old_image_data is None
+            or old_volume_id != inference_volume.GetID()
+            or not np.array_equal(old_image_data, image_data)
         )
 
         if do_prev_image_update:
-            self.previous_states["image_data"] = copy.deepcopy(image_data)
+            self._remember_inference_image_state(image_data)
 
         return image_changed
+
+    def _remember_inference_image_state(self, image_data=None):
+        """Record the inference image that was successfully uploaded."""
+        inference_volume = self.get_inference_volume_node()
+        if inference_volume is None:
+            return
+        if image_data is None:
+            image_data = slicer.util.arrayFromVolume(inference_volume)
+        self.previous_states["image_data"] = copy.deepcopy(image_data)
+        self.previous_states["image_volume_id"] = inference_volume.GetID()
 
     def mask_to_np_upload_file(self, mask):
         """
@@ -3207,10 +3712,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if decompress:
             binary_data = binary_data = gzip.decompress(binary_data)
 
-        if self.get_image_data() is None:
+        if self.get_inference_image_data() is None:
             self.capture_image()
 
-        vol_shape = self.get_image_data().shape
+        vol_shape = self.get_inference_image_data().shape
         total_voxels = np.prod(vol_shape)
         unpacked_bits = np.unpackbits(np.frombuffer(binary_data, dtype=np.uint8))
         unpacked_bits = unpacked_bits[:total_voxels]
@@ -3221,11 +3726,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         return segmentation_mask
 
-    def ras_to_xyz(self, pos):
+    def ras_to_xyz(self, pos, volume_node=None):
         """
-        Converts an RAS position to IJK voxel coords in the current volume node.
+        Converts an RAS position to IJK voxel coords in the requested volume.
         """
-        volumeNode = self.get_volume_node()
+        volumeNode = volume_node or self.get_volume_node()
 
         transformRasToVolumeRas = vtk.vtkGeneralTransform()
         slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(
@@ -3241,7 +3746,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         return xyz
 
 
-    def xyz_from_caller(self, caller, lock_point=True, point_type="control_point"):
+    def xyz_from_caller(
+        self,
+        caller,
+        lock_point=True,
+        point_type="control_point",
+        volume_node=None,
+    ):
         """
         Extract voxel coordinates from a Markups node.
         `point_type` can be either "control_point" or "curve_point".
@@ -3253,17 +3764,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return
 
             pos = [0, 0, 0]
-            caller.GetNthControlPointPosition(n - 1, pos)
+            caller.GetNthControlPointPositionWorld(n - 1, pos)
             if lock_point:
                 caller.SetNthControlPointLocked(n - 1, True)
-            xyz = self.ras_to_xyz(pos)
+            xyz = self.ras_to_xyz(pos, volume_node=volume_node)
             return xyz
         elif point_type == "curve_point":
             vtk_pts = caller.GetCurvePointsWorld()
             
             if vtk_pts is not None:
                 vtk_pts_data = vtk_to_numpy(vtk_pts.GetData())
-                xyz = [self.ras_to_xyz(pos) for pos in vtk_pts_data]
+                xyz = [
+                    self.ras_to_xyz(pos, volume_node=volume_node)
+                    for pos in vtk_pts_data
+                ]
                 debug_print(xyz)
                 return xyz
 
@@ -3271,14 +3785,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             raise ValueError(f'Unknown point_type {point_type}')
 
-    def lasso_points_to_mask(self, points):
+    def lasso_points_to_mask(self, points, volume_node=None):
         """
         Given a list of voxel coords (defining a polygon in one slice),
         returns a 3D mask with that polygon filled in the appropriate slice.
         """
         from skimage.draw import polygon
 
-        shape = self.get_image_data().shape
+        volume_node = volume_node or self.get_volume_node()
+        shape = slicer.util.arrayFromVolume(volume_node).shape
         pts = np.array(points)  # shape (n, 3)
 
         # Determine which coordinate is constant

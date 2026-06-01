@@ -146,6 +146,8 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         try:
             volume_node = self._prepare_volume()
             widget = self._create_widget(volume_node)
+            self._test_multi_plane_display_volumes(widget, volume_node)
+            self._test_native_series_inference_sync(widget, volume_node)
             missing = [name for name, _ in self.PROMPTS if not self._reference_path(name).exists()]
             if missing and not self.generate_mode:
                 self.fail(
@@ -237,6 +239,150 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                 "Failed to upload the volume to the nnInteractive server. "
                 "Verify the server is running and reachable."
             )
+
+    def _test_multi_plane_display_volumes(self, widget, source_volume):
+        print("Testing multi-plane display volumes...")
+        view_selectors = {
+            "Red": "cbRedDisplayVolume",
+            "Yellow": "cbYellowDisplayVolume",
+            "Green": "cbGreenDisplayVolume",
+        }
+        display_volumes = {}
+
+        try:
+            for slice_view_name, selector_name in view_selectors.items():
+                display_volume = slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLScalarVolumeNode"
+                )
+                display_volume.SetName(f"{slice_view_name}DisplayVolumeTest")
+                display_volumes[slice_view_name] = display_volume
+                getattr(widget.ui, selector_name).setCurrentNode(display_volume)
+
+            widget.on_apply_plane_display_volumes_clicked()
+            self.assertEqual(widget.get_volume_node().GetID(), source_volume.GetID())
+
+            for slice_view_name, display_volume in display_volumes.items():
+                composite_node = (
+                    slicer.app.layoutManager()
+                    .sliceWidget(slice_view_name)
+                    .mrmlSliceCompositeNode()
+                )
+                self.assertEqual(
+                    composite_node.GetBackgroundVolumeID(),
+                    display_volume.GetID(),
+                    msg=f"{slice_view_name} should use its selected display volume.",
+                )
+
+            widget.on_reset_plane_display_volumes_clicked()
+            for slice_view_name, selector_name in view_selectors.items():
+                composite_node = (
+                    slicer.app.layoutManager()
+                    .sliceWidget(slice_view_name)
+                    .mrmlSliceCompositeNode()
+                )
+                self.assertIsNone(getattr(widget.ui, selector_name).currentNode())
+                self.assertEqual(
+                    composite_node.GetBackgroundVolumeID(),
+                    source_volume.GetID(),
+                    msg=f"{slice_view_name} should return to the source volume.",
+                )
+        finally:
+            widget.on_reset_plane_display_volumes_clicked()
+            for display_volume in display_volumes.values():
+                if slicer.mrmlScene.IsNodePresent(display_volume):
+                    slicer.mrmlScene.RemoveNode(display_volume)
+
+        print("[PASS] multi-plane display volumes")
+
+    def _test_native_series_inference_sync(self, widget, source_volume):
+        print("Testing native-series inference sync...")
+
+        source_mask = np.zeros((4, 4, 4), dtype=np.uint8)
+        source_mask[1:3, 1:3, 1:3] = 1
+        preview_mask = np.zeros((4, 4, 4), dtype=np.uint8)
+        preview_mask[2:4, 2:4, 2:4] = 1
+        source_bool = source_mask.astype(bool)
+        preview_bool = preview_mask.astype(bool)
+        expected = {
+            0: source_bool | preview_bool,
+            1: preview_bool,
+            2: source_bool & ~preview_bool,
+            3: source_bool & preview_bool,
+        }
+        for mode, expected_mask in expected.items():
+            result = widget.compute_inference_sync_mask(
+                source_mask, preview_mask, mode
+            )
+            self.assertTrue(np.array_equal(result.astype(bool), expected_mask))
+        with self.assertRaises(ValueError):
+            widget.compute_inference_sync_mask(
+                source_mask, np.zeros((2, 2, 2), dtype=np.uint8), 0
+            )
+        with self.assertRaises(ValueError):
+            widget.compute_inference_sync_mask(source_mask, preview_mask, 99)
+
+        working_volume = slicer.modules.volumes.logic().CloneVolume(
+            slicer.mrmlScene,
+            source_volume,
+            "NativeInferenceWorkingVolumeTest",
+        )
+        try:
+            widget.ui.cbInferenceWorkingVolume.setCurrentNode(working_volume)
+            widget.ui.cbEnableNativeSeriesInference.setChecked(True)
+            self.assertTrue(widget._is_native_series_inference_active())
+            self.assertEqual(widget.ui.cbInferenceSyncMode.currentIndex, 0)
+            self.assertEqual(
+                widget.get_inference_volume_node().GetID(),
+                working_volume.GetID(),
+            )
+
+            dims = widget.get_image_data().shape
+            source_grid_mask = np.zeros(dims, dtype=np.uint8)
+            source_grid_mask[10:20, 10:20, 10:20] = 1
+            preview_grid_mask = np.zeros(dims, dtype=np.uint8)
+            preview_grid_mask[15:25, 15:25, 15:25] = 1
+            widget.show_segmentation(source_grid_mask)
+
+            widget._handle_server_segmentation_result(preview_grid_mask)
+            self.assertTrue(
+                np.array_equal(widget.get_segment_data(), source_grid_mask),
+                msg="Supplemental inference should not edit the source before sync.",
+            )
+            self.assertIsNotNone(widget._inference_preview_segment_node)
+            self.assertTrue(
+                np.array_equal(
+                    widget._inference_result_source_mask,
+                    preview_grid_mask,
+                )
+            )
+            self.assertTrue(widget.ui.pbSyncInferenceResult.isEnabled())
+
+            widget.on_clear_inference_preview_clicked()
+            self.assertIsNone(widget._inference_preview_segment_node)
+            self.assertTrue(
+                np.array_equal(widget.get_segment_data(), source_grid_mask),
+                msg="Clearing a preview must not edit the source segment.",
+            )
+
+            widget._handle_server_segmentation_result(preview_grid_mask)
+            widget.on_sync_inference_result_clicked()
+            slicer.app.processEvents()
+            self.assertTrue(
+                np.array_equal(
+                    widget.get_segment_data().astype(bool),
+                    source_grid_mask.astype(bool) | preview_grid_mask.astype(bool),
+                ),
+                msg="Default supplemental inference sync mode should be Add.",
+            )
+            self.assertIsNone(widget._inference_preview_segment_node)
+            self.assertFalse(widget.ui.pbSyncInferenceResult.isEnabled())
+        finally:
+            widget.ui.cbEnableNativeSeriesInference.setChecked(False)
+            widget.ui.cbInferenceWorkingVolume.setCurrentNode(None)
+            if slicer.mrmlScene.IsNodePresent(working_volume):
+                slicer.mrmlScene.RemoveNode(working_volume)
+
+        print("[PASS] native-series inference sync")
 
     def _trigger_point_prompt(self, widget, ijk, positive=True):
         dims = widget.get_image_data().shape  # (k, j, i)
