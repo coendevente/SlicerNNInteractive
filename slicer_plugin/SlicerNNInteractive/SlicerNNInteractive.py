@@ -1114,8 +1114,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 self._attach_alignment_transform(moving, transform)
                 self._alignment_transforms[(moving_id, fixed_id)] = transform
                 self._enable_slice_intersections()
-                if self._is_active_working_volume(moving_id):
-                    self._on_alignment_geometry_changed()
                 self._set_registration_status(
                     "Registered the supplemental series to the source volume "
                     "(translation %.1f mm, rotation %.1f deg). Verify alignment "
@@ -1130,6 +1128,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "aligned; results may be misplaced." % status,
                 True,
             )
+        # Any outcome (attach, near-identity discard, or failure) can change the
+        # working grid relative to what the server last received -- a forced
+        # re-registration already detached the previous transform. Force the next
+        # prompt to re-upload whenever the active working volume was involved.
+        if self._is_active_working_volume(moving_id):
+            self._on_alignment_geometry_changed()
         self._refresh_native_series_inference_ui()
         # Hand off to the next queued registration, if any.
         self._pump_alignment_queue()
@@ -1546,8 +1550,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbClearAlignment.clicked.connect(
             self.on_clear_alignment_clicked
         )
+        # Both alignment preferences change whether/how registration happens, so
+        # toggling either re-evaluates alignment (and discards a stale preview).
         self.ui.cbAutoRegisterSupplemental.toggled.connect(
-            self._refresh_native_series_inference_ui
+            self._on_native_series_inference_settings_changed
         )
         self.ui.cbConfirmSeriesAligned.toggled.connect(
             self._on_native_series_inference_settings_changed
