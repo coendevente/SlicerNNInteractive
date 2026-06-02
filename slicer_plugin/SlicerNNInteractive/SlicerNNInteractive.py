@@ -2072,6 +2072,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Called when a point is placed in the scene. Grabs the point position
         and sends it to the server.
         """
+        if self._alignment_in_progress:
+            # A registration is running and the prompt would be blocked anyway;
+            # drop the just-placed marker so it does not linger unsent.
+            n = caller.GetNumberOfControlPoints()
+            if n > 0:
+                caller.RemoveNthControlPoint(n - 1)
+            slicer.util.showStatusMessage(
+                "Series registration in progress; point was not sent.", 4000
+            )
+            return
+
         xyz = self.xyz_from_caller(
             caller, volume_node=self.get_inference_volume_node()
         )
@@ -2108,6 +2119,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Every time a control point is placed/moved for the bounding box ROI node.
         Once two corners are placed, we send the bounding box to the server.
         """
+        if self._alignment_in_progress:
+            # A registration is running; discard the partial box and reset the
+            # two-corner state so the next placement starts cleanly.
+            caller.RemoveAllControlPoints()
+            self.prev_caller = None
+            slicer.util.showStatusMessage(
+                "Series registration in progress; box was not sent.", 4000
+            )
+            return
+
         xyz = self.xyz_from_caller(
             caller, volume_node=self.get_inference_volume_node()
         )
