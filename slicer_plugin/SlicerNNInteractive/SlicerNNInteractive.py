@@ -1,5 +1,6 @@
 import io
 import gzip
+import math
 import requests
 import copy
 import threading
@@ -51,6 +52,16 @@ OUTPUT_SPACING_MAX_MM = 10.0
 # many voxels; reject (truly oblique / multi-slice) when it exceeds it.
 LASSO_SLICE_AXIS_MAX_SPREAD = 2
 
+# Hidden linear transform that aligns a supplemental series to the source volume
+# when their DICOM frames of reference differ (auto-registration).
+SERIES_ALIGNMENT_TRANSFORM_NODE_NAME = "NNInteractiveSeriesAlignment (do not touch)"
+# A registered translation larger than this (mm) is flagged for visual review.
+REGISTRATION_OFFSET_WARN_MM = 30.0
+# Below these magnitudes a registration result is treated as identity (series
+# already aligned) and the transform is discarded to avoid needless resampling.
+REGISTRATION_IDENTITY_TRANSLATION_MM = 1.0
+REGISTRATION_IDENTITY_ROTATION_DEG = 1.0
+
 
 def debug_print(*args):
     if DEBUG_MODE:
@@ -64,6 +75,12 @@ def ensure_synched(func):
     """
 
     def inner(self, *args, **kwargs):
+        if getattr(self, "_alignment_in_progress", False):
+            slicer.util.showStatusMessage(
+                "Series registration in progress; prompt was not sent.", 4000
+            )
+            return
+
         failed_to_sync = False
         uploaded_image = False
 
@@ -194,6 +211,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Selection Operations-private undo stack: list of (segment_id, mask_uint8).
         self._sel_op_undo_stack = []
         self._sel_op_undo_stack_limit = 10
+        # Series alignment: auto-registration of a supplemental series to the
+        # source volume. Maps (supplemental_id, source_id) -> linear transform
+        # node. While a registration CLI runs, prompts and sync are blocked.
+        self._alignment_transforms = {}
+        self._alignment_cli_node = None
+        self._alignment_cli_observer = None
+        self._alignment_pending = None
+        self._alignment_in_progress = False
+        # Pending (moving_id, source_id) pairs waiting for a free CLI slot. The
+        # three multi-plane display volumes can each need their own registration.
+        self._alignment_queue = []
 
     def setup(self):
         """
@@ -217,6 +245,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             "NativeSeriesInferencePreviewSegmentNode (do not touch)"
         )
         self.output_geometry_node_name = OUTPUT_GEOMETRY_NODE_NAME
+        self.series_alignment_transform_node_name = (
+            SERIES_ALIGNMENT_TRANSFORM_NODE_NAME
+        )
 
         # Set up editor widget
         self.ui.editor_widget.setMaximumNumberOfUndoStates(10)
@@ -381,6 +412,31 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._plane_display_volumes_active = self._apply_plane_display_volumes(
             show_status=True
         )
+        self._align_display_volumes()
+
+    def _align_display_volumes(self):
+        """Auto-register each per-plane display volume to the source volume.
+
+        Display volumes only sharpen the 2D views, but a background drawn from a
+        series with a different DICOM frame of reference would still be shown at
+        the wrong physical location. Aligning them keeps the slice intersections
+        honest. Registration is asynchronous; the slice view follows the
+        volume's parent transform live, so backgrounds re-place themselves once
+        each registration completes.
+        """
+        source_volume = self.get_volume_node()
+        if source_volume is None or not self._plane_display_snapshot:
+            return
+        seen = set()
+        for volume_id in self._plane_display_snapshot.values():
+            if not volume_id or volume_id == source_volume.GetID():
+                continue
+            if volume_id in seen:
+                continue
+            seen.add(volume_id)
+            display_volume = slicer.mrmlScene.GetNodeByID(volume_id)
+            if display_volume is not None:
+                self._ensure_alignment(display_volume, source_volume)
 
     def _reapply_plane_display_volumes_if_active(self):
         """Restore sticky per-plane backgrounds after Segment Editor activity."""
@@ -686,15 +742,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._output_geometry_source_id = source_volume.GetID()
         return node
 
-    def _refresh_native_series_inference_ui(self):
+    def _refresh_native_series_inference_ui(self, *args):
         """Update controls after enabling, disabling, or changing the working volume."""
         enabled = self.ui.cbEnableNativeSeriesInference.isChecked()
         active = self._is_native_series_inference_active()
         has_preview = self._inference_result_source_mask is not None
-        self.ui.cbInferenceWorkingVolume.setEnabled(enabled)
+        registering = self._alignment_in_progress
+        self.ui.cbInferenceWorkingVolume.setEnabled(enabled and not registering)
         self.ui.cbInferenceSyncMode.setEnabled(active)
-        self.ui.pbSyncInferenceResult.setEnabled(active and has_preview)
+        # Block sync while a registration runs so a stale preview built on the
+        # old geometry is not merged with the freshly aligned grid.
+        self.ui.pbSyncInferenceResult.setEnabled(
+            active and has_preview and not registering
+        )
         self.ui.pbClearInferencePreview.setEnabled(has_preview)
+        # Alignment preferences also serve the multi-plane display volumes, so
+        # they stay available even when native-series inference is off.
+        self.ui.cbAutoRegisterSupplemental.setEnabled(not registering)
+        self.ui.cbConfirmSeriesAligned.setEnabled(not registering)
+        self.ui.pbRegisterSupplemental.setEnabled(active and not registering)
+        self.ui.pbClearAlignment.setEnabled(
+            bool(self._alignment_transforms) and not registering
+        )
 
     def _on_native_series_inference_settings_changed(self, *args):
         """
@@ -706,6 +775,400 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.previous_states.pop("image_data", None)
             self.previous_states.pop("image_volume_id", None)
             self.previous_states.pop("segment_data", None)
+        self._sync_supplemental_alignment()
+        self._refresh_native_series_inference_ui()
+
+    # -- Supplemental-series alignment (auto-registration) -------------------
+
+    def _set_registration_status(self, text, warn=False):
+        """Show alignment status both in the panel label and the status bar."""
+        if not hasattr(self, "ui"):
+            return
+        label = self.ui.lblRegistrationStatus
+        label.setText(text)
+        label.setStyleSheet("color: #c0392b;" if warn else "")
+        if text:
+            slicer.util.showStatusMessage(text, 5000)
+
+    def _frame_of_reference_uid(self, volume_node):
+        """
+        Return the DICOM FrameOfReferenceUID (0020,0052) for a volume, or None.
+
+        Two volumes are physically comparable in RAS only when they share this
+        UID. A new mid-exam localizer or repositioning yields a different UID,
+        so equal UIDs mean aligned and different UIDs mean registration is
+        needed. Non-DICOM volumes have no UID and return None (unknown).
+        """
+        if volume_node is None:
+            return None
+        try:
+            db = slicer.dicomDatabase
+            sh = slicer.mrmlScene.GetSubjectHierarchyNode()
+            item = sh.GetItemByDataNode(volume_node) if sh is not None else 0
+            series_uid = sh.GetItemUID(item, "DICOM") if item else ""
+            if series_uid:
+                files = db.filesForSeries(series_uid)
+                if files:
+                    value = db.fileValue(files[0], "0020,0052")
+                    if value:
+                        return value
+            instance_uids = volume_node.GetAttribute("DICOM.instanceUIDs")
+            if instance_uids:
+                first = instance_uids.split()[0]
+                value = db.fileValueForInstance(first, "0020,0052")
+                if value:
+                    return value
+        except Exception as exc:
+            print("[nni] frame-of-reference lookup failed: %s" % exc)
+        return None
+
+    def _series_aligned(self, supplemental, source):
+        """True/False if both frames of reference are known, else None."""
+        supp_for = self._frame_of_reference_uid(supplemental)
+        src_for = self._frame_of_reference_uid(source)
+        if not supp_for or not src_for:
+            return None
+        return supp_for == src_for
+
+    def _attach_alignment_transform(self, supplemental, transform):
+        """Parent the supplemental volume under its alignment transform."""
+        if supplemental is not None and transform is not None:
+            supplemental.SetAndObserveTransformNodeID(transform.GetID())
+
+    def _drop_alignment_entry(self, key):
+        """Detach and delete the transform cached for one (supp, source) pair."""
+        transform = self._alignment_transforms.pop(key, None)
+        supp = slicer.mrmlScene.GetNodeByID(key[0])
+        if (
+            supp is not None
+            and transform is not None
+            and supp.GetTransformNodeID() == transform.GetID()
+        ):
+            supp.SetAndObserveTransformNodeID(None)
+        if transform is not None and slicer.mrmlScene.IsNodePresent(transform):
+            slicer.mrmlScene.RemoveNode(transform)
+
+    def _remove_alignment_transforms(self):
+        """Detach and delete every cached alignment transform."""
+        self._alignment_queue = []
+        for key in list(self._alignment_transforms.keys()):
+            self._drop_alignment_entry(key)
+
+    def _prune_alignment_for_source(self, source_id):
+        """Drop cached transforms that target a stale (no longer current) source."""
+        for key in list(self._alignment_transforms.keys()):
+            if key[1] != source_id:
+                self._drop_alignment_entry(key)
+
+    def _on_alignment_geometry_changed(self):
+        """Force the next prompt to re-upload after the working geometry moved."""
+        self._destroy_inference_preview()
+        if hasattr(self, "previous_states"):
+            self.previous_states.pop("image_data", None)
+            self.previous_states.pop("image_volume_id", None)
+            self.previous_states.pop("segment_data", None)
+
+    def _sync_supplemental_alignment(self):
+        """Align the native-series working volume after a settings change."""
+        if not hasattr(self, "ui"):
+            return
+        source = self.get_volume_node()
+        if source is not None:
+            # A stale source invalidates transforms that targeted it; drop them.
+            # Transforms for the current source stay attached and cached.
+            self._prune_alignment_for_source(source.GetID())
+        if not self._is_native_series_inference_active():
+            self._set_registration_status("", False)
+            return
+        self._ensure_alignment(self.get_inference_volume_node(), source)
+
+    def _ensure_alignment(self, supplemental, source, force=False):
+        """
+        Make sure the supplemental volume is aligned to the source volume.
+
+        Reuses a cached transform when present; otherwise inspects the DICOM
+        frame of reference and, when it differs (or force is set), starts a
+        rigid registration. Unknown frames of reference never auto-register.
+        """
+        if supplemental is None or source is None:
+            return
+        if supplemental.GetID() == source.GetID():
+            return
+        key = (supplemental.GetID(), source.GetID())
+
+        if force:
+            # Re-registering: discard the previous transform so it is not leaked
+            # when the cache entry is overwritten on completion.
+            self._drop_alignment_entry(key)
+
+        cached = self._alignment_transforms.get(key)
+        if (
+            not force
+            and cached is not None
+            and slicer.mrmlScene.IsNodePresent(cached)
+        ):
+            self._attach_alignment_transform(supplemental, cached)
+            self._set_registration_status(
+                "Reusing the existing registration for the supplemental series.",
+                False,
+            )
+            return
+
+        if not force:
+            aligned = self._series_aligned(supplemental, source)
+            if aligned is True:
+                self._set_registration_status(
+                    "Supplemental series shares the source frame of reference; "
+                    "no registration needed.",
+                    False,
+                )
+                return
+            if aligned is None:
+                if self.ui.cbConfirmSeriesAligned.isChecked():
+                    self._set_registration_status(
+                        "Alignment confirmed manually; registration skipped.",
+                        False,
+                    )
+                    return
+                self._set_registration_status(
+                    "Could not read the DICOM frame of reference. Verify "
+                    "alignment visually or click Register now.",
+                    True,
+                )
+                return
+            if not self.ui.cbAutoRegisterSupplemental.isChecked():
+                self._set_registration_status(
+                    "Supplemental series uses a different frame of reference. "
+                    "Click Register now to align it to the source volume.",
+                    True,
+                )
+                return
+
+        self._enqueue_alignment(supplemental, source)
+
+    def _enqueue_alignment(self, moving, fixed):
+        """Queue a (moving -> fixed) registration and start it when a slot frees."""
+        pair = (moving.GetID(), fixed.GetID())
+        pending_pair = (
+            self._alignment_pending[:2] if self._alignment_pending else None
+        )
+        if pair == pending_pair or pair in self._alignment_queue:
+            return
+        self._alignment_queue.append(pair)
+        self._pump_alignment_queue()
+
+    def _pump_alignment_queue(self):
+        """Start the next queued registration if none is currently running."""
+        if self._alignment_in_progress or not self._alignment_queue:
+            return
+        moving_id, fixed_id = self._alignment_queue.pop(0)
+        moving = slicer.mrmlScene.GetNodeByID(moving_id)
+        fixed = slicer.mrmlScene.GetNodeByID(fixed_id)
+        if moving is None or fixed is None:
+            # A queued volume disappeared; skip it and try the next one.
+            self._pump_alignment_queue()
+            return
+        self._start_registration(moving, fixed)
+
+    def _start_registration(self, moving, fixed):
+        """Launch an asynchronous BRAINSFit registration (moving -> fixed)."""
+        if self._alignment_in_progress:
+            return
+        try:
+            brainsfit = slicer.modules.brainsfit
+        except AttributeError:
+            self._set_registration_status(
+                "Registration module (BRAINSFit) is unavailable in this Slicer "
+                "build; cannot auto-align the supplemental series.",
+                True,
+            )
+            return
+
+        transform = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLinearTransformNode",
+            self.series_alignment_transform_node_name,
+        )
+        transform.HideFromEditorsOn()
+        transform.SetAttribute(
+            "NNInteractive.AlignmentPair",
+            "%s|%s" % (moving.GetID(), fixed.GetID()),
+        )
+        # Rigid handles patient motion / repositioning; Affine is an escape hatch
+        # when a rigid fit leaves a large residual.
+        transform_type = "Rigid"
+        if (
+            hasattr(self.ui, "cbRegistrationMode")
+            and self.ui.cbRegistrationMode.currentText == "Affine"
+        ):
+            transform_type = "Rigid,Affine"
+        params = {
+            "fixedVolume": fixed.GetID(),
+            "movingVolume": moving.GetID(),
+            "linearTransform": transform.GetID(),
+            "transformType": transform_type,
+            "initializeTransformMode": "useMomentsAlign",
+            "costMetric": "MMI",
+            "samplingPercentage": 0.02,
+        }
+        self._alignment_in_progress = True
+        self._alignment_pending = (
+            moving.GetID(),
+            fixed.GetID(),
+            transform.GetID(),
+        )
+        self._set_registration_status(
+            "Registering the supplemental series to the source volume...",
+            False,
+        )
+        self._refresh_native_series_inference_ui()
+        try:
+            cli_node = slicer.cli.run(
+                brainsfit, None, params, wait_for_completion=False
+            )
+        except Exception as exc:
+            slicer.mrmlScene.RemoveNode(transform)
+            self._alignment_in_progress = False
+            self._alignment_pending = None
+            self._set_registration_status(
+                "Could not start registration: %s" % exc, True
+            )
+            self._refresh_native_series_inference_ui()
+            return
+        self._alignment_cli_node = cli_node
+        self._alignment_cli_observer = cli_node.AddObserver(
+            slicer.vtkMRMLCommandLineModuleNode.StatusModifiedEvent,
+            self._on_registration_status_modified,
+        )
+
+    def _on_registration_status_modified(self, cli_node, event):
+        """Finish once the registration CLI reaches a terminal state."""
+        if cli_node.IsBusy():
+            return
+        self._finish_registration(cli_node, cli_node.GetStatusString())
+
+    def _finish_registration(self, cli_node, status):
+        """Attach the transform on success or clean up and warn on failure."""
+        if not self._alignment_in_progress:
+            return
+        self._alignment_in_progress = False
+        pending = self._alignment_pending
+        self._alignment_pending = None
+        if self._alignment_cli_observer is not None:
+            cli_node.RemoveObserver(self._alignment_cli_observer)
+        self._alignment_cli_observer = None
+        self._alignment_cli_node = None
+
+        moving_id, fixed_id, transform_id = pending
+        moving = slicer.mrmlScene.GetNodeByID(moving_id)
+        transform = slicer.mrmlScene.GetNodeByID(transform_id)
+        if slicer.mrmlScene.IsNodePresent(cli_node):
+            slicer.mrmlScene.RemoveNode(cli_node)
+
+        if status == "Completed" and moving is not None and transform is not None:
+            offset = self._transform_translation_mm(transform)
+            rotation = self._transform_rotation_deg(transform)
+            if (
+                offset <= REGISTRATION_IDENTITY_TRANSLATION_MM
+                and rotation <= REGISTRATION_IDENTITY_ROTATION_DEG
+            ):
+                # Frames of reference differ in name only; the series are already
+                # aligned. Drop the transform to avoid needless resampling.
+                slicer.mrmlScene.RemoveNode(transform)
+                self._set_registration_status(
+                    "Supplemental series is already aligned with the source "
+                    "volume (registration was near-identity).",
+                    False,
+                )
+            else:
+                self._attach_alignment_transform(moving, transform)
+                self._alignment_transforms[(moving_id, fixed_id)] = transform
+                self._enable_slice_intersections()
+                if self._is_active_working_volume(moving_id):
+                    self._on_alignment_geometry_changed()
+                self._set_registration_status(
+                    "Registered the supplemental series to the source volume "
+                    "(translation %.1f mm, rotation %.1f deg). Verify alignment "
+                    "with slice intersections." % (offset, rotation),
+                    offset > REGISTRATION_OFFSET_WARN_MM,
+                )
+        else:
+            if transform is not None and slicer.mrmlScene.IsNodePresent(transform):
+                slicer.mrmlScene.RemoveNode(transform)
+            self._set_registration_status(
+                "Registration failed (%s). The supplemental series is NOT "
+                "aligned; results may be misplaced." % status,
+                True,
+            )
+        self._refresh_native_series_inference_ui()
+        # Hand off to the next queued registration, if any.
+        self._pump_alignment_queue()
+
+    def _is_active_working_volume(self, volume_id):
+        """True when volume_id is the volume nnInteractive currently analyzes."""
+        if not self._is_native_series_inference_active():
+            return False
+        working = self.get_inference_volume_node()
+        return working is not None and working.GetID() == volume_id
+
+    @staticmethod
+    def _enable_slice_intersections():
+        """Turn on slice intersections so the user can verify alignment."""
+        try:
+            view_nodes = slicer.util.getNodesByClass("vtkMRMLSliceDisplayNode")
+            for node in view_nodes:
+                node.SetIntersectingSlicesVisibility(True)
+        except Exception:
+            # Older Slicer builds expose this differently; verification is a
+            # convenience, so a failure here is non-fatal.
+            pass
+
+    @staticmethod
+    def _transform_translation_mm(transform):
+        """Magnitude of the translation column of a linear transform, in mm."""
+        matrix = vtk.vtkMatrix4x4()
+        transform.GetMatrixTransformToParent(matrix)
+        return (
+            matrix.GetElement(0, 3) ** 2
+            + matrix.GetElement(1, 3) ** 2
+            + matrix.GetElement(2, 3) ** 2
+        ) ** 0.5
+
+    @staticmethod
+    def _transform_rotation_deg(transform):
+        """Rotation angle of a linear transform's 3x3 block, in degrees."""
+        matrix = vtk.vtkMatrix4x4()
+        transform.GetMatrixTransformToParent(matrix)
+        trace = (
+            matrix.GetElement(0, 0)
+            + matrix.GetElement(1, 1)
+            + matrix.GetElement(2, 2)
+        )
+        # Clamp to acos's domain to absorb floating-point and scale/shear noise.
+        cos_angle = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+        return math.degrees(math.acos(cos_angle))
+
+    def on_register_supplemental_clicked(self, checked=False):
+        """Manually register the current working volume to the source volume."""
+        source = self.get_volume_node()
+        working = self.get_inference_volume_node()
+        if source is None or working is None or source.GetID() == working.GetID():
+            self._set_registration_status(
+                "Select a supplemental working volume different from the source "
+                "volume before registering.",
+                True,
+            )
+            return
+        self._ensure_alignment(working, source, force=True)
+
+    def on_clear_alignment_clicked(self, checked=False):
+        """Remove all alignment transforms and restore original positions."""
+        self._remove_alignment_transforms()
+        self._on_alignment_geometry_changed()
+        self._set_registration_status(
+            "Cleared series alignment; the supplemental series is back to its "
+            "original position.",
+            False,
+        )
         self._refresh_native_series_inference_ui()
 
     @staticmethod
@@ -1046,6 +1509,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbClearInferencePreview.clicked.connect(
             self.on_clear_inference_preview_clicked
         )
+        self.ui.pbRegisterSupplemental.clicked.connect(
+            self.on_register_supplemental_clicked
+        )
+        self.ui.pbClearAlignment.clicked.connect(
+            self.on_clear_alignment_clicked
+        )
+        self.ui.cbAutoRegisterSupplemental.toggled.connect(
+            self._refresh_native_series_inference_ui
+        )
+        self.ui.cbConfirmSeriesAligned.toggled.connect(
+            self._on_native_series_inference_settings_changed
+        )
         self._refresh_native_series_inference_ui()
 
         # High-resolution output geometry (load persisted prefs with signals
@@ -1249,6 +1724,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._destroy_lasso3d()
         self._destroy_inference_preview()
         self._remove_output_geometry_node()
+        self._remove_alignment_transforms()
 
         if hasattr(self, "_qt_event_filters"):
             for slice_view, event_filter in self._qt_event_filters:

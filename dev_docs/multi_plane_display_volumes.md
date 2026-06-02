@@ -158,13 +158,75 @@ forces the next prompt to upload the correct image and source-grid mask.
 Clicking `Clear preview` also restores the current source mask as the server
 target so the next prompt does not continue from a discarded candidate.
 
+## Supplemental-series auto-registration
+
+The whole multi-plane / native-series design assumes every participating volume
+shares one patient coordinate system (RAS). That holds only when the series
+share a DICOM `FrameOfReferenceUID`. A mid-exam localizer/scout, repositioning,
+or patient motion produces a new frame of reference, so two series of the "same
+patient, same examination" can be silently misaligned in RAS -- masks then land
+on the wrong anatomy with no error.
+
+To guard against this, enabling `Analyze a supplemental series` (or switching
+the working volume) compares the working volume's `FrameOfReferenceUID`
+(0020,0052) against the source volume's:
+
+- equal -> already aligned, nothing to do;
+- different and `Auto-register supplemental series to source` is checked ->
+  an asynchronous rigid BRAINSFit registration (moving = working volume, fixed =
+  source volume) runs and its linear transform is attached as the working
+  volume's parent transform;
+- frame of reference unreadable (e.g. non-DICOM import) -> no automatic
+  registration; the panel warns and the user can either tick `I confirm these
+  series are already aligned (skip registration)` or click `Register now`.
+
+Attaching the transform is the only alignment action needed: `ras_to_xyz` and
+`_resample_mask_between_volumes` already follow a volume's parent transform, so
+prompt coordinates, the source-mask resample onto the working grid, and the
+result resample back all become correct automatically. The source volume and
+the high-resolution output grid are never transformed.
+
+The same machinery aligns the three multi-plane display backgrounds. Clicking
+`Apply view volumes` runs `_align_display_volumes`, which registers each unique
+non-source display volume to the source so a sharper background series drawn
+from a different frame of reference is still shown at the correct physical
+location. Because registration is asynchronous and the slice view follows the
+volume's parent transform live, backgrounds re-place themselves once each
+registration finishes. Up to three registrations are serialized through a small
+FIFO queue (`_alignment_queue` / `_pump_alignment_queue`) since BRAINSFit runs
+one CLI at a time.
+
+Transforms are cached per `(moving, source)` pair and reused on re-apply /
+re-enable. A registration whose result is within
+`REGISTRATION_IDENTITY_TRANSLATION_MM` and `REGISTRATION_IDENTITY_ROTATION_DEG`
+is treated as identity (series already aligned despite differing UIDs) and the
+transform is discarded to avoid needless resampling. On success the plugin turns
+on slice intersections so the user can verify overlap visually. Transforms stay
+attached (volumes remain in their correct physical position) until they are
+explicitly cleared via `Clear alignment`, invalidated when the source volume
+changes (`_prune_alignment_for_source`), or removed on module cleanup. While a
+registration runs, prompts and `Sync preview to source` are blocked so nothing
+is sent on stale geometry.
+
+UI controls (under `Native-series inference`): `Auto-register supplemental
+series to source` (on by default), `I confirm these series are already aligned`,
+`Registration` mode (`Rigid` default / `Affine` escape hatch), `Register now`,
+`Clear alignment`, and a status label reporting the outcome plus the registered
+translation and rotation magnitudes (flagged for review above
+`REGISTRATION_OFFSET_WARN_MM`).
+
+Open follow-up: the BRAINSFit output transform direction (moving->fixed) must be
+confirmed against real data and inverted in `_attach_alignment_transform` if a
+test shows the moving volume moving the wrong way.
+
 ## Preconditions and limitations
 
-The three display volumes must be aligned in patient space. Being from the same
-patient and examination is helpful but does not guarantee exact alignment:
-patient motion, differing DICOM orientation metadata, and scanner geometry can
-still cause offsets. Confirm alignment visually with slice intersections or
-apply a Slicer registration transform before segmentation.
+Auto-registration relies on Slicer's BRAINSFit module being available and on the
+two volumes overlapping enough for mutual-information registration to converge.
+When the DICOM frame of reference cannot be read (non-DICOM imports), no
+registration is attempted automatically; the user must confirm alignment or
+click `Register now`. Only standard Red/Yellow/Green slice orientations are
+assumed; oblique acquisitions may still be resampled by the slice viewer.
 
 This first version assumes the standard Red, Yellow, and Green slice
 orientations are suitable. Oblique acquisitions may still be resampled by the

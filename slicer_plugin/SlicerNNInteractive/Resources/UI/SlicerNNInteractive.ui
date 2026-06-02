@@ -1152,6 +1152,91 @@
             </layout>
            </item>
            <item>
+            <widget class="QCheckBox" name="cbAutoRegisterSupplemental">
+             <property name="toolTip">
+              <string>When the supplemental series uses a different DICOM frame of reference than the source volume (for example after a mid-exam localizer or repositioning), automatically run a rigid registration so prompts and masks land in the correct place.</string>
+             </property>
+             <property name="text">
+              <string>Auto-register supplemental series to source</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="cbConfirmSeriesAligned">
+             <property name="toolTip">
+              <string>Skip registration when the DICOM frame of reference cannot be read. Only check this if you are certain the supplemental series is already aligned with the source volume.</string>
+             </property>
+             <property name="text">
+              <string>I confirm these series are already aligned (skip registration)</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="horizontalLayout_seriesAlignmentMode">
+             <item>
+              <widget class="QLabel" name="lblRegistrationMode">
+               <property name="text">
+                <string>Registration:</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QComboBox" name="cbRegistrationMode">
+               <property name="toolTip">
+                <string>Rigid handles patient motion and repositioning. Use Affine only when a rigid fit leaves a large residual.</string>
+               </property>
+               <item>
+                <property name="text">
+                 <string>Rigid</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>Affine</string>
+                </property>
+               </item>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="horizontalLayout_seriesAlignmentActions">
+             <item>
+              <widget class="QPushButton" name="pbRegisterSupplemental">
+               <property name="toolTip">
+                <string>Manually register the current working volume to the source volume now, regardless of frame-of-reference detection.</string>
+               </property>
+               <property name="text">
+                <string>Register now</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="pbClearAlignment">
+               <property name="toolTip">
+                <string>Remove any registration transforms and return the supplemental series to its original position.</string>
+               </property>
+               <property name="text">
+                <string>Clear alignment</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QLabel" name="lblRegistrationStatus">
+             <property name="text">
+              <string/>
+             </property>
+             <property name="wordWrap">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
             <widget class="QLabel" name="lblNativeSeriesInferenceHelp">
              <property name="text">
               <string>Prompts run on the working volume. The result remains a preview until synchronized to the source volume.</string>
