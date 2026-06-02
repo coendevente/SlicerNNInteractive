@@ -1016,9 +1016,29 @@
             </layout>
            </item>
            <item>
+            <widget class="QCheckBox" name="cbSmoothInterpolate">
+             <property name="toolTip">
+              <string>Interpolate each coarse segmentation result onto the high-resolution grid using shape-based (signed-distance) interpolation, so the boundary is smooth in all three planes instead of stair-stepped. Requires the high-resolution output grid; enabling this turns it on automatically.</string>
+             </property>
+             <property name="text">
+              <string>Smooth (interpolate) result between slices</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="pbSmoothCurrentSegment">
+             <property name="toolTip">
+              <string>Re-run shape-based smoothing on the whole current segment, e.g. after erasing or other manual edits. Requires the high-resolution output grid; clicking enables it if needed. Undoable from the Segment Editor.</string>
+             </property>
+             <property name="text">
+              <string>Smooth current segment</string>
+             </property>
+            </widget>
+           </item>
+           <item>
             <widget class="QLabel" name="lblHighResOutputHelp">
              <property name="text">
-              <string>Note: a single inference on the coarse source volume stays coarse. Run native-series inference on each high-resolution series and merge to get sharp results in all planes.</string>
+              <string>Note: a single inference on the coarse source volume stays coarse. Enable smoothing above to interpolate it, or run native-series inference on each high-resolution series and merge.</string>
              </property>
              <property name="wordWrap">
               <bool>true</bool>

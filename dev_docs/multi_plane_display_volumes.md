@@ -60,6 +60,22 @@ interact in its slice view, and see the result synchronized to the main
 segmentation. However, the nnInteractive model still receives only the main
 source image.
 
+### Lasso is a single-slice prompt
+
+The lasso (ClosedCurve) prompt is rasterized on **one slice** of the
+inference/source volume. Curve points are converted to integer voxel
+coordinates (`ras_to_xyz` rounds), so a slice sitting near a voxel boundary
+used to scatter the points across two adjacent slices, fail the
+"exactly one constant axis" check, and silently clear the lasso with no
+segmentation -- experienced as "drew a circle, right-clicked, nothing
+happened". `lasso_points_to_mask` now picks the flattest axis and snaps it to
+a single slice when its spread is within `LASSO_SLICE_AXIS_MAX_SPREAD` voxels
+(2 by default); only genuinely oblique or multi-slice curves (e.g. drawn on a
+display plane that is not aligned with the inference/source volume) are
+rejected, with a status-bar message instead of a silent no-op. The other
+lasso/scribble early-exits (too few points, no source volume, empty mask,
+sync failure, non-200 / network error) now also show a status-bar message.
+
 ## Native-series inference mode
 
 When nnInteractive must analyze the sharper supplemental acquisition, enable
@@ -210,11 +226,52 @@ on this grid:
 - The server upload still samples the segment on the inference grid, so the
   round-trip (write output / upload inference / read output) closes.
 
-**Important expectation**: this is the foundation, not a magic sharpener. A
-single inference on the coarse source volume is still coarse; resampling it to a
-fine grid only yields smaller stair-steps. True per-plane sharpness comes from
+**Important expectation**: by itself this is the foundation, not a magic
+sharpener. A single inference on the coarse source volume is still coarse;
+nearest-neighbor resampling to a fine grid only yields smaller stair-steps.
+Per-plane sharpness comes either from **smooth interpolation** (below) or from
 running native-series inference on each high-resolution series and merging the
-results (default `Add`), which now land on the shared fine grid at full detail.
+results (default `Add`), which land on the shared fine grid at full detail.
+
+### Smooth (interpolated) results
+
+`Smooth (interpolate) result between slices` interpolates each coarse server
+segmentation result onto the fine output grid so the boundary is smooth in all
+three planes instead of stair-stepped. Because smoothing needs the fine grid to
+land on, it requires the high-resolution output feature; enabling smoothing
+turns that on automatically, and turning the high-resolution grid off turns
+smoothing off in lockstep.
+
+- Method: **shape-based (signed-distance) interpolation** in
+  `_interpolate_mask_to_output_grid`. The coarse mask's signed distance field
+  (mm, via `scipy.ndimage.distance_transform_edt`) is interpolated to the fine
+  grid (`ndimage.zoom`, linear) and thresholded at zero. This reconstructs a
+  smooth surface between the thick source slices -- it genuinely interpolates
+  cross-sections, not just rounds the existing steps. It is valid because the
+  output grid is built coplanar with the source (same origin/axes, finer
+  spacing), so coarse -> fine is a pure per-axis scale.
+- Scope: only the nnInteractive server results that flow through
+  `_handle_server_segmentation_result` (point / bbox / lasso / scribble) and the
+  native-series preview are smoothed. Manual boolean / Magic Wand operands are
+  left exact so deliberate edits are not blurred.
+- Supplemental (native-series) working volumes are not coplanar with the output
+  grid, so that path falls back to nearest-neighbor resampling followed by a
+  Gaussian smoothing pass (rounds steps; lower quality than true SDF interp).
+- Strength is a fixed sensible default (no UI control): the SDF zero-crossing
+  needs no parameter, and the Gaussian fallback sigma is derived from the source
+  slice thickness relative to the isotropic spacing.
+- Any failure (no scipy, oversized grid, etc.) returns `None` and the caller
+  degrades to the plain resampling path, so a result is never dropped.
+- Enable state persists via `QSettings`
+  (`SlicerNNInteractive/smooth_interpolate_enabled`), but is only honored at
+  startup when high-resolution output is also enabled.
+- Manual edits (the built-in Segment Editor Erase / Paint / Scissors effects)
+  write the labelmap directly and never pass through the server chokepoint, so
+  the auto toggle does not touch them. The `Smooth current segment` button
+  re-runs the same SDF smoothing on the whole current segment on demand -- use
+  it after erasing or other manual edits. It requires the high-resolution grid
+  (clicking enables it if needed) and writes through `show_segmentation`, so it
+  is undoable from the Segment Editor.
 
 Caveats:
 

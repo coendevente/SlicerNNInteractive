@@ -45,6 +45,11 @@ OUTPUT_GEOMETRY_SOFT_VOXEL_BUDGET = 50_000_000
 OUTPUT_GEOMETRY_HARD_VOXEL_BUDGET = 150_000_000
 OUTPUT_SPACING_MIN_MM = 0.3
 OUTPUT_SPACING_MAX_MM = 10.0
+# Lasso is a single-slice 2D prompt. Curve points are rounded to int voxels, so
+# a slice sitting near a voxel boundary can scatter them across two adjacent
+# slices. Snap the flattest axis to one slice when its spread is within this
+# many voxels; reject (truly oblique / multi-slice) when it exceeds it.
+LASSO_SLICE_AXIS_MAX_SPREAD = 2
 
 
 def debug_print(*args):
@@ -87,6 +92,10 @@ def ensure_synched(func):
 
         if not failed_to_sync:
             return func(self, *args, **kwargs)
+
+        slicer.util.showStatusMessage(
+            "Sync to server failed; prompt was not sent.", 4000
+        )
 
     return inner
 
@@ -522,6 +531,86 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             mask, self.get_volume_node(), self.get_output_volume_node()
         )
 
+    def _smoothing_active(self):
+        """True when smooth (interpolated) results are enabled and possible.
+
+        Smoothing needs a fine output grid to interpolate onto, so it only
+        counts as active when the high-resolution output grid is also active.
+        """
+        return (
+            hasattr(self, "ui")
+            and self.ui.cbSmoothInterpolate.isChecked()
+            and self._output_geometry_active()
+        )
+
+    def _interpolate_mask_to_output_grid(self, coarse_mask, mask_volume):
+        """Interpolate a coarse mask onto the fine output grid for smoothness.
+
+        The coarse mask is blocky in the through-plane direction because the
+        source series is thick-sliced. When the mask sits on the same grid the
+        output geometry was built from (the normal main-series path), use
+        signed-distance (shape-based) interpolation: this reconstructs a smooth
+        surface between the thick slices instead of replicating blocky steps.
+        For a mask on a non-coplanar grid (e.g. a supplemental working volume),
+        fall back to nearest-neighbor resampling followed by Gaussian smoothing.
+
+        Returns a uint8 mask on the output grid, or None so callers can degrade.
+        """
+        if not self._output_geometry_active():
+            return None
+        try:
+            from scipy import ndimage
+
+            coarse = np.asarray(coarse_mask).astype(bool)
+            out_shape = self._output_grid_shape()
+            if out_shape is None:
+                return None
+            if not coarse.any():
+                return np.zeros(out_shape, dtype=np.uint8)
+
+            iso = self._output_geometry_spacing
+            spacing = mask_volume.GetSpacing()  # (x, y, z) in IJK order
+            # numpy axis order is (z, y, x).
+            samp = (spacing[2], spacing[1], spacing[0])
+
+            coplanar = mask_volume.GetID() == self._output_geometry_source_id
+            if coplanar:
+                # Signed distance field in mm: positive inside, negative outside.
+                sdf = (
+                    ndimage.distance_transform_edt(coarse, sampling=samp)
+                    - ndimage.distance_transform_edt(~coarse, sampling=samp)
+                ).astype(np.float32)
+                # Output/input voxel ratio per numpy axis (z, y, x).
+                zoom = (
+                    spacing[2] / iso,
+                    spacing[1] / iso,
+                    spacing[0] / iso,
+                )
+                scaled = ndimage.zoom(sdf, zoom, order=1)
+                # zoom rounds dims while the grid uses ceil; fit exact shape.
+                out = np.full(out_shape, -1.0, dtype=np.float32)
+                clip = tuple(
+                    slice(0, min(out_shape[a], scaled.shape[a])) for a in range(3)
+                )
+                out[clip] = scaled[clip]
+                return (out >= 0).astype(np.uint8)
+
+            # Non-coplanar grid: nearest resample, then Gaussian-smooth on output.
+            resampled = self._resample_mask_between_volumes(
+                coarse_mask, mask_volume, self.get_output_volume_node()
+            )
+            if resampled is None:
+                return None
+            source_spacing = self.get_volume_node().GetSpacing()
+            sigma = float(np.clip(0.5 * max(source_spacing) / iso, 0.5, 3.0))
+            smoothed = ndimage.gaussian_filter(
+                resampled.astype(np.float32), sigma=sigma
+            )
+            return (smoothed >= 0.5).astype(np.uint8)
+        except Exception as e:  # noqa: BLE001 - degrade gracefully
+            print(f"[nni] smooth interpolate failed: {e}")
+            return None
+
     def _ensure_output_geometry_node(self, source_volume):
         """Build or reuse the isotropic output-geometry volume for source_volume."""
         iso = self._get_output_spacing(source_volume)
@@ -758,9 +847,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         output_volume = self.get_output_volume_node()
         working_volume = self.get_inference_volume_node()
-        output_mask = self._resample_mask_between_volumes(
-            working_mask, working_volume, output_volume
-        )
+        if self._smoothing_active():
+            output_mask = self._interpolate_mask_to_output_grid(
+                working_mask, working_volume
+            )
+        else:
+            output_mask = self._resample_mask_between_volumes(
+                working_mask, working_volume, output_volume
+            )
         if output_mask is None:
             # High-res output resample failed; fall back to the source grid so
             # the preview is still produced.
@@ -834,6 +928,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # The result is on the inference grid (== source here). Resample onto
             # the canonical output grid before writing (no-op if they are equal).
             inference_mask = segmentation_mask
+            if self._smoothing_active():
+                smoothed = self._interpolate_mask_to_output_grid(
+                    inference_mask, self.get_inference_volume_node()
+                )
+                if smoothed is not None:
+                    self.show_segmentation(smoothed)
+                    return
+                # Smoothing failed; fall through to plain resampling below.
             resampled = self._resample_mask_between_volumes(
                 inference_mask,
                 self.get_inference_volume_node(),
@@ -956,6 +1058,22 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         blocked = self.ui.cbEnableHighResOutput.blockSignals(True)
         self.ui.cbEnableHighResOutput.setChecked(self._get_high_res_enabled_setting())
         self.ui.cbEnableHighResOutput.blockSignals(blocked)
+
+        # Smooth (interpolated) results. Only honor the persisted preference when
+        # the high-resolution output it depends on is actually enabled; otherwise
+        # start unchecked rather than silently building a fine grid at startup.
+        self.ui.cbSmoothInterpolate.toggled.connect(
+            self._on_smooth_interpolate_changed
+        )
+        self.ui.pbSmoothCurrentSegment.clicked.connect(
+            self.on_smooth_current_segment_clicked
+        )
+        blocked = self.ui.cbSmoothInterpolate.blockSignals(True)
+        self.ui.cbSmoothInterpolate.setChecked(
+            self._get_smooth_interpolate_setting()
+            and self._get_high_res_enabled_setting()
+        )
+        self.ui.cbSmoothInterpolate.blockSignals(blocked)
 
         # Connect Prompt Type buttons
         self.ui.pbPromptTypePositive.clicked.connect(
@@ -1568,6 +1686,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
 
         if len(xyzs) < 3:
+            slicer.util.showStatusMessage("Lasso needs at least 3 points.", 4000)
             return
 
         # The lasso prompt only supports points on a single slice plane.
@@ -1578,7 +1697,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             mask = self.lasso_points_to_mask(xyzs, volume_node=inference_volume)
         except ValueError:
             slicer.util.showStatusMessage(
-                "Lasso points must lie on a single slice plane; cleared.",
+                "Lasso must be drawn on a slice aligned with the "
+                "segmentation/inference volume; cleared.",
                 4000,
             )
             caller.RemoveAllControlPoints()
@@ -1600,6 +1720,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 self.ui.pbInteractionLasso.click()
 
             qt.QTimer.singleShot(0, _next)
+        else:
+            slicer.util.showStatusMessage("No source volume selected.", 4000)
 
     #
     #  -- Scribble
@@ -1682,8 +1804,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 mask, mask_volume_node, inference_volume
             )
         if np.sum(mask) == 0:
+            slicer.util.showStatusMessage(
+                "Lasso/scribble produced an empty mask; nothing to send.", 4000
+            )
             return
-        
+
         url = f"{self.server}/add_{tp}_interaction"
         try:
             buffer = io.BytesIO()
@@ -1717,8 +1842,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 debug_print(
                     f"lasso_or_scribble_prompt upload failed with status code: {seg_response.status_code}"
                 )
+                slicer.util.showStatusMessage(
+                    f"Server rejected {tp} prompt (status "
+                    f"{seg_response.status_code}).",
+                    4000,
+                )
         except Exception as e:
             debug_print(f"Error in lasso_or_scribble_prompt: {e}")
+            slicer.util.showStatusMessage(
+                f"Failed to send {tp} prompt: {e}", 4000
+            )
 
     def on_scribble_finished(self, caller, event):
         """
@@ -2146,14 +2279,97 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 migrated = src_mask
             self.show_segmentation(migrated)
 
+    def _get_smooth_interpolate_setting(self):
+        """Read whether smooth (interpolated) results are enabled. Default False."""
+        v = qt.QSettings().value(
+            "SlicerNNInteractive/smooth_interpolate_enabled", False
+        )
+        if isinstance(v, str):
+            return v.lower() == "true"
+        return bool(v)
+
     def _on_high_res_output_changed(self, checked):
         """Persist the high-res output toggle and migrate the current segment."""
         qt.QSettings().setValue(
             "SlicerNNInteractive/high_res_output_enabled", bool(checked)
         )
+        # Smoothing interpolates onto the fine grid, so it cannot run without
+        # the high-resolution output. Turn it off in lockstep.
+        if (
+            not checked
+            and hasattr(self, "ui")
+            and self.ui.cbSmoothInterpolate.isChecked()
+        ):
+            blocked = self.ui.cbSmoothInterpolate.blockSignals(True)
+            self.ui.cbSmoothInterpolate.setChecked(False)
+            self.ui.cbSmoothInterpolate.blockSignals(blocked)
+            qt.QSettings().setValue(
+                "SlicerNNInteractive/smooth_interpolate_enabled", False
+            )
+            slicer.util.showStatusMessage(
+                "Smoothing disabled (needs high-resolution output).", 4000
+            )
         self._rebuild_output_geometry_and_migrate()
         if hasattr(self, "ui"):
             self._refresh_native_series_inference_ui()
+
+    def _enable_high_res_for_smoothing(self):
+        """Turn on the fine output grid that smoothing needs (no-op if active)."""
+        if self._output_geometry_active():
+            return
+        blocked = self.ui.cbEnableHighResOutput.blockSignals(True)
+        self.ui.cbEnableHighResOutput.setChecked(True)
+        self.ui.cbEnableHighResOutput.blockSignals(blocked)
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/high_res_output_enabled", True
+        )
+        self._rebuild_output_geometry_and_migrate()
+        self._refresh_native_series_inference_ui()
+        slicer.util.showStatusMessage(
+            "High-resolution output enabled for smoothing.", 4000
+        )
+
+    def _on_smooth_interpolate_changed(self, checked):
+        """Persist the smoothing toggle; auto-enable the fine output grid it needs."""
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/smooth_interpolate_enabled", bool(checked)
+        )
+        if checked:
+            self._enable_high_res_for_smoothing()
+
+    def on_smooth_current_segment_clicked(self, checked=False):
+        """Re-run shape-based smoothing on the whole current segment.
+
+        Manual edits (the built-in Erase/Paint/Scissors effects) write the
+        segment labelmap directly and never pass through the server result
+        chokepoint, so their boundaries stay stair-stepped. This button reuses
+        the same SDF interpolation to smooth the current segment on demand.
+        """
+        source_volume = self.get_volume_node()
+        if source_volume is None:
+            slicer.util.showStatusMessage("No source volume selected.", 4000)
+            return
+        self._enable_high_res_for_smoothing()
+        if not self._output_geometry_active():
+            slicer.util.showStatusMessage(
+                "Could not enable high-resolution output for smoothing.", 4000
+            )
+            return
+        # The source volume is fine in-plane and only coarse through-plane, so
+        # reading the segment on its grid keeps in-plane detail; the SDF pass
+        # then interpolates smoothly through-plane onto the fine output grid.
+        coarse = self.get_segment_data(reference_volume_node=source_volume)
+        if coarse is None or int(coarse.sum()) == 0:
+            slicer.util.showStatusMessage(
+                "Current segment is empty; nothing to smooth.", 4000
+            )
+            return
+        smoothed = self._interpolate_mask_to_output_grid(coarse, source_volume)
+        if smoothed is None:
+            slicer.util.showStatusMessage("Smoothing failed.", 4000)
+            return
+        self.show_segmentation(smoothed)
+        slicer.util.showStatusMessage("Current segment smoothed.", 3000)
 
     def _on_output_spacing_changed(self, value):
         """Persist the output spacing and, if enabled, rebuild the output grid."""
@@ -4224,14 +4440,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         shape = slicer.util.arrayFromVolume(volume_node).shape
         pts = np.array(points)  # shape (n, 3)
 
-        # Determine which coordinate is constant
-        const_axes = [i for i in range(3) if np.unique(pts[:, i]).size == 1]
-        if len(const_axes) != 1:
+        # Determine the slice axis. Ideally one coordinate is constant, but
+        # int-rounding of curve points (ras_to_xyz) can scatter the slice axis
+        # across two adjacent voxels when the slice sits near a voxel boundary.
+        # Pick the flattest axis and snap it to a single slice; only reject when
+        # its spread exceeds the tolerance (a genuinely oblique / multi-slice
+        # curve that cannot be treated as a single-slice 2D lasso).
+        spreads = [int(pts[:, i].max() - pts[:, i].min()) for i in range(3)]
+        const_axis = int(np.argmin(spreads))
+        if spreads[const_axis] > LASSO_SLICE_AXIS_MAX_SPREAD:
             raise ValueError(
-                "Expected exactly one constant coordinate among the points"
+                "Expected the lasso points to lie on a single slice plane"
             )
-        const_axis = const_axes[0]
-        const_val = int(pts[0, const_axis])
+        const_val = int(round(np.median(pts[:, const_axis])))
 
         # Create a blank 3D mask
         mask = np.zeros(shape, dtype=np.uint8)

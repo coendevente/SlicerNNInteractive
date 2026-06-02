@@ -149,6 +149,8 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             self._test_multi_plane_display_volumes(widget, volume_node)
             self._test_native_series_inference_sync(widget, volume_node)
             self._test_high_res_output_geometry(widget, volume_node)
+            self._test_smooth_interpolation(widget, volume_node)
+            self._test_smooth_current_segment(widget, volume_node)
             missing = [name for name, _ in self.PROMPTS if not self._reference_path(name).exists()]
             if missing and not self.generate_mode:
                 self.fail(
@@ -190,6 +192,7 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                     )
 
             self._test_lasso_cross_slice_safe(widget)
+            self._test_lasso_slice_axis_tolerance(widget)
             self._test_selection_operations(widget)
         finally:
             self.tearDown()
@@ -529,6 +532,177 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
 
         print("[PASS] high-resolution output geometry")
 
+    def _test_smooth_interpolation(self, widget, source_volume):
+        print("Testing smooth interpolation...")
+        source_dims = widget.get_image_data().shape  # (z, y, x), feature off
+        iso = max(0.3, 0.75 * min(source_volume.GetSpacing()))
+        widget.clear_current_segment()
+        slicer.app.processEvents()
+        widget.ui.sbOutputSpacing.setValue(iso)
+        try:
+            # UI coupling: enabling smoothing auto-enables high-res output.
+            widget.ui.cbEnableHighResOutput.setChecked(False)
+            slicer.app.processEvents()
+            widget.ui.cbSmoothInterpolate.setChecked(True)
+            slicer.app.processEvents()
+            self.assertTrue(widget.ui.cbEnableHighResOutput.isChecked())
+            self.assertTrue(widget._output_geometry_active())
+            self.assertTrue(widget._smoothing_active())
+
+            output_dims = widget._output_grid_shape()
+
+            # Empty mask short-circuits to a zero mask on the output grid.
+            empty = widget._interpolate_mask_to_output_grid(
+                np.zeros(source_dims, dtype=np.uint8), source_volume
+            )
+            self.assertIsNotNone(empty)
+            self.assertEqual(empty.shape, output_dims)
+            self.assertEqual(int(empty.sum()), 0)
+
+            # SDF interpolation: nested squares on two adjacent source slices
+            # must yield an intermediate-size cross-section on the fine slice
+            # between them (nearest-neighbor would jump abruptly instead).
+            cz, cy, cx = (
+                source_dims[0] // 2,
+                source_dims[1] // 2,
+                source_dims[2] // 2,
+            )
+            z0, z1 = cz, cz + 1
+            w1, w2 = 20, 8
+            coarse = np.zeros(source_dims, dtype=np.uint8)
+            coarse[z0, cy - w1:cy + w1, cx - w1:cx + w1] = 1
+            coarse[z1, cy - w2:cy + w2, cx - w2:cx + w2] = 1
+            smoothed = widget._interpolate_mask_to_output_grid(coarse, source_volume)
+            self.assertIsNotNone(smoothed)
+            self.assertEqual(smoothed.shape, output_dims)
+            self.assertGreater(int(smoothed.sum()), 0)
+
+            spacing_z = source_volume.GetSpacing()[2]
+
+            def fz(zsrc):
+                return int(
+                    np.clip(round(zsrc * spacing_z / iso), 0, output_dims[0] - 1)
+                )
+
+            a_big = int(smoothed[fz(z0)].sum())
+            a_small = int(smoothed[fz(z1)].sum())
+            a_mid = int(smoothed[fz(z0 + 0.5)].sum())
+            self.assertGreater(
+                a_big, a_small, msg="Larger source square -> larger cross-section."
+            )
+            self.assertGreater(
+                a_mid, a_small, msg="SDF must interpolate between the slices."
+            )
+            self.assertGreater(
+                a_big, a_mid, msg="SDF must interpolate between the slices."
+            )
+
+            # Gaussian fallback path (mask grid not coplanar with the output grid).
+            saved = widget._output_geometry_source_id
+            widget._output_geometry_source_id = "force-noncoplanar"
+            try:
+                fallback = widget._interpolate_mask_to_output_grid(
+                    coarse, source_volume
+                )
+            finally:
+                widget._output_geometry_source_id = saved
+            self.assertIsNotNone(fallback)
+            self.assertEqual(fallback.shape, output_dims)
+            self.assertGreater(int(fallback.sum()), 0)
+
+            # Turning off the high-res grid must also disable smoothing.
+            widget.ui.cbEnableHighResOutput.setChecked(False)
+            slicer.app.processEvents()
+            self.assertFalse(widget.ui.cbSmoothInterpolate.isChecked())
+            self.assertFalse(widget._smoothing_active())
+        finally:
+            widget.ui.cbSmoothInterpolate.setChecked(False)
+            widget.ui.cbEnableHighResOutput.setChecked(False)
+            widget.ui.sbOutputSpacing.setValue(0.0)
+            widget._remove_output_geometry_node()
+            widget.clear_current_segment()
+            slicer.app.processEvents()
+
+        print("[PASS] smooth interpolation")
+
+    def _test_smooth_current_segment(self, widget, source_volume):
+        print("Testing smooth-current-segment button...")
+        source_dims = widget.get_image_data().shape  # (z, y, x), feature off
+        iso = max(0.3, 0.75 * min(source_volume.GetSpacing()))
+        widget.clear_current_segment()
+        slicer.app.processEvents()
+        widget.ui.sbOutputSpacing.setValue(iso)
+        try:
+            # High-res output on, auto-smoothing OFF: a coarse result is stored
+            # blocky (nearest-neighbor) on the fine grid.
+            widget.ui.cbSmoothInterpolate.setChecked(False)
+            widget.ui.cbEnableHighResOutput.setChecked(True)
+            slicer.app.processEvents()
+            self.assertTrue(widget._output_geometry_active())
+            self.assertFalse(widget._smoothing_active())
+            output_dims = widget._output_grid_shape()
+
+            cz, cy, cx = (
+                source_dims[0] // 2,
+                source_dims[1] // 2,
+                source_dims[2] // 2,
+            )
+            z0, z1 = cz, cz + 1
+            w1, w2 = 20, 8
+            coarse = np.zeros(source_dims, dtype=np.uint8)
+            coarse[z0, cy - w1:cy + w1, cx - w1:cx + w1] = 1
+            coarse[z1, cy - w2:cy + w2, cx - w2:cx + w2] = 1
+            widget._handle_server_segmentation_result(coarse)
+            slicer.app.processEvents()
+
+            spacing_z = source_volume.GetSpacing()[2]
+
+            def fz(zsrc):
+                return int(
+                    np.clip(round(zsrc * spacing_z / iso), 0, output_dims[0] - 1)
+                )
+
+            stored = widget.get_segment_data()
+            self.assertEqual(stored.shape, output_dims)
+            blocky_big = int(stored[fz(z0)].sum())
+            blocky_small = int(stored[fz(z1)].sum())
+            blocky_mid = int(stored[fz(z0 + 0.5)].sum())
+            # Nearest-neighbor: the middle fine slice copies one source slice, so
+            # it is not strictly between the two cross-sections.
+            self.assertFalse(
+                blocky_small < blocky_mid < blocky_big,
+                msg="Without smoothing the result should not interpolate.",
+            )
+
+            # Smooth the current segment via the manual button handler.
+            widget.on_smooth_current_segment_clicked()
+            slicer.app.processEvents()
+            smoothed = widget.get_segment_data()
+            self.assertEqual(smoothed.shape, output_dims)
+            self.assertGreater(int(smoothed.sum()), 0)
+            s_big = int(smoothed[fz(z0)].sum())
+            s_small = int(smoothed[fz(z1)].sum())
+            s_mid = int(smoothed[fz(z0 + 0.5)].sum())
+            self.assertGreater(s_big, s_small)
+            self.assertGreater(s_mid, s_small, msg="Button must interpolate slices.")
+            self.assertGreater(s_big, s_mid, msg="Button must interpolate slices.")
+
+            # Empty segment: button must not crash and must leave it empty.
+            widget.clear_current_segment()
+            slicer.app.processEvents()
+            widget.on_smooth_current_segment_clicked()
+            slicer.app.processEvents()
+            self.assertEqual(int(widget.get_segment_data().sum()), 0)
+        finally:
+            widget.ui.cbSmoothInterpolate.setChecked(False)
+            widget.ui.cbEnableHighResOutput.setChecked(False)
+            widget.ui.sbOutputSpacing.setValue(0.0)
+            widget._remove_output_geometry_node()
+            widget.clear_current_segment()
+            slicer.app.processEvents()
+
+        print("[PASS] smooth-current-segment button")
+
     def _trigger_point_prompt(self, widget, ijk, positive=True):
         dims = widget.get_image_data().shape  # (k, j, i)
         clamped = [
@@ -834,6 +1008,46 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         )
         self.assertFalse(widget.ui.pbInteractionLassoCancel.isVisible())
         print("[PASS] lasso cross-slice safety")
+
+    def _test_lasso_slice_axis_tolerance(self, widget):
+        """
+        Curve points are int-rounded, so a slice near a voxel boundary can
+        scatter the slice axis across two adjacent voxels. lasso_points_to_mask
+        must snap such a (within-tolerance) curve onto a single slice instead of
+        raising, while still rejecting genuinely multi-slice / oblique curves.
+        """
+        print("Testing lasso slice-axis tolerance...")
+        volume_node = widget.get_volume_node()
+        self.assertIsNotNone(volume_node)
+
+        # In-plane square (x, y vary ~20 voxels), slice axis z jittered by 1
+        # voxel. Flattest axis is z with spread 1 (<= tolerance) -> snap, no raise.
+        jittered = [
+            [40, 40, 40],
+            [60, 40, 41],
+            [60, 60, 40],
+            [40, 60, 41],
+        ]
+        mask = widget.lasso_points_to_mask(jittered, volume_node=volume_node)
+        self.assertGreater(int(mask.sum()), 0, msg="Snapped lasso must fill voxels.")
+        filled_z = np.unique(np.argwhere(mask)[:, 0])
+        self.assertEqual(
+            filled_z.size, 1,
+            msg="Within-tolerance lasso must collapse to a single slice.",
+        )
+        # xyz axis 2 (z) maps to numpy mask axis 0; const_val is the snapped slice.
+        self.assertEqual(widget._last_lasso_slice, (0, int(filled_z[0])))
+
+        # Slice axis spread 7 (> tolerance) -> genuinely multi-slice -> raise.
+        oblique = [
+            [40, 40, 40],
+            [60, 40, 41],
+            [60, 60, 46],
+            [40, 60, 47],
+        ]
+        with self.assertRaises(ValueError):
+            widget.lasso_points_to_mask(oblique, volume_node=volume_node)
+        print("[PASS] lasso slice-axis tolerance")
 
     def _test_selection_operations(self, widget):
         """
