@@ -427,6 +427,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         source_volume = self.get_volume_node()
         if source_volume is None or not self._plane_display_snapshot:
             return
+        # Drop transforms left over from a previous (now stale) source volume so
+        # they are not orphaned when a new alignment overwrites the parent.
+        self._prune_alignment_for_source(source_volume.GetID())
         seen = set()
         for volume_id in self._plane_display_snapshot.values():
             if not volume_id or volume_id == source_volume.GetID():
@@ -853,6 +856,34 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._alignment_queue = []
         for key in list(self._alignment_transforms.keys()):
             self._drop_alignment_entry(key)
+
+    def _cancel_active_registration(self):
+        """Tear down an in-flight registration so cleanup cannot dangle.
+
+        The CLI observer is added directly on the node (not via
+        VTKObservationMixin), so removeObservers() would not catch it, and the
+        pending transform is not yet cached. Remove both explicitly.
+        """
+        cli = self._alignment_cli_node
+        if cli is not None:
+            if self._alignment_cli_observer is not None:
+                try:
+                    cli.RemoveObserver(self._alignment_cli_observer)
+                except Exception:
+                    pass
+            try:
+                cli.Cancel()
+            except Exception:
+                pass
+        if self._alignment_pending is not None:
+            node = slicer.mrmlScene.GetNodeByID(self._alignment_pending[2])
+            if node is not None and slicer.mrmlScene.IsNodePresent(node):
+                slicer.mrmlScene.RemoveNode(node)
+        self._alignment_cli_observer = None
+        self._alignment_cli_node = None
+        self._alignment_pending = None
+        self._alignment_in_progress = False
+        self._alignment_queue = []
 
     def _prune_alignment_for_source(self, source_id):
         """Drop cached transforms that target a stale (no longer current) source."""
@@ -1724,6 +1755,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._destroy_lasso3d()
         self._destroy_inference_preview()
         self._remove_output_geometry_node()
+        self._cancel_active_registration()
         self._remove_alignment_transforms()
 
         if hasattr(self, "_qt_event_filters"):
