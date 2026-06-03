@@ -62,16 +62,6 @@ REGISTRATION_OFFSET_WARN_MM = 30.0
 REGISTRATION_IDENTITY_TRANSLATION_MM = 1.0
 REGISTRATION_IDENTITY_ROTATION_DEG = 1.0
 
-# Smoothing methods for interpolating a coarse mask onto the fine output grid.
-# Order here defines the combo-box order; "surface" is the default.
-#   surface  - closed-surface (windowed-sinc/Taubin) smoothing, shrink-free
-#   shape    - signed-distance shape-based interpolation (cubic), best through-plane
-#   gaussian - Gaussian blur + threshold, uniform rounding
-#   median   - median filter, light edge-preserving denoise
-SMOOTHING_METHODS = ["surface", "shape", "gaussian", "median"]
-SMOOTHING_METHOD_DEFAULT = "surface"
-SMOOTHING_STRENGTH_DEFAULT = 0.5
-
 
 def debug_print(*args):
     if DEBUG_MODE:
@@ -613,16 +603,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
 
     def _interpolate_mask_to_output_grid(self, coarse_mask, mask_volume):
-        """Smooth a coarse mask onto the fine output grid using the chosen method.
+        """Interpolate a coarse mask onto the fine output grid for smoothness.
 
         The coarse mask is blocky in the through-plane direction because the
-        source series is thick-sliced. This dispatches to the smoothing method
-        selected in the UI (surface / shape / gaussian / median) and returns a
-        uint8 mask on the output grid, or None so callers can degrade.
+        source series is thick-sliced. When the mask sits on the same grid the
+        output geometry was built from (the normal main-series path), use
+        signed-distance (shape-based) interpolation: this reconstructs a smooth
+        surface between the thick slices instead of replicating blocky steps.
+        For a mask on a non-coplanar grid (e.g. a supplemental working volume),
+        fall back to nearest-neighbor resampling followed by Gaussian smoothing.
+
+        Returns a uint8 mask on the output grid, or None so callers can degrade.
         """
         if not self._output_geometry_active():
             return None
         try:
+            from scipy import ndimage
+
             coarse = np.asarray(coarse_mask).astype(bool)
             out_shape = self._output_grid_shape()
             if out_shape is None:
@@ -630,161 +627,48 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             if not coarse.any():
                 return np.zeros(out_shape, dtype=np.uint8)
 
-            method = self._current_smoothing_method()
-            strength = self._current_smoothing_strength()
-            if method == "surface":
-                return self._smooth_surface(coarse, mask_volume, strength)
-            if method == "gaussian":
-                return self._smooth_gaussian(coarse, mask_volume, strength)
-            if method == "median":
-                return self._smooth_median(coarse, mask_volume, strength)
-            # Default / "shape": signed-distance shape-based interpolation.
-            return self._smooth_shape(coarse, mask_volume)
+            iso = self._output_geometry_spacing
+            spacing = mask_volume.GetSpacing()  # (x, y, z) in IJK order
+            # numpy axis order is (z, y, x).
+            samp = (spacing[2], spacing[1], spacing[0])
+
+            coplanar = mask_volume.GetID() == self._output_geometry_source_id
+            if coplanar:
+                # Signed distance field in mm: positive inside, negative outside.
+                sdf = (
+                    ndimage.distance_transform_edt(coarse, sampling=samp)
+                    - ndimage.distance_transform_edt(~coarse, sampling=samp)
+                ).astype(np.float32)
+                # Output/input voxel ratio per numpy axis (z, y, x).
+                zoom = (
+                    spacing[2] / iso,
+                    spacing[1] / iso,
+                    spacing[0] / iso,
+                )
+                scaled = ndimage.zoom(sdf, zoom, order=1)
+                # zoom rounds dims while the grid uses ceil; fit exact shape.
+                out = np.full(out_shape, -1.0, dtype=np.float32)
+                clip = tuple(
+                    slice(0, min(out_shape[a], scaled.shape[a])) for a in range(3)
+                )
+                out[clip] = scaled[clip]
+                return (out >= 0).astype(np.uint8)
+
+            # Non-coplanar grid: nearest resample, then Gaussian-smooth on output.
+            resampled = self._resample_mask_between_volumes(
+                coarse_mask, mask_volume, self.get_output_volume_node()
+            )
+            if resampled is None:
+                return None
+            source_spacing = self.get_volume_node().GetSpacing()
+            sigma = float(np.clip(0.5 * max(source_spacing) / iso, 0.5, 3.0))
+            smoothed = ndimage.gaussian_filter(
+                resampled.astype(np.float32), sigma=sigma
+            )
+            return (smoothed >= 0.5).astype(np.uint8)
         except Exception as e:  # noqa: BLE001 - degrade gracefully
             print(f"[nni] smooth interpolate failed: {e}")
             return None
-
-    def _smooth_shape(self, coarse, mask_volume):
-        """Signed-distance (shape-based) interpolation onto the output grid.
-
-        For a mask coplanar with the output grid (the normal main-series path),
-        reconstruct a smooth surface between thick slices from a signed distance
-        field, using cubic interpolation (order=3) so the through-plane ramp is
-        smoother and per-slice in/out oscillation is reduced. For a non-coplanar
-        mask (e.g. a supplemental working volume) fall back to nearest-neighbor
-        resampling followed by Gaussian smoothing. Returns uint8 or None.
-        """
-        from scipy import ndimage
-
-        iso = self._output_geometry_spacing
-        spacing = mask_volume.GetSpacing()  # (x, y, z) in IJK order
-        # numpy axis order is (z, y, x).
-        samp = (spacing[2], spacing[1], spacing[0])
-        out_shape = self._output_grid_shape()
-
-        coplanar = mask_volume.GetID() == self._output_geometry_source_id
-        if coplanar:
-            # Signed distance field in mm: positive inside, negative outside.
-            sdf = (
-                ndimage.distance_transform_edt(coarse, sampling=samp)
-                - ndimage.distance_transform_edt(~coarse, sampling=samp)
-            ).astype(np.float32)
-            # Output/input voxel ratio per numpy axis (z, y, x).
-            zoom = (
-                spacing[2] / iso,
-                spacing[1] / iso,
-                spacing[0] / iso,
-            )
-            # Cubic interpolation of the SDF gives a smoother level set than
-            # linear, reducing the per-slice oscillation of the reconstruction.
-            scaled = ndimage.zoom(sdf, zoom, order=3)
-            # zoom rounds dims while the grid uses ceil; fit exact shape.
-            out = np.full(out_shape, -1.0, dtype=np.float32)
-            clip = tuple(
-                slice(0, min(out_shape[a], scaled.shape[a])) for a in range(3)
-            )
-            out[clip] = scaled[clip]
-            return (out >= 0).astype(np.uint8)
-
-        # Non-coplanar grid: nearest resample, then Gaussian-smooth on output.
-        resampled = self._resample_mask_between_volumes(
-            coarse, mask_volume, self.get_output_volume_node()
-        )
-        if resampled is None:
-            return None
-        source_spacing = self.get_volume_node().GetSpacing()
-        sigma = float(np.clip(0.5 * max(source_spacing) / iso, 0.5, 3.0))
-        smoothed = ndimage.gaussian_filter(resampled.astype(np.float32), sigma=sigma)
-        return (smoothed >= 0.5).astype(np.uint8)
-
-    def _smooth_gaussian(self, coarse, mask_volume, strength):
-        """Resample onto the output grid, Gaussian-blur, threshold at 0.5.
-
-        strength in [0, 1] maps to a blur sigma (in output voxels); a flat edge
-        keeps its position at the 0.5 crossing, convex features round in and
-        concave notches fill. Returns uint8 or None.
-        """
-        from scipy import ndimage
-
-        resampled = self._resample_mask_between_volumes(
-            coarse, mask_volume, self.get_output_volume_node()
-        )
-        if resampled is None:
-            return None
-        sigma = float(np.clip(0.5 + strength * 2.5, 0.5, 3.0))
-        smoothed = ndimage.gaussian_filter(resampled.astype(np.float32), sigma=sigma)
-        return (smoothed >= 0.5).astype(np.uint8)
-
-    def _smooth_median(self, coarse, mask_volume, strength):
-        """Resample onto the output grid, then median-filter (edge-preserving).
-
-        strength in [0, 1] maps to an odd kernel size (1..5 voxels). A binary
-        median is a majority vote, so it stays binary and barely changes volume.
-        Returns uint8 or None.
-        """
-        from scipy import ndimage
-
-        resampled = self._resample_mask_between_volumes(
-            coarse, mask_volume, self.get_output_volume_node()
-        )
-        if resampled is None:
-            return None
-        size = int(round(strength * 4)) + 1
-        if size % 2 == 0:
-            size += 1
-        size = max(1, min(5, size))
-        if size <= 1:
-            return resampled.astype(np.uint8)
-        filtered = ndimage.median_filter(resampled.astype(np.uint8), size=size)
-        return (filtered >= 1).astype(np.uint8)
-
-    def _smooth_surface(self, coarse, mask_volume, strength):
-        """Shrink-free smoothing via a closed-surface (windowed-sinc) round-trip.
-
-        Import the coarse mask into a staging segmentation, build a closed
-        surface with Slicer's "Smoothing factor" (a windowed-sinc / Taubin pass
-        that minimizes shrinkage), drop the original binary labelmap so the
-        smoothed surface becomes the source, then re-convert to a binary
-        labelmap on the output grid. Returns uint8 or None.
-        """
-        output_volume = self.get_output_volume_node()
-        if output_volume is None:
-            return None
-
-        staging_node = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLSegmentationNode"
-        )
-        staging_node.SetName("SmoothingSurface (temporary)")
-        staging_node.HideFromEditorsOn()
-        self._set_segmentation_reference_volume(staging_node, mask_volume)
-        segmentation = staging_node.GetSegmentation()
-        segment_id = segmentation.AddEmptySegment("Smooth", "Smooth")
-        try:
-            slicer.util.updateSegmentBinaryLabelmapFromArray(
-                coarse.astype(np.uint8), staging_node, segment_id, mask_volume
-            )
-            factor = float(min(1.0, max(0.0, strength)))
-            segmentation.SetConversionParameter("Smoothing factor", str(factor))
-            staging_node.CreateClosedSurfaceRepresentation()
-            # Drop the original binary labelmap so the re-conversion below is
-            # driven by the smoothed closed surface, not the blocky input.
-            binary_name = (
-                slicer.vtkSegmentationConverter
-                .GetSegmentationBinaryLabelmapRepresentationName()
-            )
-            segmentation.RemoveRepresentation(binary_name)
-            self._set_segmentation_reference_volume(staging_node, output_volume)
-            result = slicer.util.arrayFromSegmentBinaryLabelmap(
-                staging_node, segment_id, output_volume
-            )
-            if result is None:
-                return None
-            return result.astype(np.uint8)
-        except Exception as exc:
-            print("[nni] surface smoothing failed: %s" % exc)
-            return None
-        finally:
-            slicer.mrmlScene.RemoveNode(staging_node)
 
     def _ensure_output_geometry_node(self, source_volume):
         """Build or reuse the isotropic output-geometry volume for source_volume."""
@@ -1702,24 +1586,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             and self._get_high_res_enabled_setting()
         )
         self.ui.cbSmoothInterpolate.blockSignals(blocked)
-
-        # Smoothing method and strength (persisted; signals blocked while
-        # restoring so no smoothing is triggered at startup).
-        self.ui.cbSmoothingMethod.currentIndexChanged.connect(
-            self._on_smoothing_method_changed
-        )
-        self.ui.sbSmoothingStrength.valueChanged.connect(
-            self._on_smoothing_strength_changed
-        )
-        blocked = self.ui.cbSmoothingMethod.blockSignals(True)
-        self.ui.cbSmoothingMethod.setCurrentIndex(
-            SMOOTHING_METHODS.index(self._get_smoothing_method_setting())
-        )
-        self.ui.cbSmoothingMethod.blockSignals(blocked)
-        blocked = self.ui.sbSmoothingStrength.blockSignals(True)
-        self.ui.sbSmoothingStrength.setValue(self._get_smoothing_strength_setting())
-        self.ui.sbSmoothingStrength.blockSignals(blocked)
-        self._refresh_smoothing_ui()
 
         # Connect Prompt Type buttons
         self.ui.pbPromptTypePositive.clicked.connect(
@@ -3005,84 +2871,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         if checked:
             self._enable_high_res_for_smoothing()
-        if hasattr(self, "ui"):
-            self._refresh_smoothing_ui()
-
-    def _get_smoothing_method_setting(self):
-        """Read the persisted smoothing method key. Default 'surface'."""
-        v = qt.QSettings().value(
-            "SlicerNNInteractive/smoothing_method", SMOOTHING_METHOD_DEFAULT
-        )
-        v = str(v) if v is not None else SMOOTHING_METHOD_DEFAULT
-        return v if v in SMOOTHING_METHODS else SMOOTHING_METHOD_DEFAULT
-
-    def _get_smoothing_strength_setting(self):
-        """Read the persisted smoothing strength in [0, 1]. Default 0.5."""
-        try:
-            v = float(
-                qt.QSettings().value(
-                    "SlicerNNInteractive/smoothing_strength",
-                    SMOOTHING_STRENGTH_DEFAULT,
-                )
-            )
-        except (TypeError, ValueError):
-            v = SMOOTHING_STRENGTH_DEFAULT
-        return float(min(1.0, max(0.0, v)))
-
-    def _current_smoothing_method(self):
-        """Selected smoothing method key, from the combo box or persisted value."""
-        if hasattr(self, "ui"):
-            idx = self.ui.cbSmoothingMethod.currentIndex
-            if 0 <= idx < len(SMOOTHING_METHODS):
-                return SMOOTHING_METHODS[idx]
-        return self._get_smoothing_method_setting()
-
-    def _current_smoothing_strength(self):
-        """Selected smoothing strength in [0, 1], from the spin box or persisted."""
-        if hasattr(self, "ui"):
-            try:
-                v = float(self.ui.sbSmoothingStrength.value)
-            except (TypeError, ValueError):
-                v = self._get_smoothing_strength_setting()
-            return float(min(1.0, max(0.0, v)))
-        return self._get_smoothing_strength_setting()
-
-    def _on_smoothing_method_changed(self, *args):
-        """Persist the smoothing method and refresh dependent control state."""
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/smoothing_method", self._current_smoothing_method()
-        )
-        if hasattr(self, "ui"):
-            self._refresh_smoothing_ui()
-
-    def _on_smoothing_strength_changed(self, *args):
-        """Persist the smoothing strength."""
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/smoothing_strength",
-            self._current_smoothing_strength(),
-        )
-
-    def _refresh_smoothing_ui(self):
-        """Enable the method/strength controls only when smoothing can run.
-
-        Strength is meaningless for the shape-based method (it has no tunable
-        parameter), so it is disabled when that method is selected.
-        """
-        if not hasattr(self, "ui"):
-            return
-        enabled = self.ui.cbSmoothInterpolate.isChecked()
-        self.ui.cbSmoothingMethod.setEnabled(enabled)
-        self.ui.sbSmoothingStrength.setEnabled(
-            enabled and self._current_smoothing_method() != "shape"
-        )
 
     def on_smooth_current_segment_clicked(self, checked=False):
-        """Re-run the selected smoothing method on the whole current segment.
+        """Re-run shape-based smoothing on the whole current segment.
 
         Manual edits (the built-in Erase/Paint/Scissors effects) write the
         segment labelmap directly and never pass through the server result
         chokepoint, so their boundaries stay stair-stepped. This button reuses
-        the same smoothing dispatcher to smooth the current segment on demand.
+        the same SDF interpolation to smooth the current segment on demand.
         """
         source_volume = self.get_volume_node()
         if source_volume is None:
