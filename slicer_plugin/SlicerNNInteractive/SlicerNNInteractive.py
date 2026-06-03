@@ -1622,6 +1622,24 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         self.ui.pbUndoSelectionOp.clicked.connect(self.on_undo_selection_op_clicked)
         self.ui.sldSegmentOpacity.valueChanged.connect(self._on_segment_opacity_changed)
+        # Non-destructive display smoothing (load persisted prefs with signals
+        # blocked so restoring the widgets does not apply smoothing at startup).
+        self.ui.cbDisplaySmooth.toggled.connect(
+            self._on_display_smooth_enabled_changed
+        )
+        self.ui.sbDisplaySmoothStrength.valueChanged.connect(
+            self._on_display_smooth_strength_changed
+        )
+        self.ui.pbBakeDisplaySmooth.clicked.connect(
+            self.on_bake_display_smooth_clicked
+        )
+        blocked = self.ui.sbDisplaySmoothStrength.blockSignals(True)
+        self.ui.sbDisplaySmoothStrength.setValue(self._get_display_smooth_strength())
+        self.ui.sbDisplaySmoothStrength.blockSignals(blocked)
+        blocked = self.ui.cbDisplaySmooth.blockSignals(True)
+        self.ui.cbDisplaySmooth.setChecked(self._get_display_smooth_enabled())
+        self.ui.cbDisplaySmooth.blockSignals(blocked)
+        self._refresh_display_smooth_ui()
         self.ui.cbEnableLassoClip.toggled.connect(self._on_lasso_clip_enabled_changed)
         self.ui.sbLassoClipN.valueChanged.connect(self._on_lasso_clip_n_changed)
         # Load persisted lasso-clip prefs into the widgets (block signals so
@@ -2705,6 +2723,225 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             "SlicerNNInteractive/segment_opacity", float(value)
         )
 
+    # -- Non-destructive display smoothing (2D + 3D from the closed surface) --
+
+    def _existing_segmentation_node(self):
+        """The current editor segmentation node, or None (never creates one)."""
+        node = self.ui.editor_widget.segmentationNode()
+        if node is None:
+            return None
+        internal_names = {
+            self.scribble_segment_node_name,
+            self.wand_preview_segment_node_name,
+            self.lasso3d_input_segment_node_name,
+            self.lasso3d_preview_segment_node_name,
+            self.inference_preview_segment_node_name,
+        }
+        if node.GetName() in internal_names:
+            return None
+        return node
+
+    @staticmethod
+    def _closed_surface_name():
+        return (
+            slicer.vtkSegmentationConverter
+            .GetSegmentationClosedSurfaceRepresentationName()
+        )
+
+    @staticmethod
+    def _binary_labelmap_name():
+        return (
+            slicer.vtkSegmentationConverter
+            .GetSegmentationBinaryLabelmapRepresentationName()
+        )
+
+    def _get_display_smooth_enabled(self):
+        """Read whether non-destructive display smoothing is on. Default False."""
+        v = qt.QSettings().value(
+            "SlicerNNInteractive/display_smooth_enabled", False
+        )
+        if isinstance(v, str):
+            return v.lower() == "true"
+        return bool(v)
+
+    def _get_display_smooth_strength(self):
+        """Read the display smoothing strength in [0, 1]. Default 0.5."""
+        try:
+            v = float(
+                qt.QSettings().value(
+                    "SlicerNNInteractive/display_smooth_strength", 0.5
+                )
+            )
+        except (TypeError, ValueError):
+            v = 0.5
+        return float(min(1.0, max(0.0, v)))
+
+    def _current_display_smooth_strength(self):
+        """Strength from the spin box, falling back to the persisted value."""
+        if hasattr(self, "ui"):
+            try:
+                v = float(self.ui.sbDisplaySmoothStrength.value)
+            except (TypeError, ValueError):
+                v = self._get_display_smooth_strength()
+            return float(min(1.0, max(0.0, v)))
+        return self._get_display_smooth_strength()
+
+    def _apply_display_smoothing(self):
+        """Smooth the closed surface and render 2D + 3D from it (non-destructive).
+
+        Sets a segmentation-level "Smoothing factor" (a windowed-sinc pass that
+        Slicer re-applies whenever the surface is rebuilt) and points the segment
+        display node's 2D and 3D preferred representations at the closed surface.
+        The binary labelmap (the stored data) is never modified.
+        """
+        seg_node = self._existing_segmentation_node()
+        if seg_node is None:
+            return
+        display_node = seg_node.GetDisplayNode()
+        if display_node is None:
+            return
+        try:
+            segmentation = seg_node.GetSegmentation()
+            strength = self._current_display_smooth_strength()
+            segmentation.SetConversionParameter("Smoothing factor", str(strength))
+            # Drop any stale surface so it is rebuilt with the current factor.
+            segmentation.RemoveRepresentation(self._closed_surface_name())
+            seg_node.CreateClosedSurfaceRepresentation()
+            surface_name = self._closed_surface_name()
+            display_node.SetPreferredDisplayRepresentationName2D(surface_name)
+            display_node.SetPreferredDisplayRepresentationName3D(surface_name)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            print("[nni] apply display smoothing failed: %s" % exc)
+
+    def _clear_display_smoothing(self):
+        """Render 2D + 3D from the binary labelmap again (data untouched)."""
+        seg_node = self._existing_segmentation_node()
+        if seg_node is None:
+            return
+        display_node = seg_node.GetDisplayNode()
+        if display_node is None:
+            return
+        try:
+            labelmap_name = self._binary_labelmap_name()
+            display_node.SetPreferredDisplayRepresentationName2D(labelmap_name)
+            display_node.SetPreferredDisplayRepresentationName3D(labelmap_name)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            print("[nni] clear display smoothing failed: %s" % exc)
+
+    def _refresh_display_smooth_ui(self):
+        """Enable strength/bake only when display smoothing is on."""
+        if not hasattr(self, "ui"):
+            return
+        enabled = self.ui.cbDisplaySmooth.isChecked()
+        self.ui.sbDisplaySmoothStrength.setEnabled(enabled)
+        self.ui.pbBakeDisplaySmooth.setEnabled(enabled)
+
+    def _on_display_smooth_enabled_changed(self, checked):
+        """Persist the toggle and apply or clear the display-only smoothing."""
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/display_smooth_enabled", bool(checked)
+        )
+        if checked:
+            self._apply_display_smoothing()
+        else:
+            self._clear_display_smoothing()
+        self._refresh_display_smooth_ui()
+
+    def _on_display_smooth_strength_changed(self, value):
+        """Persist the strength and re-apply if display smoothing is active."""
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/display_smooth_strength",
+            self._current_display_smooth_strength(),
+        )
+        if hasattr(self, "ui") and self.ui.cbDisplaySmooth.isChecked():
+            self._apply_display_smoothing()
+
+    def _reapply_display_smoothing_if_active(self):
+        """Re-apply display smoothing after the active segmentation changes."""
+        if hasattr(self, "ui") and self.ui.cbDisplaySmooth.isChecked():
+            self._apply_display_smoothing()
+
+    def on_bake_display_smooth_clicked(self, checked=False):
+        """Bake the currently displayed smooth surface back into the segment.
+
+        This is the explicit, destructive "export" step: convert the smoothed
+        closed surface to a binary labelmap on the output grid and store it as
+        the segment data. A snapshot of the original labelmap is restored if any
+        step fails, so a bad conversion never corrupts the segment.
+        """
+        seg_node = self._existing_segmentation_node()
+        segment_id = self.get_current_segment_id()
+        if seg_node is None or not segment_id:
+            slicer.util.showStatusMessage("No segment selected to bake.", 4000)
+            return
+        output_volume = self.get_output_volume_node()
+        if output_volume is None:
+            slicer.util.showStatusMessage("No output volume available.", 4000)
+            return
+
+        original = None
+        try:
+            original = slicer.util.arrayFromSegmentBinaryLabelmap(
+                seg_node, segment_id, output_volume
+            )
+            if original is not None:
+                original = original.copy()
+
+            segmentation = seg_node.GetSegmentation()
+            strength = self._current_display_smooth_strength()
+            segmentation.SetConversionParameter("Smoothing factor", str(strength))
+            segmentation.RemoveRepresentation(self._closed_surface_name())
+            seg_node.CreateClosedSurfaceRepresentation()
+
+            # Rebuild the binary labelmap from the smoothed surface on the output
+            # grid, then read it back as the new segment data.
+            segmentation.SetReferenceImageGeometryParameterFromVolumeNode(
+                output_volume
+            )
+            segmentation.RemoveRepresentation(self._binary_labelmap_name())
+            seg_node.CreateBinaryLabelmapRepresentation()
+            baked = slicer.util.arrayFromSegmentBinaryLabelmap(
+                seg_node, segment_id, output_volume
+            )
+            if baked is None:
+                raise RuntimeError("Could not rebuild labelmap from surface.")
+
+            slicer.util.updateSegmentBinaryLabelmapFromArray(
+                baked.astype(np.uint8), seg_node, segment_id, output_volume
+            )
+        except Exception as exc:  # noqa: BLE001 - never leave bad data
+            print("[nni] bake smoothed surface failed: %s" % exc)
+            if original is not None:
+                try:
+                    slicer.util.updateSegmentBinaryLabelmapFromArray(
+                        original.astype(np.uint8),
+                        seg_node,
+                        segment_id,
+                        output_volume,
+                    )
+                except Exception:
+                    pass
+            slicer.util.showStatusMessage(
+                "Bake failed; the original segment was restored.", 5000
+            )
+            return
+
+        # The stored data is now smooth, so drop the display-only override and
+        # push the baked mask to the server.
+        if hasattr(self, "ui"):
+            blocked = self.ui.cbDisplaySmooth.blockSignals(True)
+            self.ui.cbDisplaySmooth.setChecked(False)
+            self.ui.cbDisplaySmooth.blockSignals(blocked)
+            qt.QSettings().setValue(
+                "SlicerNNInteractive/display_smooth_enabled", False
+            )
+        self._clear_display_smoothing()
+        self._refresh_display_smooth_ui()
+        self.upload_segment_to_server()
+        slicer.util.showStatusMessage(
+            "Smoothed surface baked into the segment.", 4000
+        )
+
     # -- Lasso slice-range clipping (keep only the lasso slice +/- N) --
 
     def _get_lasso_clip_enabled(self):
@@ -3261,12 +3498,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Refresh the operand selector when segments are added/removed/renamed."""
         self.populate_operand_selector()
         self._sync_opacity_slider_from_segment()
+        self._reapply_display_smoothing_if_active()
 
     def on_segment_editor_node_modified(self, caller, event):
         """Refresh observers and operand list when the node/segment selection changes."""
         self._observe_active_segmentation()
         self.populate_operand_selector()
         self._sync_opacity_slider_from_segment()
+        self._reapply_display_smoothing_if_active()
 
     # -- ROI operand --
 
