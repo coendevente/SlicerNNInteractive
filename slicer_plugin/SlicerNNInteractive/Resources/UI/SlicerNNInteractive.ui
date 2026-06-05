@@ -970,6 +970,19 @@
          </layout>
         </item>
         <item>
+         <widget class="QCheckBox" name="cbSnapSlicesToGrid">
+          <property name="toolTip">
+           <string>Snap mouse-wheel and slider scrolling in the three slice views to each view's own background voxel grid, so every step lands on a real slice instead of an interpolated in-between frame.</string>
+          </property>
+          <property name="text">
+           <string>Snap scrolling to original slices (no interpolated frames)</string>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="QGroupBox" name="highResOutputGroup">
           <property name="title">
            <string>High-resolution output (optional)</string>

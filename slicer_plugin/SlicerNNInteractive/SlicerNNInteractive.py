@@ -306,6 +306,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.setup_prompts()
 
         self.enable_slice_intersections()
+        # Snap slice-view scrolling to each view's own voxel grid so the mouse
+        # wheel lands on real slices, not interpolated in-between frames. State is
+        # installed here from the persisted setting; init_ui_functionality only
+        # reflects it in the checkbox (with signals blocked).
+        self._slice_snap_observers = []
+        self._snapping_in_progress = False
+        self._refresh_slice_snap()
         self.init_ui_functionality()
 
         _ = self.get_current_segment_id()
@@ -352,6 +359,105 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         return True
 
+    def _get_snap_slices_setting(self):
+        """Read whether scrolling snaps to the original voxel grid. Default True."""
+        v = qt.QSettings().value("SlicerNNInteractive/snap_slices_to_grid", True)
+        if isinstance(v, str):
+            return v.lower() == "true"
+        return bool(v)
+
+    def _iter_standard_slice_logics(self):
+        """Yield (view_name, sliceLogic, sliceNode) for the three standard views.
+
+        Views not currently realized in the layout are skipped.
+        """
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return
+        for view_name in PLANE_DISPLAY_SELECTOR_NAMES:
+            slice_widget = layout_manager.sliceWidget(view_name)
+            if slice_widget is None:
+                continue
+            slice_logic = slice_widget.sliceLogic()
+            slice_node = slice_widget.mrmlSliceNode()
+            if slice_logic is None or slice_node is None:
+                continue
+            yield view_name, slice_logic, slice_node
+
+    def _snap_all_slice_views(self):
+        """Snap every standard slice view's offset onto its own voxel grid."""
+        if getattr(self, "_snapping_in_progress", False):
+            return
+        self._snapping_in_progress = True
+        try:
+            for _name, slice_logic, _node in self._iter_standard_slice_logics():
+                slice_logic.SnapSliceOffsetToIJK()
+        finally:
+            self._snapping_in_progress = False
+
+    def _on_slice_node_modified(self, slice_logic, caller=None, event=None):
+        """Re-snap one slice view after its offset changed (guards recursion).
+
+        SnapSliceOffsetToIJK modifies the slice node, which re-fires this same
+        observer; the in-progress flag short-circuits that recursion.
+        """
+        if self._snapping_in_progress:
+            return
+        self._snapping_in_progress = True
+        try:
+            slice_logic.SnapSliceOffsetToIJK()
+        finally:
+            self._snapping_in_progress = False
+
+    def _install_slice_snap_observers(self):
+        """Observe the three standard slice nodes and snap offsets to the grid."""
+        self._remove_slice_snap_observers()
+        for _name, slice_logic, slice_node in self._iter_standard_slice_logics():
+            # Bind this view's logic per-iteration so each callback snaps its own
+            # view (default-arg capture avoids late binding in the loop).
+            callback = (
+                lambda caller, event, logic=slice_logic: self._on_slice_node_modified(
+                    logic, caller, event
+                )
+            )
+            tag = slice_node.AddObserver(vtk.vtkCommand.ModifiedEvent, callback)
+            self._slice_snap_observers.append((slice_node, tag))
+        # Align the current views at once so the effect is visible immediately.
+        self._snap_all_slice_views()
+
+    def _remove_slice_snap_observers(self):
+        """Drop any installed slice-node snap observers."""
+        for slice_node, tag in getattr(self, "_slice_snap_observers", []):
+            if slice_node is not None:
+                slice_node.RemoveObserver(tag)
+        self._slice_snap_observers = []
+
+    def _refresh_slice_snap(self):
+        """Install or remove the snap observers to match the persisted setting."""
+        if not hasattr(self, "_slice_snap_observers"):
+            self._slice_snap_observers = []
+        if not hasattr(self, "_snapping_in_progress"):
+            self._snapping_in_progress = False
+        if self._get_snap_slices_setting():
+            self._install_slice_snap_observers()
+        else:
+            self._remove_slice_snap_observers()
+
+    def _on_snap_slices_changed(self, checked):
+        """Persist the snap-to-grid toggle and (un)install the observers."""
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/snap_slices_to_grid", bool(checked)
+        )
+        self._refresh_slice_snap()
+        if checked:
+            slicer.util.showStatusMessage(
+                "Slice scrolling now snaps to the original voxel grid.", 4000
+            )
+        else:
+            slicer.util.showStatusMessage(
+                "Slice scrolling restored to Slicer default.", 4000
+            )
+
     def _apply_plane_display_volumes(self, show_status=False):
         """Apply the configured supplemental backgrounds to standard slice views."""
         source_volume = self.get_volume_node()
@@ -384,6 +490,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     4000,
                 )
             return False
+
+        # A new background has a different voxel grid, so re-align the offsets.
+        # Changing the composite node does not fire the slice-node observer.
+        if self._get_snap_slices_setting():
+            self._snap_all_slice_views()
 
         if show_status:
             slicer.util.showStatusMessage(
@@ -483,6 +594,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 4000,
             )
             return
+
+        # The source volume grid differs from the previous backgrounds; re-snap.
+        if self._get_snap_slices_setting():
+            self._snap_all_slice_views()
 
         slicer.util.showStatusMessage(
             "Restored the Segment Editor source volume in all slice views.",
@@ -1571,6 +1686,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.cbEnableHighResOutput.setChecked(self._get_high_res_enabled_setting())
         self.ui.cbEnableHighResOutput.blockSignals(blocked)
 
+        # Snap slice scrolling to the original voxel grid (no interpolated frames).
+        # Observers are already installed from the constructor per the persisted
+        # setting, so set the widget with signals blocked to avoid a redundant
+        # reinstall here.
+        self.ui.cbSnapSlicesToGrid.toggled.connect(self._on_snap_slices_changed)
+        blocked = self.ui.cbSnapSlicesToGrid.blockSignals(True)
+        self.ui.cbSnapSlicesToGrid.setChecked(self._get_snap_slices_setting())
+        self.ui.cbSnapSlicesToGrid.blockSignals(blocked)
+
         # Smooth (interpolated) results. Only honor the persisted preference when
         # the high-resolution output it depends on is actually enabled; otherwise
         # start unchecked rather than silently building a fine grid at startup.
@@ -1774,6 +1898,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Clean up resources when the module is closed.
         """
         self.removeObservers()
+        self._remove_slice_snap_observers()
 
         # Tear down the hidden lasso (3D) Scissors editor and region/preview nodes.
         self._destroy_lasso3d()
