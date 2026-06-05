@@ -32,6 +32,15 @@ from PythonQt.QtGui import QMessageBox
 
 DEBUG_MODE = False
 
+PLUGIN_VERSION = "1.1.0"
+print("[nni] SlicerNNInteractive build loaded:", PLUGIN_VERSION)
+
+# A volume counts as oblique (and gets rotated to its own acquisition plane) when
+# any IJK axis tilts more than ~2.5 degrees off the nearest RAS axis. The test
+# compares each axis' largest direction-cosine against cos(2.5deg).
+OBLIQUE_COS_THRESHOLD = 0.999
+
+
 PLANE_DISPLAY_SELECTOR_NAMES = {
     "Red": "cbRedDisplayVolume",
     "Yellow": "cbYellowDisplayVolume",
@@ -135,8 +144,10 @@ class SlicerNNInteractive(ScriptedLoadableModule):
         self.parent.helpText = """
             This is an 3D Slicer extension for using nnInteractive.
 
+            Build: %s
+
             Read more about this plugin here: https://github.com/coendevente/SlicerNNInteractive.
-            """
+            """ % PLUGIN_VERSION
         self.parent.acknowledgementText = """When using SlicerNNInteractive, please cite as described here: https://github.com/coendevente/SlicerNNInteractive?tab=readme-ov-file#citation."""
 
 
@@ -312,6 +323,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # reflects it in the checkbox (with signals blocked).
         self._slice_snap_observers = []
         self._snapping_in_progress = False
+        self._snap_last_offset = {}
         self._refresh_slice_snap()
         self.init_ui_functionality()
 
@@ -384,46 +396,112 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 continue
             yield view_name, slice_logic, slice_node
 
-    def _snap_all_slice_views(self):
-        """Snap every standard slice view's offset onto its own voxel grid."""
+    def _view_background_volume(self, view_name):
+        """Return the background volume node for one slice view, or None."""
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return None
+        slice_widget = layout_manager.sliceWidget(view_name)
+        if slice_widget is None:
+            return None
+        composite_node = slice_widget.mrmlSliceCompositeNode()
+        if composite_node is None:
+            return None
+        volume_id = composite_node.GetBackgroundVolumeID()
+        if not volume_id:
+            return None
+        return slicer.mrmlScene.GetNodeByID(volume_id)
+
+    def _volume_is_oblique(self, volume):
+        """True when the volume's axes are not aligned with the RAS axes.
+
+        Each column of the IJK-to-RAS direction matrix is a unit IJK axis. An
+        axis-aligned volume has one component at magnitude 1 and the rest near 0
+        in every column. We flag the volume oblique when any column's largest
+        component drops below cos(threshold), i.e. that axis is tilted off RAS.
+        """
+        if volume is None:
+            return False
+        get_dirs = getattr(volume, "GetIJKToRASDirectionMatrix", None)
+        if get_dirs is None:
+            return False
+        matrix = vtk.vtkMatrix4x4()
+        get_dirs(matrix)
+        for col in range(3):
+            largest = max(abs(matrix.GetElement(row, col)) for row in range(3))
+            if largest < OBLIQUE_COS_THRESHOLD:
+                return True
+        return False
+
+    def _align_views_to_volume_planes(self):
+        """Rotate oblique-series views to their acquisition plane, then snap.
+
+        For an obliquely acquired series the standard RAS views reslice it at an
+        angle, so scrolling never lands on the real acquired slices. Rotating each
+        view to the volume plane straightens the image, aligns the slice-
+        intersection cross to the real series axes, and makes one view step
+        through the original slices. Axis-aligned volumes are left untouched
+        (rotating would be a no-op and could override a manual orientation). After
+        rotating, snap the offset onto the nearest slice center.
+        """
         if getattr(self, "_snapping_in_progress", False):
             return
         self._snapping_in_progress = True
         try:
-            for _name, slice_logic, _node in self._iter_standard_slice_logics():
+            for view_name, slice_logic, slice_node in (
+                self._iter_standard_slice_logics()
+            ):
+                volume = self._view_background_volume(view_name)
+                rotated = False
+                if volume is not None and self._volume_is_oblique(volume):
+                    slice_node.RotateToVolumePlane(volume)
+                    rotated = True
                 slice_logic.SnapSliceOffsetToIJK()
+                self._snap_last_offset[view_name] = slice_logic.GetSliceOffset()
         finally:
             self._snapping_in_progress = False
 
-    def _on_slice_node_modified(self, slice_logic, caller=None, event=None):
+    def _on_slice_node_modified(
+        self, view_name, slice_logic, caller=None, event=None
+    ):
         """Re-snap one slice view after its offset changed (guards recursion).
 
         SnapSliceOffsetToIJK modifies the slice node, which re-fires this same
-        observer; the in-progress flag short-circuits that recursion.
+        observer; the in-progress flag short-circuits that recursion. ModifiedEvent
+        also fires for non-offset changes (field of view, orientation), so we only
+        act when the offset actually moved since we last saw this view.
         """
         if self._snapping_in_progress:
+            return
+        before = slice_logic.GetSliceOffset()
+        last = self._snap_last_offset.get(view_name)
+        if last is not None and abs(before - last) < 1e-4:
+            # Offset unchanged; this Modified came from something else. Ignore.
             return
         self._snapping_in_progress = True
         try:
             slice_logic.SnapSliceOffsetToIJK()
         finally:
             self._snapping_in_progress = False
+        self._snap_last_offset[view_name] = slice_logic.GetSliceOffset()
 
     def _install_slice_snap_observers(self):
         """Observe the three standard slice nodes and snap offsets to the grid."""
         self._remove_slice_snap_observers()
-        for _name, slice_logic, slice_node in self._iter_standard_slice_logics():
-            # Bind this view's logic per-iteration so each callback snaps its own
-            # view (default-arg capture avoids late binding in the loop).
+        self._snap_last_offset = {}
+        installed = []
+        for view_name, slice_logic, slice_node in self._iter_standard_slice_logics():
+            # Bind this view per-iteration so each callback snaps its own view
+            # (default-arg capture avoids late binding in the loop).
             callback = (
-                lambda caller, event, logic=slice_logic: self._on_slice_node_modified(
-                    logic, caller, event
+                lambda caller, event, name=view_name, logic=slice_logic: (
+                    self._on_slice_node_modified(name, logic, caller, event)
                 )
             )
             tag = slice_node.AddObserver(vtk.vtkCommand.ModifiedEvent, callback)
             self._slice_snap_observers.append((slice_node, tag))
         # Align the current views at once so the effect is visible immediately.
-        self._snap_all_slice_views()
+        self._align_views_to_volume_planes()
 
     def _remove_slice_snap_observers(self):
         """Drop any installed slice-node snap observers."""
@@ -438,7 +516,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._slice_snap_observers = []
         if not hasattr(self, "_snapping_in_progress"):
             self._snapping_in_progress = False
-        if self._get_snap_slices_setting():
+        if not hasattr(self, "_snap_last_offset"):
+            self._snap_last_offset = {}
+        enabled = self._get_snap_slices_setting()
+        if enabled:
             self._install_slice_snap_observers()
         else:
             self._remove_slice_snap_observers()
@@ -491,10 +572,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
             return False
 
-        # A new background has a different voxel grid, so re-align the offsets.
+        # A new background may be an oblique series; re-align views to it.
         # Changing the composite node does not fire the slice-node observer.
         if self._get_snap_slices_setting():
-            self._snap_all_slice_views()
+            self._align_views_to_volume_planes()
 
         if show_status:
             slicer.util.showStatusMessage(
@@ -595,9 +676,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
-        # The source volume grid differs from the previous backgrounds; re-snap.
+        # Backgrounds changed; re-align views (and straighten any oblique series).
         if self._get_snap_slices_setting():
-            self._snap_all_slice_views()
+            self._align_views_to_volume_planes()
 
         slicer.util.showStatusMessage(
             "Restored the Segment Editor source volume in all slice views.",

@@ -972,10 +972,10 @@
         <item>
          <widget class="QCheckBox" name="cbSnapSlicesToGrid">
           <property name="toolTip">
-           <string>Snap mouse-wheel and slider scrolling in the three slice views to each view's own background voxel grid, so every step lands on a real slice instead of an interpolated in-between frame.</string>
+           <string>For obliquely acquired series, the standard axial/sagittal/coronal views reslice the volume at an angle, so scrolling never lands on the real acquired slices. Enable this to rotate the slice views to the series' own acquisition planes: the image is straightened, the slice-intersection cross follows the real series axes, and one view scrolls through the original slices. Axis-aligned series are left unchanged.</string>
           </property>
           <property name="text">
-           <string>Snap scrolling to original slices (no interpolated frames)</string>
+           <string>Align views to the acquisition plane for oblique series</string>
           </property>
           <property name="checked">
            <bool>true</bool>
