@@ -1,6 +1,7 @@
 FROM nvidia/cuda:12.1.0-devel-ubuntu20.04
 
-RUN apt-get update && apt-get install -y wget && \
+RUN apt-get update && apt-get install -y wget ca-certificates && \
+    update-ca-certificates && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m user 
@@ -20,7 +21,7 @@ RUN /bin/bash -c "\
     source /opt/conda/etc/profile.d/conda.sh && \
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
-    conda create -y -n nnInteractive python=3.12 -c conda-forge --override-channels && \
+    conda create -y -n nnInteractive python=3.12 pip ca-certificates -c conda-forge --override-channels && \
     conda clean -afy \
 "
 
