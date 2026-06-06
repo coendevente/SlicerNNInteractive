@@ -470,6 +470,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         observer; the in-progress flag short-circuits that recursion. ModifiedEvent
         also fires for non-offset changes (field of view, orientation), so we only
         act when the offset actually moved since we last saw this view.
+
+        Slicer's default scroll step (~1-2 mm) is often smaller than the voxel
+        spacing (e.g. 5 mm), so a naive nearest-voxel snap bounces back to the
+        same slice every tick. When that happens we detect the scroll direction and
+        force exactly one voxel step so every wheel event advances one real slice.
         """
         if self._snapping_in_progress:
             return
@@ -478,9 +483,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if last is not None and abs(before - last) < 1e-4:
             # Offset unchanged; this Modified came from something else. Ignore.
             return
+        direction = 1.0 if (last is None or before > last) else -1.0
         self._snapping_in_progress = True
         try:
             slice_logic.SnapSliceOffsetToIJK()
+            snapped = slice_logic.GetSliceOffset()
+            # If the snap landed back on the same slice (scroll delta was too
+            # small to cross the half-voxel threshold), nudge one full step in
+            # the scroll direction so every wheel tick advances exactly one layer.
+            if last is not None and abs(snapped - last) < 1e-4:
+                spacing = slice_logic.GetLowestVolumeSliceSpacing()
+                step = spacing[2] if spacing and len(spacing) > 2 else 0.0
+                if step > 1e-4:
+                    slice_logic.SetSliceOffset(last + direction * step)
+                    slice_logic.SnapSliceOffsetToIJK()
         finally:
             self._snapping_in_progress = False
         self._snap_last_offset[view_name] = slice_logic.GetSliceOffset()
