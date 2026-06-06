@@ -184,6 +184,8 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                         mask,
                         prompt_name
                     )
+
+            self._verify_bounded_undo_redo(widget)
         finally:
             self.tearDown()
 
@@ -270,6 +272,52 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             segmentation_node, segment_id, widget.get_volume_node()
         )
         return labelmap.astype(np.uint8)
+
+    def _current_segment_mask(self, widget):
+        segmentation_node, segment_id = widget.get_selected_segmentation_node_and_segment_id()
+        labelmap = slicer.util.arrayFromSegmentBinaryLabelmap(
+            segmentation_node, segment_id, widget.get_volume_node()
+        )
+        return labelmap.astype(np.uint8)
+
+    def _verify_bounded_undo_redo(self, widget):
+        widget.clear_current_segment()
+
+        prompt_sequence = [
+            positive([141, 114, 85]),
+            positive([109, 114, 58]),
+            positive([177, 114, 38]),
+        ]
+
+        masks = []
+        for interaction in prompt_sequence:
+            masks.append(
+                self._trigger_point_prompt(widget, interaction["coords"], interaction["positive"])
+            )
+
+        widget.undo_prompt()
+        slicer.app.processEvents()
+        self.assertTrue(np.array_equal(self._current_segment_mask(widget), masks[1]))
+
+        widget.undo_prompt()
+        slicer.app.processEvents()
+        self.assertTrue(np.array_equal(self._current_segment_mask(widget), masks[0]))
+
+        widget.undo_prompt()
+        slicer.app.processEvents()
+        self.assertTrue(np.array_equal(self._current_segment_mask(widget), masks[0]))
+
+        widget.redo_prompt()
+        slicer.app.processEvents()
+        self.assertTrue(np.array_equal(self._current_segment_mask(widget), masks[1]))
+
+        widget.redo_prompt()
+        slicer.app.processEvents()
+        self.assertTrue(np.array_equal(self._current_segment_mask(widget), masks[2]))
+
+        widget.redo_prompt()
+        slicer.app.processEvents()
+        self.assertTrue(np.array_equal(self._current_segment_mask(widget), masks[2]))
 
     def _trigger_scribble_prompt(self, widget, interaction):
         mask = self._build_scribble_mask(widget, interaction)

@@ -9,6 +9,7 @@ import importlib.util
 
 import numpy as np
 from pathlib import Path
+from collections import deque
 
 import slicer
 import qt
@@ -178,10 +179,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.all_prompt_buttons = {}
         self.setup_prompts()
 
+        self.max_history_depth = 2
+        self._is_replaying_history = False
+        self._active_request_count = 0
+        self._history_state = None
+
         self.init_ui_functionality()
 
         _ = self.get_current_segment_id()
         self.previous_states = {}
+        self.reset_prompt_history()
 
     def init_ui_functionality(self):
         """
@@ -194,7 +201,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.Server.text = savedServer
         self.server = savedServer.rstrip("/")
 
+        settings = qt.QSettings()
+        saved_history_depth = settings.value(
+            "SlicerNNInteractive/maxHistoryDepth", self.max_history_depth
+        )
+        self.set_max_history_depth(saved_history_depth, update_widget=False)
+        self.ui.sbHistoryDepth.value = self.max_history_depth
+
         self.ui.Server.editingFinished.connect(self.update_server)
+        self.ui.sbHistoryDepth.valueChanged.connect(self.on_history_depth_changed)
         self.ui.pbTestServer.clicked.connect(self.test_server_connection)
 
         # Set initial prompt type
@@ -235,6 +250,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             "r": self.clear_current_segment,
             "Shift+L": self.submit_lasso_if_present,
             "t": self.toggle_prompt_type,  # Add 'T' shortcut to toggle between positive/negative
+            "Ctrl+Z": self.undo_prompt,
+            "Ctrl+Y": self.redo_prompt,
         }
         self.shortcut_items = {}
 
@@ -568,6 +585,192 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             for i in range(n):
                 node.RemoveNthControlPoint(0)
 
+    def make_history_entry(self, prompt_type, positive_click, payload, segmentation_mask):
+        return {
+            "type": prompt_type,
+            "positive": bool(positive_click),
+            "payload": payload,
+            "mask": np.array(segmentation_mask, dtype=np.uint8, copy=True),
+        }
+
+    def reset_prompt_history(self, baseline_mask=None):
+        if baseline_mask is None:
+            image_data = self.get_image_data()
+            if image_data is not None:
+                baseline_mask = np.zeros(image_data.shape, dtype=np.uint8)
+            else:
+                baseline_mask = np.zeros((0,), dtype=np.uint8)
+        else:
+            baseline_mask = np.array(baseline_mask, dtype=np.uint8, copy=True)
+
+        self._history_state = {
+            "base_mask": baseline_mask,
+            "past": deque(),
+            "future": deque(),
+        }
+
+    def history_can_undo(self):
+        return bool(self._history_state and self._history_state["past"])
+
+    def history_can_redo(self):
+        return bool(self._history_state and self._history_state["future"])
+
+    def record_history_entry(self, prompt_type, positive_click, payload, segmentation_mask):
+        if self._is_replaying_history:
+            return
+
+        if self._history_state is None:
+            self.reset_prompt_history()
+
+        self._history_state["future"].clear()
+        if len(self._history_state["past"]) >= self.max_history_depth:
+            dropped_entry = self._history_state["past"].popleft()
+            self._history_state["base_mask"] = np.array(
+                dropped_entry["mask"], dtype=np.uint8, copy=True
+            )
+
+        entry = self.make_history_entry(
+            prompt_type=prompt_type,
+            positive_click=positive_click,
+            payload=payload,
+            segmentation_mask=segmentation_mask,
+        )
+        self._history_state["past"].append(entry)
+
+    def set_history_base_mask(self, baseline_mask):
+        baseline_mask = np.array(baseline_mask, dtype=np.uint8, copy=True)
+        if self._history_state is None:
+            self.reset_prompt_history(baseline_mask=baseline_mask)
+            return
+
+        self._history_state["base_mask"] = baseline_mask
+        self._history_state["past"].clear()
+        self._history_state["future"].clear()
+
+    def set_max_history_depth(self, max_history_depth, update_widget=True):
+        max_history_depth = max(1, int(max_history_depth))
+        self.max_history_depth = max_history_depth
+
+        if update_widget and hasattr(self, "ui") and hasattr(self.ui, "sbHistoryDepth"):
+            blocker = qt.QSignalBlocker(self.ui.sbHistoryDepth)
+            self.ui.sbHistoryDepth.value = self.max_history_depth
+            del blocker
+
+        if self._history_state is None:
+            return
+
+        while len(self._history_state["past"]) > self.max_history_depth:
+            dropped_entry = self._history_state["past"].popleft()
+            self._history_state["base_mask"] = np.array(
+                dropped_entry["mask"], dtype=np.uint8, copy=True
+            )
+
+        while len(self._history_state["future"]) > self.max_history_depth:
+            self._history_state["future"].pop()
+
+    def on_history_depth_changed(self, value):
+        self.set_max_history_depth(value, update_widget=False)
+        settings = qt.QSettings()
+        settings.setValue("SlicerNNInteractive/maxHistoryDepth", self.max_history_depth)
+
+    def build_history_payload(self, **kwargs):
+        payload = {}
+        for key, value in kwargs.items():
+            if isinstance(value, np.ndarray):
+                payload[key] = np.array(value, copy=True)
+            elif isinstance(value, list):
+                payload[key] = list(value)
+            else:
+                payload[key] = value
+        return payload
+
+    def cancel_pending_lasso(self):
+        lasso_node = self.prompt_types["lasso"]["node"]
+        if lasso_node is None:
+            return False
+
+        if lasso_node.GetNumberOfControlPoints() < 1:
+            return False
+
+        self.on_lasso_cancel_clicked()
+        self.ui.pbInteractionLasso.setChecked(False)
+        return True
+
+    def apply_history_state(self, target_entries):
+        if self._history_state is None:
+            return
+
+        base_mask = np.array(self._history_state["base_mask"], dtype=np.uint8, copy=True)
+        self.show_segmentation(base_mask)
+        upload_result = self.upload_segment_to_server()
+        if upload_result is None:
+            raise RuntimeError("Failed to synchronize base segment during history replay.")
+
+        if not target_entries:
+            return
+
+        self._is_replaying_history = True
+        try:
+            for entry in target_entries:
+                self.replay_history_entry(entry)
+        finally:
+            self._is_replaying_history = False
+
+        self.show_segmentation(target_entries[-1]["mask"])
+
+    def replay_history_entry(self, entry):
+        prompt_type = entry["type"]
+        payload = entry["payload"]
+        positive_click = entry["positive"]
+
+        if prompt_type == "point":
+            self.point_prompt(
+                xyz=payload["xyz"],
+                positive_click=positive_click,
+                sync=False,
+                record_history=False,
+            )
+        elif prompt_type == "bbox":
+            self.bbox_prompt(
+                outer_point_one=payload["outer_point_one"],
+                outer_point_two=payload["outer_point_two"],
+                positive_click=positive_click,
+                sync=False,
+                record_history=False,
+            )
+        elif prompt_type in ["lasso", "scribble"]:
+            self.lasso_or_scribble_prompt(
+                mask=payload["mask"],
+                positive_click=positive_click,
+                tp=prompt_type,
+                sync=False,
+                record_history=False,
+            )
+        elif prompt_type == "clear":
+            # "Clear" is a no-op during replay because show_segmentation is called on masks
+            pass
+        else:
+            raise ValueError(f"Unknown prompt type '{prompt_type}' in history replay.")
+
+    def undo_prompt(self):
+        if self.cancel_pending_lasso():
+            return
+
+        if self._active_request_count > 0 or not self.history_can_undo():
+            return
+
+        entry = self._history_state["past"].pop()
+        self._history_state["future"].appendleft(entry)
+        self.apply_history_state(list(self._history_state["past"]))
+
+    def redo_prompt(self):
+        if self._active_request_count > 0 or not self.history_can_redo():
+            return
+
+        entry = self._history_state["future"].popleft()
+        self._history_state["past"].append(entry)
+        self.apply_history_state(list(self._history_state["past"]))
+
     def on_place_button_clicked(self, checked, prompt_name):
         self.setup_prompts(skip_if_exists=True)
 
@@ -643,11 +846,32 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if volume_node:
             self.point_prompt(xyz=xyz, positive_click=self.is_positive)
 
-    @ensure_synched
-    def point_prompt(self, xyz=None, positive_click=False):
+    def point_prompt(self, xyz=None, positive_click=False, sync=True, record_history=True):
         """
         Uploads point prompt to the server.
         """
+        if sync:
+            return self._point_prompt_synched(
+                xyz=xyz,
+                positive_click=positive_click,
+                record_history=record_history,
+            )
+
+        return self._point_prompt_impl(
+            xyz=xyz,
+            positive_click=positive_click,
+            record_history=record_history,
+        )
+
+    @ensure_synched
+    def _point_prompt_synched(self, xyz=None, positive_click=False, record_history=True):
+        return self._point_prompt_impl(
+            xyz=xyz,
+            positive_click=positive_click,
+            record_history=record_history,
+        )
+
+    def _point_prompt_impl(self, xyz=None, positive_click=False, record_history=True):
         url = f"{self.server}/add_point_interaction"
 
         seg_response = self.request_to_server(
@@ -662,6 +886,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         debug_print(f"{positive_click} point prompt triggered! {xyz}")
 
         self.show_segmentation(unpacked_segmentation)
+        if record_history:
+            self.record_history_entry(
+                prompt_type="point",
+                positive_click=positive_click,
+                payload=self.build_history_payload(xyz=xyz),
+                segmentation_mask=unpacked_segmentation,
+            )
+
+        return unpacked_segmentation
 
     #
     #  -- Bounding Box
@@ -709,11 +942,35 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self.prev_caller = caller
 
-    @ensure_synched
-    def bbox_prompt(self, outer_point_one, outer_point_two, positive_click=False):
+    def bbox_prompt(self, outer_point_one, outer_point_two, positive_click=False, sync=True, record_history=True):
         """
         Uploads BBox prompt to the server.
         """
+        if sync:
+            return self._bbox_prompt_synched(
+                outer_point_one=outer_point_one,
+                outer_point_two=outer_point_two,
+                positive_click=positive_click,
+                record_history=record_history,
+            )
+
+        return self._bbox_prompt_impl(
+            outer_point_one=outer_point_one,
+            outer_point_two=outer_point_two,
+            positive_click=positive_click,
+            record_history=record_history,
+        )
+
+    @ensure_synched
+    def _bbox_prompt_synched(self, outer_point_one, outer_point_two, positive_click=False, record_history=True):
+        return self._bbox_prompt_impl(
+            outer_point_one=outer_point_one,
+            outer_point_two=outer_point_two,
+            positive_click=positive_click,
+            record_history=record_history,
+        )
+
+    def _bbox_prompt_impl(self, outer_point_one, outer_point_two, positive_click=False, record_history=True):
         url = f"{self.server}/add_bbox_interaction"
 
         seg_response = self.request_to_server(
@@ -729,6 +986,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             seg_response.content, decompress=False
         )
         self.show_segmentation(unpacked_segmentation)
+        if record_history:
+            self.record_history_entry(
+                prompt_type="bbox",
+                positive_click=positive_click,
+                payload=self.build_history_payload(
+                    outer_point_one=outer_point_one,
+                    outer_point_two=outer_point_two,
+                ),
+                segmentation_mask=unpacked_segmentation,
+            )
+
+        return unpacked_segmentation
 
     #
     #  -- Lasso
@@ -832,11 +1101,35 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     #
     #  -- Lasso/scribble
     #
-    @ensure_synched
-    def lasso_or_scribble_prompt(self, mask, positive_click=False, tp="lasso"):
+    def lasso_or_scribble_prompt(self, mask, positive_click=False, tp="lasso", sync=True, record_history=True):
         """
         Uploads lasso or scribble prompt to the server.
         """
+        if sync:
+            return self._lasso_or_scribble_prompt_synched(
+                mask=mask,
+                positive_click=positive_click,
+                tp=tp,
+                record_history=record_history,
+            )
+
+        return self._lasso_or_scribble_prompt_impl(
+            mask=mask,
+            positive_click=positive_click,
+            tp=tp,
+            record_history=record_history,
+        )
+
+    @ensure_synched
+    def _lasso_or_scribble_prompt_synched(self, mask, positive_click=False, tp="lasso", record_history=True):
+        return self._lasso_or_scribble_prompt_impl(
+            mask=mask,
+            positive_click=positive_click,
+            tp=tp,
+            record_history=record_history,
+        )
+
+    def _lasso_or_scribble_prompt_impl(self, mask, positive_click=False, tp="lasso", record_history=True):
         if np.sum(mask) == 0:
             return
         
@@ -869,6 +1162,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     seg_response.content, decompress=False
                 )
                 self.show_segmentation(unpacked_segmentation)
+                if record_history:
+                    self.record_history_entry(
+                        prompt_type=tp,
+                        positive_click=positive_click,
+                        payload=self.build_history_payload(mask=np.array(mask, dtype=np.uint8, copy=True)),
+                        segmentation_mask=unpacked_segmentation,
+                    )
+                return unpacked_segmentation
             else:
                 debug_print(
                     f"lasso_or_scribble_prompt upload failed with status code: {seg_response.status_code}"
@@ -891,7 +1192,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             return
 
-        mask = slicer.util.arrayFromSegmentBinaryLabelmap(
+        mask = self.get_segment_mask_or_empty(
             self.scribble_segment_node, label_name, self.get_volume_node()
         )
 
@@ -952,6 +1253,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Make sure the right node is selected
         self.ui.editor_widget.setSegmentationNode(segmentation_node)
         self.segment_editor_node.SetSelectedSegmentID(new_segment_id)
+        self.reset_prompt_history()
 
         return segmentation_node, new_segment_id
 
@@ -968,9 +1270,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         if selected_segment_id:
             debug_print(f"Clearing segment: {selected_segment_id}")
-            self.show_segmentation(
-                np.zeros(self.get_image_data().shape, dtype=np.uint8)
+            # Record the clear action in history before resetting prompt history or clearing
+            empty_mask = self.get_empty_mask()
+            self.record_history_entry(
+                prompt_type="clear",
+                positive_click=True,
+                payload={},
+                segmentation_mask=empty_mask
             )
+            self.show_segmentation(empty_mask)
             self.setup_prompts()
             self.upload_segment_to_server()
         else:
@@ -981,6 +1289,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Updates the currently selected segment with the given binary mask array.
         """
         t0 = time.time()
+        segmentation_mask = np.array(segmentation_mask, dtype=np.uint8, copy=True)
         self.previous_states["segment_data"] = segmentation_mask
 
         segmentationNode, selectedSegmentID = (
@@ -1013,8 +1322,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # (see https://github.com/coendevente/SlicerNNInteractive/issues/38)
             segmentationNode.GetSegmentation().CollapseBinaryLabelmaps()
         
-        del segmentation_mask
-
         debug_print(f"show_segmentation took {time.time() - t0}")
 
     def get_segmentation_node(self):
@@ -1065,6 +1372,39 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         return self.ui.editor_widget.mrmlSegmentEditorNode().GetSelectedSegmentID()
 
+    def get_empty_mask(self):
+        image_data = self.get_image_data()
+        if image_data is None:
+            return np.zeros((0,), dtype=np.uint8)
+
+        return np.zeros(image_data.shape, dtype=np.uint8)
+
+    def get_segment_mask_or_empty(self, segmentation_node, segment_id, volume_node=None):
+        if segmentation_node is None or not segment_id:
+            return self.get_empty_mask()
+
+        segment = segmentation_node.GetSegmentation().GetSegment(segment_id)
+        if segment is None:
+            return self.get_empty_mask()
+
+        if volume_node is None:
+            volume_node = self.get_volume_node()
+
+        try:
+            mask = slicer.util.arrayFromSegmentBinaryLabelmap(
+                segmentation_node, segment_id, volume_node
+            )
+        except Exception as exc:
+            debug_print(
+                f"Falling back to empty mask for segment '{segment_id}': {exc}"
+            )
+            return self.get_empty_mask()
+
+        if mask is None:
+            return self.get_empty_mask()
+
+        return np.array(mask, dtype=np.uint8, copy=True)
+
     def get_segment_data(self):
         """
         Gets the labelmap array (binary) of the currently selected segment.
@@ -1073,7 +1413,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.get_selected_segmentation_node_and_segment_id()
         )
 
-        mask = slicer.util.arrayFromSegmentBinaryLabelmap(
+        mask = self.get_segment_mask_or_empty(
             segmentation_node, selected_segment_id, self.get_volume_node()
         )
         seg_data_bool = mask.astype(bool)
@@ -1098,6 +1438,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             debug_print("old_segment_data is None")
 
         debug_print(f"selected_segment_changed: {selected_segment_changed}")
+
+        if selected_segment_changed and not self._is_replaying_history:
+            self.set_history_base_mask(segment_data.astype(np.uint8))
 
         return selected_segment_changed
 
@@ -1174,50 +1517,54 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Wraps requests.post in a try/except and shows error in pop up windows if necessary.
         """
 
-        with slicer.util.tryWithErrorDisplay(_("Segmentation failed."), waitCursor=True):
+        self._active_request_count += 1
+        try:
+            with slicer.util.tryWithErrorDisplay(_("Segmentation failed."), waitCursor=True):
 
-            error_message = None
-            try:
-                response = requests.post(*args, **kwargs)
-                debug_print('response:', response)
-            except requests.exceptions.MissingSchema as e:
-                response = None
-                if self.server == "":
-                    raise RuntimeError("It seems you have not set the server URL yet. You can configure it in the 'Configuration' tab.")
-                else:
-                    raise RuntimeError(f"Server URL '{self.server}' is unreachable. You can edit the URL in the 'Configuration' tab.")
-            except requests.exceptions.ConnectionError as e:
-                response = None
-                raise RuntimeError(f"Failed to connect to server '{self.server}'. Please make sure the server is running and check the server URL in the 'Configuration' tab.")
-            except requests.exceptions.InvalidSchema as e:
-                append_text_to_error_message = ""
-                if not args[0].startswith("http://"):
-                    append_text_to_error_message = "\n\nHint: Perhaps your Server URL in the 'Configuration' tab should start with 'http://'. For example, if your server runs on localhost and port 1527, 'localhost:1527' would not work as a Server URL, while 'http://localhost:1527' would."
-                raise RuntimeError(f'{e}{append_text_to_error_message}')
-
-            if response.status_code != 200:
-                status_code = response.status_code
-                response = None
-                raise RuntimeError(f"Something has gone wrong with your request (Status code {status_code}).")
-
-            t0 = time.time()
-            # Try to parse JSON and check for a specific error.
-            content_type = response.headers.get("Content-Type", "")
-            if "application/json" in content_type:
-                resp_json = response.json()
-                if resp_json.get("status") == "error":
-                    if "No image uploaded" in resp_json.get("message", ""):
-                        debug_print("No image has been uploaded to the server. Please upload an image first.")
-                        self.upload_image_to_server()
-                        self.upload_segment_to_server()
-                        return self.request_to_server(*args, **kwargs)
+                error_message = None
+                try:
+                    response = requests.post(*args, **kwargs)
+                    debug_print('response:', response)
+                except requests.exceptions.MissingSchema as e:
+                    response = None
+                    if self.server == "":
+                        raise RuntimeError("It seems you have not set the server URL yet. You can configure it in the 'Configuration' tab.")
                     else:
-                        response = None
-                        raise RuntimeError(f"Server error: {resp_json.get('message', 'Unknown error')}")
+                        raise RuntimeError(f"Server URL '{self.server}' is unreachable. You can edit the URL in the 'Configuration' tab.")
+                except requests.exceptions.ConnectionError as e:
+                    response = None
+                    raise RuntimeError(f"Failed to connect to server '{self.server}'. Please make sure the server is running and check the server URL in the 'Configuration' tab.")
+                except requests.exceptions.InvalidSchema as e:
+                    append_text_to_error_message = ""
+                    if not args[0].startswith("http://"):
+                        append_text_to_error_message = "\n\nHint: Perhaps your Server URL in the 'Configuration' tab should start with 'http://'. For example, if your server runs on localhost and port 1527, 'localhost:1527' would not work as a Server URL, while 'http://localhost:1527' would."
+                    raise RuntimeError(f'{e}{append_text_to_error_message}')
 
-            debug_print('1157 took', time.time() - t0)
+                if response.status_code != 200:
+                    status_code = response.status_code
+                    response = None
+                    raise RuntimeError(f"Something has gone wrong with your request (Status code {status_code}).")
 
-        return response
+                t0 = time.time()
+                # Try to parse JSON and check for a specific error.
+                content_type = response.headers.get("Content-Type", "")
+                if "application/json" in content_type:
+                    resp_json = response.json()
+                    if resp_json.get("status") == "error":
+                        if "No image uploaded" in resp_json.get("message", ""):
+                            debug_print("No image has been uploaded to the server. Please upload an image first.")
+                            self.upload_image_to_server()
+                            self.upload_segment_to_server()
+                            return self.request_to_server(*args, **kwargs)
+                        else:
+                            response = None
+                            raise RuntimeError(f"Server error: {resp_json.get('message', 'Unknown error')}")
+
+                debug_print('1157 took', time.time() - t0)
+
+            return response
+        finally:
+            self._active_request_count -= 1
 
     def upload_image_to_server(self):
         """
