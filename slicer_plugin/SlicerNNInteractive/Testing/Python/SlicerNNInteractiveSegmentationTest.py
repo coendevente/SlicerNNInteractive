@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+import qt
 import SimpleITK as sitk
 import slicer
 from SampleData import SampleDataLogic
@@ -206,33 +207,36 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         widget.ui.editor_widget.setSegmentationNode(segmentation_node)
         widget.ui.editor_widget.setSourceVolumeNode(volume_node)
         widget.make_new_segment()
-        image_data = slicer.util.arrayFromVolume(volume_node).copy()
-        widget.previous_states["image_data"] = image_data
-        widget.previous_states["segment_data"] = np.zeros_like(image_data, dtype=np.uint8)
-        self._ensure_server_is_ready(widget)
-        self._upload_volume_before_tests(widget)
+        self._configure_session(widget)
         return widget
 
-    def _ensure_server_is_ready(self, widget):
+    def _configure_session(self, widget):
+        """
+        Configure and start an nnInteractive session for the tests. If
+        ``SLICER_NNI_TEST_SERVER_URL`` is set we use remote mode against that
+        server; otherwise we use an in-process local session (no server needed).
+        """
+        settings = qt.QSettings()
         server_override = os.environ.get("SLICER_NNI_TEST_SERVER_URL", "").strip()
         if server_override:
+            settings.setValue("SlicerNNInteractive/mode", "remote")
+            settings.setValue("SlicerNNInteractive/server", server_override.rstrip("/"))
             widget.server = server_override.rstrip("/")
             widget.ui.Server.setText(widget.server)
-        if not getattr(widget, "server", ""):
+        else:
+            settings.setValue("SlicerNNInteractive/mode", "local")
+
+        if not widget.ensure_session():
             self.fail(
-                "Server URL not configured. Set it in the Slicer settings or define "
-                "SLICER_NNI_TEST_SERVER_URL before running tests."
+                "Could not start an nnInteractive session. For local tests make sure "
+                "Local mode is set up (PyTorch + nnInteractive[local]); for server "
+                "tests set SLICER_NNI_TEST_SERVER_URL to a reachable server."
             )
 
-    def _upload_volume_before_tests(self, widget):
-        # Uploading the current image to the nnInteractive server avoids requests failing
-        # with "No image uploaded" during the scripted prompts.
-        result = widget.upload_image_to_server()
-        if result is None:
-            self.fail(
-                "Failed to upload the volume to the nnInteractive server. "
-                "Verify the server is running and reachable."
-            )
+        # Push the current volume into the session (don't rely on cached state).
+        widget.previous_states.pop("image_data", None)
+        if not widget.sync_image_to_session():
+            self.fail("Failed to set the test image on the nnInteractive session.")
 
     def _trigger_point_prompt(self, widget, ijk, positive=True):
         dims = widget.get_image_data().shape  # (k, j, i)
@@ -274,8 +278,10 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
     def _trigger_scribble_prompt(self, widget, interaction):
         mask = self._build_scribble_mask(widget, interaction)
         self._save_scribble_mask(interaction["mask_name"], mask)
+        crop, bbox = widget._mask_to_crop(mask)
         widget.lasso_or_scribble_prompt(
-            mask=mask,
+            crop=crop,
+            interaction_bbox=bbox,
             positive_click=interaction["positive"],
             tp="scribble",
         )
@@ -352,8 +358,10 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
     def _trigger_lasso_prompt(self, widget, interaction):
         mask = self._build_lasso_mask(widget, interaction)
         self._save_lasso_mask(interaction["mask_name"], mask)
+        crop, bbox = widget._mask_to_crop(mask)
         widget.lasso_or_scribble_prompt(
-            mask=mask,
+            crop=crop,
+            interaction_bbox=bbox,
             positive_click=interaction["positive"],
             tp="lasso",
         )
@@ -485,8 +493,13 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         
         dice = get_dice()
         print(f'Dice score {prompt_name}: {dice:.4f}')
-        
-        dice_threshold = 0.99
+
+        # NOTE: the reference masks were frozen against nnInteractive v1. v2 inference
+        # (interaction decay, autozoom, lasso/scribble crops) can shift outputs slightly,
+        # so after migrating to v2 the references should be regenerated once
+        # (SLICER_NNI_GENERATE_TEST_MASK=1) and reviewed. SLICER_NNI_DICE_THRESHOLD can
+        # relax the bar during that transition.
+        dice_threshold = float(os.environ.get("SLICER_NNI_DICE_THRESHOLD", "0.99"))
         try:
             self.assertEqual(reference_mask.shape, result_mask.shape)
             self.assertGreater(result_mask.sum(), 0)
