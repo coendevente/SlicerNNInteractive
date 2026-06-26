@@ -203,7 +203,8 @@ This repository is available under a Apache-2.0 license (see [here](LICENSE)).
 
 This extension brings [nnInteractive](https://github.com/MIC-DKFZ/nnInteractive) into 3D Slicer.
 nnInteractive is developed at the German Cancer Research Center (DKFZ) and
-[Helmholtz Imaging](https://www.helmholtz-imaging.de/).
+[Helmholtz Imaging](https://www.helmholtz-imaging.de/), who also maintain this Slicer extension in
+part.
 
 <p align="left">
   <img src="img/DKFZ_Logo.png" alt="German Cancer Research Center (DKFZ)" height="55">
