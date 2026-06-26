@@ -104,6 +104,46 @@ class SlicerNNInteractive(ScriptedLoadableModule):
 
 
 ###############################################################################
+# Freehand-lasso input capture
+###############################################################################
+
+
+class _LassoFreehandFilter(qt.QObject):
+    """
+    Per-slice-view Qt event filter. It does two jobs:
+
+    1. Forwards mouse events to the module widget so it can capture a freehand-lasso
+       contour (``handle_lasso_event``).
+    2. Re-asserts our coloured prompt cursor on hover/move. Slice views are VTK-backed
+       (QVTKOpenGLNativeWidget) and Slicer/markups/effects reset the OS cursor on mode
+       changes and on hover, so a one-shot ``setCursor()`` does not stick -- we keep
+       re-applying it here while a tool is active (``_reassert_cursor_on_view``).
+    """
+
+    def __init__(self, module_widget, slice_widget):
+        qt.QObject.__init__(self)
+        self._module_widget = module_widget
+        self._slice_widget = slice_widget
+        self._cursor_event_types = {
+            qt.QEvent.Enter,
+            qt.QEvent.HoverEnter,
+            qt.QEvent.HoverMove,
+            qt.QEvent.MouseMove,
+        }
+
+    def eventFilter(self, obj, event):
+        mw = self._module_widget
+        if getattr(mw, "_cleanup_in_progress", False) or getattr(
+            mw, "_application_quitting", False
+        ):
+            return False
+        if event.type() in self._cursor_event_types:
+            mw._reassert_cursor_on_view(self._slice_widget)
+            mw._queue_cursor_reassert(self._slice_widget)
+        return mw.handle_lasso_event(self._slice_widget, event, obj)
+
+
+###############################################################################
 # SlicerNNInteractiveWidget
 ###############################################################################
 
@@ -1577,17 +1617,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def display_node_markup_lasso(self, display_node):
         """
-        Handles the appearance of the lasso display node.
+        The freehand lasso no longer uses a markups node for drawing -- the live
+        contour and its fill are rendered with VTK 2D overlay actors (see
+        _lasso_overlay_*). The markups "LassoPrompt" node is kept only so the existing
+        prompt/button plumbing stays uniform; hide it so it never renders anything.
         """
-        display_node.SetFillOpacity(0)
-        display_node.SetOutlineOpacity(0.5)
-        display_node.SetSelectedColor(0, 0, 1)
-        display_node.SetColor(0, 0, 1)
-        display_node.SetActiveColor(0, 0, 1)
-        display_node.SetSliceProjectionColor(0, 0, 1)
-        display_node.SetGlyphScale(1)
-        display_node.SetLineThickness(0.3)
-        display_node.SetHandlesInteractive(False)
+        display_node.SetVisibility(False)
+        display_node.SetGlyphScale(0)
         display_node.SetTextScale(0)
 
     ###############################################################################
@@ -1602,31 +1638,242 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Called when a point is placed in the scene. Grabs the point position
         and sends it to the server.
         """
+        # Point placement now runs through click capture (_place_point_from_event) in
+        # ViewTransform mode; ignore any stray markups place callback while it is active.
+        if getattr(self, "_place_tool", None) == "point":
+            return
         xyz = self.xyz_from_caller(caller)
+
+        # Colour this point by polarity: positive -> "selected" (green), negative ->
+        # "unselected" (red). This is per-control-point, so a node can hold both.
+        n = caller.GetNumberOfControlPoints()
+        if n > 0:
+            caller.SetNthControlPointSelected(n - 1, self.is_positive)
 
         volume_node = self.get_volume_node()
         if volume_node:
             self.point_prompt(xyz=xyz, positive_click=self.is_positive)
+            # Record how to undo this point's marker (the control point just placed).
+            self._push_prompt_undo(
+                self._make_control_point_undo(caller.GetID(), caller.GetNumberOfControlPoints() - 1)
+            )
 
     @ensure_synched
     def point_prompt(self, xyz=None, positive_click=False):
         """
-        Uploads point prompt to the server.
+        Adds a point interaction to the nnInteractive session.
+        ``xyz`` is in IJK (i, j, k) order; the session image is [1, k, j, i], so
+        coordinates are reversed to match the array's spatial-axis order.
         """
-        url = f"{self.server}/add_point_interaction"
-
-        seg_response = self.request_to_server(
-            url, json={"voxel_coord": xyz[::-1], "positive_click": positive_click}
-        )
-
-        unpacked_segmentation = self.unpack_binary_segmentation(
-            seg_response.content, decompress=False
-        )
-        debug_print("unpacked_segmentation.sum():", unpacked_segmentation.sum())
-        debug_print(seg_response)
         debug_print(f"{positive_click} point prompt triggered! {xyz}")
+        t0 = time.time()
+        changed_bbox = self.session.add_point_interaction(
+            xyz[::-1],
+            include_interaction=bool(positive_click),
+            run_prediction=self.auto_run,
+        )
+        t1 = time.time()
+        self.apply_result(changed_bbox)
+        debug_print(
+            f"[timing] add_point_interaction {t1 - t0:.3f}s | apply_result {time.time() - t1:.3f}s"
+        )
 
-        self.show_segmentation(unpacked_segmentation)
+    def _deactivate_capture_tools(self):
+        """Turn off the click-capture tools (point/bbox) when another tool takes over."""
+        self._place_tool = None
+        self._cancel_bbox_drag()
+        for btn in (self.ui.pbInteractionPoint, self.ui.pbInteractionBBox):
+            if btn.isChecked():
+                btn.setChecked(False)
+
+    def _place_point_from_event(self, slice_widget, event, event_widget=None):
+        """Place a point prompt at a captured left-click (point tool, ViewTransform mode).
+
+        Mirrors the lasso's display->RAS->IJK conversion, adds the visual control point
+        that markups Place mode used to add for us, and sends the point to the session.
+        """
+        slice_node = slice_widget.mrmlSliceNode()
+        slice_view = slice_widget.sliceView()
+        if slice_node is None or self.get_volume_node() is None:
+            return
+        node = self.prompt_types["point"]["node"]
+        if node is None:
+            return
+        xy = self._event_xy_in_slice_view(slice_view, event, event_widget)
+        disp = self._event_display_xy(slice_view, xy)
+        ras = slice_node.GetXYToRAS().MultiplyPoint([disp[0], disp[1], 0.0, 1.0])
+        ras3 = [ras[0], ras[1], ras[2]]
+        xyz = self.ras_to_xyz(ras3)
+        # Visual marker (markups Place mode used to add this for us); colour by polarity.
+        idx = node.AddControlPointWorld(vtk.vtkVector3d(ras3[0], ras3[1], ras3[2]))
+        node.SetNthControlPointSelected(idx, self.is_positive)
+        node.SetNthControlPointLocked(idx, True)
+        self.point_prompt(xyz=xyz, positive_click=self.is_positive)
+        self._push_prompt_undo(
+            self._make_control_point_undo(node.GetID(), node.GetNumberOfControlPoints() - 1)
+        )
+
+    # --- BBox drag-and-drop (press = first corner, drag = live box, release = box) ----
+    def _handle_bbox_drag_event(self, slice_widget, event, event_widget=None):
+        """Capture a left-button drag as a bounding box. Returns True if consumed."""
+        etype = event.type()
+        if etype == qt.QEvent.MouseButtonPress and event.button() == qt.Qt.LeftButton:
+            self._begin_bbox_drag(slice_widget, event, event_widget)
+            return True
+        if etype == qt.QEvent.MouseMove and (event.buttons() & qt.Qt.LeftButton):
+            self._update_bbox_drag(event, event_widget)
+            return True
+        if etype == qt.QEvent.MouseButtonRelease and event.button() == qt.Qt.LeftButton:
+            self._finish_bbox_drag(event, event_widget)
+            return True
+        if etype == qt.QEvent.MouseButtonDblClick and event.button() == qt.Qt.LeftButton:
+            return True
+        return False
+
+    def _begin_bbox_drag(self, slice_widget, event, event_widget=None):
+        slice_node = slice_widget.mrmlSliceNode()
+        slice_view = slice_widget.sliceView()
+        if slice_node is None or self.get_volume_node() is None:
+            self._cancel_bbox_drag()
+            return
+        xy = self._event_xy_in_slice_view(slice_view, event, event_widget)
+        disp = self._event_display_xy(slice_view, xy)
+        ras = slice_node.GetXYToRAS().MultiplyPoint([disp[0], disp[1], 0.0, 1.0])
+        color = self.COLOR_POSITIVE if self.is_positive else self.COLOR_NEGATIVE
+        self._bbox_preview_create(slice_view, color)
+        self._bbox_drag = {
+            "slice_widget": slice_widget,
+            "slice_view": slice_view,
+            "press_disp": disp,
+            "press_ras": [ras[0], ras[1], ras[2]],
+        }
+
+    def _update_bbox_drag(self, event, event_widget=None):
+        drag = getattr(self, "_bbox_drag", None)
+        if not drag:
+            return
+        xy = self._event_xy_in_slice_view(drag["slice_view"], event, event_widget)
+        disp = self._event_display_xy(drag["slice_view"], xy)
+        self._bbox_preview_update(drag["press_disp"], disp)
+
+    def _finish_bbox_drag(self, event, event_widget=None):
+        drag = getattr(self, "_bbox_drag", None)
+        self._bbox_drag = None
+        self._bbox_preview_remove()
+        if not drag or self.get_volume_node() is None:
+            return
+        slice_node = drag["slice_widget"].mrmlSliceNode()
+        if slice_node is None:
+            return
+        xy = self._event_xy_in_slice_view(drag["slice_view"], event, event_widget)
+        disp = self._event_display_xy(drag["slice_view"], xy)
+        ras = slice_node.GetXYToRAS().MultiplyPoint([disp[0], disp[1], 0.0, 1.0])
+        first_xyz = self.ras_to_xyz(drag["press_ras"])
+        second_xyz = self.ras_to_xyz([ras[0], ras[1], ras[2]])
+        if first_xyz == second_xyz:
+            return  # zero-size box (a click, not a drag) -- ignore
+        self.bbox_prompt(
+            outer_point_one=first_xyz,
+            outer_point_two=second_xyz,
+            positive_click=self.is_positive,
+        )
+        # Persist the box as a hollow outline painted into the prompt overlay, so it
+        # stays visible and tracks pan/zoom/slice like the scribble/lasso prompts (the
+        # live VTK preview is display-space only and is removed on release).
+        crop, bbox = self._bbox_outline_crop(first_xyz, second_xyz)
+        undo_overlay = (
+            self._paint_prompt_overlay(crop, bbox, self.is_positive) if crop is not None else None
+        )
+        if undo_overlay is not None:
+            label, prev = undo_overlay
+            self._push_prompt_undo(self._make_overlay_restore(label, prev))
+        else:
+            self._push_prompt_undo(lambda: None)
+
+    def _bbox_outline_crop(self, xyz_a, xyz_b):
+        """Build a 1-voxel-thick rectangle outline for the box spanning two IJK corners,
+        in the (crop, ((k0,k1),(j0,j1),(i0,i1))) form _paint_prompt_overlay expects.
+        Clamped to the image; returns (None, None) if degenerate or out of bounds."""
+        image = self.get_image_data()
+        if image is None:
+            return None, None
+        k_dim, j_dim, i_dim = image.shape  # session image array is (k, j, i)
+        ia, ja, ka = xyz_a  # ras_to_xyz returns (i, j, k)
+        ib, jb, kb = xyz_b
+        i0, i1 = max(0, min(ia, ib)), min(i_dim, max(ia, ib) + 1)
+        j0, j1 = max(0, min(ja, jb)), min(j_dim, max(ja, jb) + 1)
+        k0, k1 = max(0, min(ka, kb)), min(k_dim, max(ka, kb) + 1)
+        if i1 - i0 <= 0 or j1 - j0 <= 0 or k1 - k0 <= 0:
+            return None, None
+        crop = np.zeros((k1 - k0, j1 - j0, i1 - i0), dtype=np.uint8)
+        crop[:, 0, :] = 1
+        crop[:, -1, :] = 1
+        crop[:, :, 0] = 1
+        crop[:, :, -1] = 1
+        return crop, ((k0, k1), (j0, j1), (i0, i1))
+
+    def _cancel_bbox_drag(self):
+        """Drop any in-progress box drag and its preview."""
+        self._bbox_drag = None
+        self._bbox_preview_remove()
+
+    def _bbox_preview_create(self, slice_view, color):
+        """Live rectangle outline drawn with a VTK 2D actor in display coords (same
+        proven technique as the lasso outline)."""
+        self._bbox_preview_remove()
+        renderer = self._lasso_renderer_for(slice_view)
+        if renderer is None:
+            return False
+        points = vtk.vtkPoints()
+        pd = vtk.vtkPolyData()
+        pd.SetPoints(points)
+        coordinate = vtk.vtkCoordinate()
+        coordinate.SetCoordinateSystemToDisplay()
+        mapper = vtk.vtkPolyDataMapper2D()
+        mapper.SetTransformCoordinate(coordinate)
+        mapper.SetInputData(pd)
+        actor = vtk.vtkActor2D()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetLineWidth(2.5)
+        renderer.AddActor2D(actor)
+        self._bbox_preview = {
+            "points": points,
+            "pd": pd,
+            "actor": actor,
+            "renderer": renderer,
+            "view": slice_view,
+        }
+        return True
+
+    def _bbox_preview_update(self, disp0, disp1):
+        prev = getattr(self, "_bbox_preview", None)
+        if not prev:
+            return
+        x0, y0 = disp0
+        x1, y1 = disp1
+        pts = prev["points"]
+        pts.Reset()
+        for (x, y) in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+            pts.InsertNextPoint(x, y, 0.0)
+        lines = vtk.vtkCellArray()
+        lines.InsertNextCell(5)
+        for i in (0, 1, 2, 3, 0):
+            lines.InsertCellPoint(i)
+        prev["pd"].SetLines(lines)
+        prev["pd"].Modified()
+        prev["view"].scheduleRender()
+
+    def _bbox_preview_remove(self):
+        prev = getattr(self, "_bbox_preview", None)
+        if not prev:
+            return
+        try:
+            prev["renderer"].RemoveActor2D(prev["actor"])
+            prev["view"].scheduleRender()
+        except Exception:  # noqa: BLE001
+            pass
+        self._bbox_preview = None
 
     #
     #  -- Bounding Box
@@ -1636,6 +1883,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Every time a control point is placed/moved for the bounding box ROI node.
         Once two corners are placed, we send the bounding box to the server.
         """
+        # BBox placement now runs through drag capture (_handle_bbox_drag_event) in
+        # ViewTransform mode; ignore any stray markups place callback while it is active.
+        if getattr(self, "_place_tool", None) == "bbox":
+            return
+        self._set_node_color(caller, self.is_positive)
         xyz = self.xyz_from_caller(caller)
 
         if self.prev_caller is not None and caller.GetID() == self.prev_caller.GetID():
@@ -1662,6 +1914,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
 
                 def _next():
+                    if getattr(self, "_cleanup_in_progress", False) or getattr(
+                        self, "_application_quitting", False
+                    ):
+                        return
                     self.setup_prompts()
                     # Start placing a new box
                     self.ui.pbInteractionBBox.click()
@@ -1677,66 +1933,373 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     @ensure_synched
     def bbox_prompt(self, outer_point_one, outer_point_two, positive_click=False):
         """
-        Uploads BBox prompt to the server.
+        Adds a bounding-box interaction to the session. The two corners are given
+        in IJK (i, j, k); we reverse to (k, j, i) and build half-open intervals
+        ``[[k0, k1], [j0, j1], [i0, i1]]``. One axis is size 1 (the drawn slice),
+        which satisfies the 2D-bbox requirement of the public models.
         """
-        url = f"{self.server}/add_bbox_interaction"
-
-        seg_response = self.request_to_server(
-            url,
-            json={
-                "outer_point_one": outer_point_one[::-1],
-                "outer_point_two": outer_point_two[::-1],
-                "positive_click": positive_click,
-            },
+        p1 = outer_point_one[::-1]
+        p2 = outer_point_two[::-1]
+        bbox = [[int(min(a, b)), int(max(a, b)) + 1] for a, b in zip(p1, p2)]
+        changed_bbox = self.session.add_bbox_interaction(
+            bbox,
+            include_interaction=bool(positive_click),
+            run_prediction=self.auto_run,
         )
-
-        unpacked_segmentation = self.unpack_binary_segmentation(
-            seg_response.content, decompress=False
-        )
-        self.show_segmentation(unpacked_segmentation)
+        # The box markup is cleared right after it is sent (a fresh box placement is
+        # started), so there is no lingering marker to remove; push a no-op to keep the
+        # undo stack aligned with the session's interaction count.
+        self._push_prompt_undo(lambda: None)
+        self.apply_result(changed_bbox)
 
     #
     #  -- Lasso
     #
-    def on_lasso_placed(self, caller, event):
+    def set_lasso_active(self, active):
         """
-        Called whenever a new point is added to the lasso.
+        Enable/disable freehand-lasso mode. Unlike the other prompts the lasso is not a
+        markups Place interaction: the contour is captured from a left-mouse drag on the
+        slice views (see handle_lasso_event) and submitted on release.
         """
-        pointsDefined = self.prompt_types["lasso"]["node"].GetNumberOfControlPoints() > 0
-        self.ui.pbInteractionLassoCancel.setVisible(pointsDefined)
-
-    def on_lasso_cancel_clicked(self):
-        """
-        Called when the user clicks the cancel button for the lasso.
-        """
-        self.prompt_types["lasso"]["node"].RemoveAllControlPoints()
+        active = bool(active)
+        self._lasso_active = active
+        if self.ui.pbInteractionLasso.isChecked() != active:
+            self.ui.pbInteractionLasso.setChecked(active)
+        if active:
+            self._install_lasso_filters()
+            self._deactivate_capture_tools()  # lasso vs point/bbox are mutually exclusive
+            # Lasso and scribble paint are mutually exclusive.
+            if self.ui.pbInteractionScribble.isChecked():
+                self.ui.pbInteractionScribble.click()
+        elif self._lasso_drawing:
+            # Toggling the tool off mid-stroke discards the in-progress contour, but a
+            # completed lasso stays visible as the active prompt.
+            self._cancel_lasso_stroke()
         self.ui.pbInteractionLassoCancel.setVisible(False)
+        self._update_prompt_cursor()
+
+    def _install_lasso_filters(self):
+        """
+        Install event filters on every slice-view cursor target. The filters capture
+        freehand-lasso drags when lasso is active and keep the custom prompt cursor
+        above Slicer's markups/Paint/VTK cursor resets for all prompt tools.
+        """
+        if not hasattr(self, "_qt_event_filters"):
+            self._qt_event_filters = []
+        covered = [target for target, _ in self._qt_event_filters]
+        for slice_widget in self._slice_widgets():
+            for target in self._slice_view_cursor_targets(slice_widget):
+                if any(target is existing for existing in covered):
+                    continue
+                self._prepare_cursor_target(target)
+                event_filter = _LassoFreehandFilter(self, slice_widget)
+                target.installEventFilter(event_filter)
+                self._qt_event_filters.append((target, event_filter))
+                covered.append(target)
+
+    def handle_lasso_event(self, slice_widget, event, event_widget=None):
+        """
+        Mouse handler routed from the per-slice-view event filter. Returns True to
+        consume the event so the drag does not pan / window-level / scroll the view.
+        """
+        # Point/BBox tools: capture LEFT-click events ourselves (we run in ViewTransform
+        # mode, so right/middle button zoom/pan are handled natively and never reach here
+        # to be consumed). Only left-button events are swallowed so they don't window/level.
+        place_tool = getattr(self, "_place_tool", None)
+        if place_tool == "point" and not self._lasso_active:
+            etype = event.type()
+            if etype == qt.QEvent.MouseButtonRelease and event.button() == qt.Qt.LeftButton:
+                self._place_point_from_event(slice_widget, event, event_widget)
+                return True
+            if etype == qt.QEvent.MouseButtonPress and event.button() == qt.Qt.LeftButton:
+                return True
+            if etype == qt.QEvent.MouseButtonDblClick and event.button() == qt.Qt.LeftButton:
+                return True
+            if etype == qt.QEvent.MouseMove and (event.buttons() & qt.Qt.LeftButton):
+                return True
+        elif place_tool == "bbox" and not self._lasso_active:
+            # Drag-and-drop: press = first corner, drag = live rectangle, release = box.
+            if self._handle_bbox_drag_event(slice_widget, event, event_widget):
+                return True
+
+        if not self._lasso_active:
+            return False
+
+        event_type = event.type()
+        if event_type == qt.QEvent.MouseButtonPress:
+            if event.button() == qt.Qt.LeftButton:
+                self._begin_lasso_stroke(slice_widget, event, event_widget)
+                return True
+            if event.button() == qt.Qt.RightButton and self._lasso_drawing:
+                self._cancel_lasso_stroke()
+                return True
+        elif event_type == qt.QEvent.MouseMove:
+            if self._lasso_drawing and (event.buttons() & qt.Qt.LeftButton):
+                self._add_lasso_point(slice_widget, event, event_widget=event_widget)
+                return True
+        elif event_type == qt.QEvent.MouseButtonRelease:
+            if event.button() == qt.Qt.LeftButton and self._lasso_drawing:
+                self._finish_lasso_stroke()
+                return True
+        elif event_type == qt.QEvent.MouseButtonDblClick:
+            if event.button() == qt.Qt.LeftButton:
+                return True
+        return False
+
+    def _begin_lasso_stroke(self, slice_widget, event, event_widget=None):
+        """Start a freehand contour on the slice the user pressed in."""
+        slice_view = slice_widget.sliceView()
+        color = self.COLOR_POSITIVE if self.is_positive else self.COLOR_NEGATIVE
+        self._lasso_slice_widget = slice_widget
+        self._lasso_display_pts = []
+        self._lasso_last_xy = None
+        if not self._lasso_overlay_create(slice_view, color):
+            self._lasso_drawing = False
+            return
+        self._lasso_drawing = True
+        self._add_lasso_point(slice_widget, event, event_widget=event_widget)
+
+    def _add_lasso_point(self, slice_widget, event, min_step=2.0, event_widget=None):
+        """Append the cursor position to the live contour, throttled by pixel distance.
+
+        Points are stored in VTK display coordinates (device px, origin bottom-left) --
+        the same system the overlay actor and the slice's XYToRAS matrix both use, so
+        the live outline and the rasterized result are guaranteed to agree.
+        """
+        slice_view = slice_widget.sliceView()
+        xy = self._event_xy_in_slice_view(slice_view, event, event_widget)
+        if self._lasso_last_xy is not None:
+            dx = xy[0] - self._lasso_last_xy[0]
+            dy = xy[1] - self._lasso_last_xy[1]
+            if (dx * dx + dy * dy) < (min_step * min_step):
+                return
+        self._lasso_last_xy = xy
+        disp = self._event_display_xy(slice_view, xy)
+        self._lasso_display_pts.append(disp)
+        self._lasso_overlay_add(disp)
+
+    def _finish_lasso_stroke(self):
+        """Close the contour on left-button release, then rasterize + fill + submit it."""
+        self._lasso_drawing = False
+        self._lasso_last_xy = None
+        self._lasso_overlay_finalize()  # close the outline loop (brief preview)
+        self.submit_lasso_if_present()  # paints the persistent labelmap fill, then sends
+
+    def _cancel_lasso_stroke(self):
+        """Discard the in-progress contour without submitting."""
+        self._lasso_drawing = False
+        self._lasso_last_xy = None
+        self._lasso_display_pts = []
+        self._lasso_overlay_remove()
+
+    def _event_xy_in_slice_view(self, slice_view, event, event_widget=None):
+        """Mouse event position mapped into slice-view logical pixels."""
+        if event_widget is not None and event_widget is not slice_view:
+            try:
+                pos = event_widget.mapTo(slice_view, event.pos())
+                return (pos.x(), pos.y())
+            except Exception:  # noqa: BLE001
+                pass
+        return (event.x(), event.y())
+
+    def _event_display_xy(self, slice_view, xy):
+        """Qt mouse position -> VTK display coords (device px, origin bottom-left)."""
+        try:
+            dpr = slice_view.devicePixelRatioF()
+        except Exception:  # noqa: BLE001
+            dpr = 1.0
+        # Qt: origin top-left, logical px. VTK display: origin bottom-left, device px.
+        # NB: in Slicer's PythonQt binding QWidget.height is a property (int), not a
+        # callable -- ``slice_view.height()`` raises "'int' object is not callable".
+        x = xy[0] * dpr
+        y = (slice_view.height * dpr) - (xy[1] * dpr)
+        return (x, y)
+
+    # --- freehand overlay actors -------------------------------------------------
+    # The contour is drawn with native VTK 2D actors layered on the slice view rather
+    # than a markups node: a markups closed curve trailed the cursor, lagged a stroke
+    # behind on colour, and would not render its fill in 2D. These actors live in
+    # display coordinates so the line tracks the cursor exactly while drawing.
+
+    def _lasso_renderer_for(self, slice_view):
+        try:
+            return slice_view.renderWindow().GetRenderers().GetFirstRenderer()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _lasso_overlay_create(self, slice_view, color):
+        """Build the live outline actor for a fresh stroke (display coords, follows the
+        cursor). The persistent filled prompt is a labelmap overlay painted on release
+        (see _paint_prompt_overlay), so the outline actor is transient."""
+        self._lasso_overlay_remove()
+        renderer = self._lasso_renderer_for(slice_view)
+        if renderer is None:
+            return False
+
+        points = vtk.vtkPoints()
+        outline_pd = vtk.vtkPolyData()
+        outline_pd.SetPoints(points)
+
+        coordinate = vtk.vtkCoordinate()
+        coordinate.SetCoordinateSystemToDisplay()
+
+        outline_mapper = vtk.vtkPolyDataMapper2D()
+        outline_mapper.SetTransformCoordinate(coordinate)
+        outline_mapper.SetInputData(outline_pd)
+        outline_actor = vtk.vtkActor2D()
+        outline_actor.SetMapper(outline_mapper)
+        outline_actor.GetProperty().SetColor(*color)
+        outline_actor.GetProperty().SetLineWidth(2.5)
+
+        renderer.AddActor2D(outline_actor)
+
+        self._lasso_points = points
+        self._lasso_outline_pd = outline_pd
+        self._lasso_outline_actor = outline_actor
+        self._lasso_renderer = renderer
+        self._lasso_render_view = slice_view
+        return True
+
+    def _lasso_overlay_add(self, disp):
+        """Append a point and redraw the open polyline that follows the cursor."""
+        if self._lasso_points is None:
+            return
+        self._lasso_points.InsertNextPoint(disp[0], disp[1], 0.0)
+        n = self._lasso_points.GetNumberOfPoints()
+        lines = vtk.vtkCellArray()
+        lines.InsertNextCell(n)
+        for i in range(n):
+            lines.InsertCellPoint(i)
+        self._lasso_outline_pd.SetLines(lines)
+        self._lasso_outline_pd.Modified()
+        self._lasso_render_view.scheduleRender()
+
+    def _lasso_overlay_finalize(self):
+        """Close the outline loop (a brief filled-contour preview before the labelmap
+        overlay is painted on release)."""
+        if self._lasso_points is None or self._lasso_points.GetNumberOfPoints() < 3:
+            return
+        n = self._lasso_points.GetNumberOfPoints()
+        closed = vtk.vtkCellArray()
+        closed.InsertNextCell(n + 1)
+        for i in range(n):
+            closed.InsertCellPoint(i)
+        closed.InsertCellPoint(0)
+        self._lasso_outline_pd.SetLines(closed)
+        self._lasso_outline_pd.Modified()
+        self._lasso_render_view.scheduleRender()
+
+    def _lasso_overlay_remove(self):
+        """Remove the live outline actor from the slice view and reset overlay state."""
+        renderer = getattr(self, "_lasso_renderer", None)
+        view = getattr(self, "_lasso_render_view", None)
+        actor = getattr(self, "_lasso_outline_actor", None)
+        if renderer is not None and actor is not None:
+            renderer.RemoveActor2D(actor)
+            if view is not None:
+                view.scheduleRender()
+        self._lasso_points = None
+        self._lasso_outline_pd = None
+        self._lasso_outline_actor = None
+        self._lasso_renderer = None
+        self._lasso_render_view = None
 
     def submit_lasso_if_present(self):
         """
-        Submits the currently open lasso. We gather all the control points,
-        rasterize them into a mask, and send the mask to the server.
+        Rasterize the freehand contour into a tight 2D crop and send it (with its
+        interaction bbox) to the session. Display points are converted to RAS via the
+        stroke slice's XYToRAS, then to IJK; skimage fills the closed polygon.
         """
-        caller = self.prompt_types["lasso"]["node"]
-        xyzs = self.xyz_from_caller(caller, point_type="curve_point")
-
-        if len(xyzs) < 3:
+        pts = self._lasso_display_pts
+        slice_widget = self._lasso_slice_widget
+        if not pts or len(pts) < 3 or slice_widget is None:
+            self._lasso_overlay_remove()
+            return
+        slice_node = slice_widget.mrmlSliceNode()
+        if slice_node is None:
+            self._lasso_overlay_remove()
             return
 
-        mask = self.lasso_points_to_mask(xyzs)
+        xy_to_ras = slice_node.GetXYToRAS()
+        xyzs = []
+        for (x, y) in pts:
+            ras = xy_to_ras.MultiplyPoint([x, y, 0.0, 1.0])
+            xyzs.append(self.ras_to_xyz([ras[0], ras[1], ras[2]]))
 
-        volume_node = self.get_volume_node()
-        if volume_node:
-            self.lasso_or_scribble_prompt(
-                mask=mask, positive_click=self.is_positive, tp="lasso"
+        try:
+            crop, bbox = self.lasso_points_to_crop(xyzs)
+        except ValueError:
+            # No single constant slice axis (e.g. an oblique reformat); ignore.
+            self._lasso_overlay_remove()
+            slicer.util.showStatusMessage(
+                "Lasso must be drawn on an axial, sagittal or coronal slice.", 3000
             )
+            return
 
-            def _next():
-                self.setup_prompts()
-                # Start placing a new lasso
-                self.ui.pbInteractionLasso.click()
+        if crop is None or self.get_volume_node() is None:
+            self._lasso_overlay_remove()
+            return
 
-            qt.QTimer.singleShot(0, _next)
+        # Send the prompt FIRST so the model result is painted immediately (exactly as
+        # the bbox path does). Only then stamp the filled region into the green/red
+        # prompt-overlay labelmap so it persists and tracks pan/zoom/slice navigation.
+        # _paint_prompt_overlay does a full-volume labelmap read+write that would
+        # otherwise delay the result the user is waiting on. Drop the display-space
+        # outline actor up front so the live stroke disappears the instant the user
+        # releases, regardless of how long the prompt round-trip takes.
+        self._lasso_overlay_remove()
+        sent = self.lasso_or_scribble_prompt(
+            crop=crop,
+            interaction_bbox=bbox,
+            positive_click=self.is_positive,
+            tp="lasso",
+        )
+        if sent:
+            undo_overlay = self._paint_prompt_overlay(crop, bbox, self.is_positive)
+            if undo_overlay is not None:
+                label, prev = undo_overlay
+                self._push_prompt_undo(self._make_overlay_restore(label, prev))
+            else:
+                # Keep the undo stack paired 1:1 with session interactions.
+                self._push_prompt_undo(lambda: None)
+
+    def _paint_prompt_overlay(self, crop, bbox, positive):
+        """
+        Stamp a filled crop into the shared green/red prompt-overlay segmentation
+        (``scribble_segment_node``: fg = positive/green, bg = negative/red) so a
+        finished lasso stays visible and follows the view. The scribble diff baseline
+        is updated in lockstep so this fill is not later re-sent as a scribble.
+        """
+        node = getattr(self, "scribble_segment_node", None)
+        volume = self.get_volume_node()
+        image = self.get_image_data()
+        if node is None or volume is None or image is None:
+            return None
+        label = "fg" if positive else "bg"
+        try:
+            arr = slicer.util.arrayFromSegmentBinaryLabelmap(node, label, volume)
+        except Exception:  # noqa: BLE001
+            arr = None
+        if arr is None or arr.shape != image.shape:
+            arr = np.zeros(image.shape, dtype=np.uint8)
+        # Snapshot the label's overlay before this stroke so the stroke can be undone.
+        prev_overlay = arr.copy()
+        (k0, k1), (j0, j1), (i0, i1) = bbox
+        arr[k0:k1, j0:j1, i0:i1] = np.logical_or(
+            arr[k0:k1, j0:j1, i0:i1], crop > 0
+        ).astype(np.uint8)
+        try:
+            slicer.util.updateSegmentBinaryLabelmapFromArray(arr, node, label, volume)
+        except Exception as exc:  # noqa: BLE001
+            # Write API unavailable/changed -- skip the persistent overlay (the lasso
+            # prompt is still sent to the model). Logged so it is diagnosable.
+            debug_print(f"_paint_prompt_overlay: could not update labelmap: {exc}")
+            return None
+        # Keep the per-label scribble baseline in sync (see on_scribble_finished).
+        if not hasattr(self, "_prev_scribble_masks") or self._prev_scribble_masks is None:
+            self._prev_scribble_masks = {}
+        self._prev_scribble_masks[label] = arr.copy()
+        return (label, prev_overlay)
 
     #
     #  -- Scribble
@@ -1747,6 +2310,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         scribble segment (bg or fg, depending on prompt type).
         """
         self.setup_prompts(skip_if_exists=True)
+
+        if checked:
+            # Scribble paint, freehand lasso and point/bbox are mutually exclusive.
+            self.set_lasso_active(False)
+            self._deactivate_capture_tools()
 
         interaction_node = slicer.app.applicationLogic().GetInteractionNode()
         interaction_node.SetCurrentInteractionMode(interaction_node.ViewTransform)
@@ -3405,47 +3973,101 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             raise ValueError(f'Unknown point_type {point_type}')
 
-    def lasso_points_to_mask(self, points):
+    def lasso_points_to_crop(self, points):
         """
-        Given a list of voxel coords (defining a polygon in one slice),
-        returns a 3D mask with that polygon filled in the appropriate slice.
+        Rasterizes a polygon (defined in a single slice) into a tight crop plus a
+        half-open ``interaction_bbox`` ``[[k0, k1], [j0, j1], [i0, i1]]`` in image
+        (k, j, i) = (z, y, x) order. Returns ``(crop, bbox)`` or ``(None, None)``
+        if the polygon is empty.
+
+        ``points`` come from ``xyz_from_caller`` in IJK (i, j, k) order; the image
+        array is (k, j, i), so x->axis2, y->axis1, z->axis0.
         """
         from skimage.draw import polygon
 
-        shape = self.get_image_data().shape
-        pts = np.array(points)  # shape (n, 3)
+        zyx_shape = self.get_image_data().shape  # (z, y, x)
+        pts = np.array(points)  # columns (i=x, j=y, k=z)
 
-        # Determine which coordinate is constant
         const_axes = [i for i in range(3) if np.unique(pts[:, i]).size == 1]
         if len(const_axes) != 1:
-            raise ValueError(
-                "Expected exactly one constant coordinate among the points"
-            )
+            raise ValueError("Expected exactly one constant coordinate among the points")
         const_axis = const_axes[0]
         const_val = int(pts[0, const_axis])
 
-        # Create a blank 3D mask
-        mask = np.zeros(shape, dtype=np.uint8)
+        def _tighten(full2d, axis0_len, axis1_len):
+            a, b = np.nonzero(full2d)
+            if len(a) == 0:
+                return None
+            a0, a1 = int(a.min()), int(a.max()) + 1
+            b0, b1 = int(b.min()), int(b.max()) + 1
+            return full2d[a0:a1, b0:b1], (a0, a1), (b0, b1)
 
-        # Depending on which axis is constant, extract the 2D polygon and fill the corresponding slice.
-        # Note: our volume is ordered as (z, y, x)
-        if const_axis == 2:
-            x_coords = pts[:, 0]
-            y_coords = pts[:, 1]
-            rr, cc = polygon(y_coords, x_coords, shape=(shape[1], shape[2]))
-            mask[const_val, rr, cc] = 1
-        elif const_axis == 1:
-            x_coords = pts[:, 0]
-            z_coords = pts[:, 2]
-            rr, cc = polygon(z_coords, x_coords, shape=(shape[0], shape[2]))
-            mask[rr, const_val, cc] = 1
-        elif const_axis == 0:
-            y_coords = pts[:, 1]
-            z_coords = pts[:, 2]
-            rr, cc = polygon(z_coords, y_coords, shape=(shape[0], shape[1]))
-            mask[rr, cc, const_val] = 1
+        if const_axis == 2:  # z constant -> slice over (y, x)
+            rr, cc = polygon(pts[:, 1], pts[:, 0], shape=(zyx_shape[1], zyx_shape[2]))
+            full = np.zeros((zyx_shape[1], zyx_shape[2]), dtype=np.uint8)
+            full[rr, cc] = 1
+            tightened = _tighten(full, zyx_shape[1], zyx_shape[2])
+            if tightened is None:
+                return None, None
+            crop2d, (y0, y1), (x0, x1) = tightened
+            crop = crop2d[None, :, :]  # (1, dy, dx) in (z, y, x)
+            bbox = [[const_val, const_val + 1], [y0, y1], [x0, x1]]
+        elif const_axis == 1:  # y constant -> slice over (z, x)
+            rr, cc = polygon(pts[:, 2], pts[:, 0], shape=(zyx_shape[0], zyx_shape[2]))
+            full = np.zeros((zyx_shape[0], zyx_shape[2]), dtype=np.uint8)
+            full[rr, cc] = 1
+            tightened = _tighten(full, zyx_shape[0], zyx_shape[2])
+            if tightened is None:
+                return None, None
+            crop2d, (z0, z1), (x0, x1) = tightened
+            crop = crop2d[:, None, :]  # (dz, 1, dx)
+            bbox = [[z0, z1], [const_val, const_val + 1], [x0, x1]]
+        else:  # const_axis == 0, x constant -> slice over (z, y)
+            rr, cc = polygon(pts[:, 2], pts[:, 1], shape=(zyx_shape[0], zyx_shape[1]))
+            full = np.zeros((zyx_shape[0], zyx_shape[1]), dtype=np.uint8)
+            full[rr, cc] = 1
+            tightened = _tighten(full, zyx_shape[0], zyx_shape[1])
+            if tightened is None:
+                return None, None
+            crop2d, (z0, z1), (y0, y1) = tightened
+            crop = crop2d[:, :, None]  # (dz, dy, 1)
+            bbox = [[z0, z1], [y0, y1], [const_val, const_val + 1]]
 
-        return mask
+        return np.ascontiguousarray(crop), bbox
+
+    def _mask_to_crop(self, mask):
+        """
+        Tighten a (z, y, x) binary mask to a crop plus its half-open bbox
+        ``[[k0, k1], [j0, j1], [i0, i1]]`` (in the mask's own coordinates). Returns
+        ``(None, None)`` if the mask is empty. The caller offsets the bbox when the
+        mask is a sub-region rather than the full volume (see the region scribble path).
+        """
+        nz = np.argwhere(mask > 0)
+        if nz.size == 0:
+            return None, None
+        mins = nz.min(0)
+        maxs = nz.max(0) + 1
+        bbox = [[int(mins[a]), int(maxs[a])] for a in range(3)]
+        crop = mask[mins[0]:maxs[0], mins[1]:maxs[1], mins[2]:maxs[2]].astype(np.uint8)
+        return np.ascontiguousarray(crop), bbox
+
+    def _apply_scribble_brush_size(self, paint_effect):
+        """
+        Sets the paint brush size. If a session is connected, use the model's
+        preferred scribble thickness (in voxels) converted to an absolute (mm)
+        diameter; otherwise fall back to a relative brush.
+        """
+        thickness = getattr(self.session, "preferred_scribble_thickness", None) if self.session else None
+        if thickness:
+            spacing = self.get_image_spacing()  # (z, y, x) mm/voxel
+            diameters_mm = [t * s for t, s in zip(thickness, spacing)]
+            # Use the smallest in-plane extent as the brush diameter.
+            diameter_mm = max(min(diameters_mm), 0.1)
+            paint_effect.setParameter("BrushUseAbsoluteSize", "1")
+            paint_effect.setParameter("BrushAbsoluteDiameter", str(diameter_mm))
+        else:
+            paint_effect.setParameter("BrushUseAbsoluteSize", "0")
+            paint_effect.setParameter("BrushRelativeDiameter", ".75")
 
     ###############################################################################
     # Prompt type toggle (positive / negative)

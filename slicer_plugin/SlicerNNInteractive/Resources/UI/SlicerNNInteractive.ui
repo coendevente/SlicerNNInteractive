@@ -233,7 +233,7 @@
                    <bool>true</bool>
                   </property>
                   <property name="toolTip">
-                   <string>Place lasso prompt. Double-click to finish.</string>
+                   <string>Draw a freehand contour with the left mouse button held down. Release to close and fill it, and submit it as a 2D prompt.</string>
                   </property>
                   <property name="text">
                    <string> &amp;Lasso</string>
