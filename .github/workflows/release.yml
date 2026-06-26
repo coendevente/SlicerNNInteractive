@@ -36,125 +36,9 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "📦 Release version: $VERSION"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Verify version matches pyproject.toml
-        run: |
-          cd server
-          PYPROJECT_VERSION=$(grep -E '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
-          TAG_VERSION=${{ steps.get_version.outputs.version }}
-
-          echo "Version in pyproject.toml: $PYPROJECT_VERSION"
-          echo "Version from git tag: $TAG_VERSION"
-
-          if [ "$PYPROJECT_VERSION" != "$TAG_VERSION" ]; then
-            echo "❌ Error: Version mismatch!"
-            echo "   pyproject.toml: $PYPROJECT_VERSION"
-            echo "   Git tag: v$TAG_VERSION"
-            echo ""
-            echo "Please update pyproject.toml to match the tag version before releasing."
-            exit 1
-          fi
-          echo "✅ Versions match"
-
-  publish-pypi:
-    runs-on: ubuntu-latest
-    needs: verify-tag
-    environment: production
-    permissions:
-      id-token: write  # Required for trusted publishing
-      contents: read
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install build twine
-
-      - name: Build package
-        run: |
-          cd server
-          python -m build
-
-      - name: Check package
-        run: |
-          cd server
-          twine check dist/*
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: server/dist/
-          print-hash: true
-
-      - name: Verify publication
-        run: |
-          echo "✅ Published to PyPI!"
-          echo ""
-          echo "Install with:"
-          echo "  pip install nninteractive-slicer-server==${{ needs.verify-tag.outputs.version }}"
-
-  publish-docker:
-    runs-on: ubuntu-latest
-    needs: verify-tag
-    environment: production
-    steps:
-      - name: Free up disk space
-        run: |
-          # Free up disk space on GitHub Actions runner
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h
-
-      - name: Check out code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./server
-          file: ./server/Dockerfile
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/nninteractive-slicer-server:${{ needs.verify-tag.outputs.version }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/nninteractive-slicer-server:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          platforms: linux/amd64
-
-      - name: Verify publication
-        run: |
-          echo "✅ Published to Docker Hub!"
-          echo ""
-          echo "Pull with:"
-          echo "  docker pull ${{ secrets.DOCKERHUB_USERNAME }}/nninteractive-slicer-server:${{ needs.verify-tag.outputs.version }}"
-          echo "  docker pull ${{ secrets.DOCKERHUB_USERNAME }}/nninteractive-slicer-server:latest"
-
   create-github-release:
     runs-on: ubuntu-latest
-    needs: [verify-tag, publish-pypi, publish-docker]
+    needs: verify-tag
     permissions:
       contents: write
     steps:
@@ -188,18 +72,19 @@ jobs:
           body: |
             ## 🚀 Release ${{ needs.verify-tag.outputs.version }}
 
+            This extension talks to the official **nnInteractive** backend (v2).
+            There is no longer a bundled server — run the official server, or use the
+            built-in local compute mode.
+
             ### Installation
 
-            **PyPI:**
-            ```bash
-            pip install nninteractive-slicer-server==${{ needs.verify-tag.outputs.version }}
-            ```
+            **3D Slicer extension:** install *nnInteractive* from the Slicer Extensions Manager
+            (or clone this repo and add `slicer_plugin/` via *Edit → Application Settings → Modules*).
 
-            **Docker:**
+            **Server (optional — for remote compute):**
             ```bash
-            docker pull coendevente/nninteractive-slicer-server:${{ needs.verify-tag.outputs.version }}
-            # Or use :latest tag
-            docker pull coendevente/nninteractive-slicer-server:latest
+            pip install nnInteractive[server]
+            nninteractive-server --model-dir /path/to/nnInteractive_v1.0 --host 0.0.0.0 --port 1527
             ```
 
             ### Changes
