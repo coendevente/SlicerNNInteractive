@@ -28,6 +28,7 @@ https://github.com/user-attachments/assets/c9f9ee0a-f74d-4907-aa21-484dcfd10948
 - [Development](#development)
 - [Citation](#citation)
 - [License](#license)
+- [Acknowledgements](#acknowledgements)
 
 ## Compute modes
 
@@ -197,3 +198,15 @@ This repository is available under a Apache-2.0 license (see [here](LICENSE)).
 
 > [!IMPORTANT]
 > The model weights that are downloaded when running nnInteractive are available under a `Creative Commons Attribution Non Commercial Share Alike 4.0` license, as described in the original nnInteractive repository [here](https://github.com/MIC-DKFZ/nnInteractive/tree/master?tab=readme-ov-file#license).
+
+## Acknowledgements
+
+This extension brings [nnInteractive](https://github.com/MIC-DKFZ/nnInteractive) into 3D Slicer.
+nnInteractive is developed at the German Cancer Research Center (DKFZ) and
+[Helmholtz Imaging](https://www.helmholtz-imaging.de/).
+
+<p align="left">
+  <img src="img/DKFZ_Logo.png" alt="German Cancer Research Center (DKFZ)" height="55">
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="img/HI_Logo.png" alt="Helmholtz Imaging" height="55">
+</p>
