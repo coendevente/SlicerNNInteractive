@@ -25,26 +25,36 @@ https://github.com/user-attachments/assets/c9f9ee0a-f74d-4907-aa21-484dcfd10948
 - [Common issues](#common-issues)
 - [Testing](#testing)
 - [Contributing](#contributing)
+- [Development](#development)
 - [Citation](#citation)
 - [License](#license)
 
 ## Compute modes
 
-This extension targets **nnInteractive v2** and uses the official
-[`nnInteractive`](https://github.com/MIC-DKFZ/nnInteractive) package directly — it no longer
-ships its own server. You can run inference in two ways:
+This extension targets **nnInteractive v2** and drives the official
+[`nnInteractive`](https://github.com/MIC-DKFZ/nnInteractive) inference code directly — it no
+longer ships its own server. Upstream is now split into two pip packages that share the
+`nnInteractive` namespace:
 
-- **Local mode** — inference runs **in-process inside Slicer's Python**. No separate server is
-  needed, but Slicer's Python must have the full nnInteractive + PyTorch stack, so you need a
-  machine with a (preferably NVIDIA) GPU. 10 GB of VRAM is recommended; small objects work with
-  <6 GB. CPU is supported but slow.
-- **Remote mode** — Slicer is a **lightweight client** (no PyTorch) that talks to an
-  [official `nninteractive-server`](https://github.com/MIC-DKFZ/nnInteractive/blob/master/SERVER_CLIENT.md)
-  running on a GPU machine (which may be the same computer).
+- **`nninteractive-client`** — a lightweight, **torch-free** remote client (`numpy` / `httpx` /
+  `blosc2` only). This is all Slicer needs in Remote mode.
+- **`nnInteractive`** — the **full** local-inference + server stack (PyTorch, nnU-Net, …). It
+  depends on `nninteractive-client`, so a full install includes the client too.
+
+Accordingly, you can run inference in two ways:
+
+- **Local mode** — inference runs **in-process inside Slicer's Python** via the full
+  `nnInteractive` package. No separate server is needed, but Slicer's Python must have the full
+  nnInteractive + PyTorch stack, so you need a machine with a (preferably NVIDIA) GPU. 10 GB of
+  VRAM is recommended; small objects work with <6 GB. CPU is supported but slow.
+- **Remote mode** — Slicer is a **lightweight client** (just `nninteractive-client`, no PyTorch)
+  that talks to an `nninteractive-server` running on a GPU machine (which may be the same
+  computer).
 
 You choose the mode the first time you open the module (and can change it later in the
 `Configuration` tab). The extension installs only the Python packages that the selected mode
-needs — **Remote mode stays PyTorch-free**.
+needs — **Remote mode stays PyTorch-free**. If only `nninteractive-client` is present, Local mode
+stays disabled until you install the full `nnInteractive` package and restart Slicer.
 
 ## Installation
 
@@ -60,11 +70,12 @@ The first time you open the `nnInteractive` module, a dialog asks whether you wa
 compute** or a **Remote server**. Based on your choice the extension installs the matching Python
 packages into Slicer's Python:
 
-- **Remote** → installs a **torch-free** client (the nnInteractive package via `--no-deps`
-  plus the `httpx` + `blosc2` wire stack). **No PyTorch is installed.** Then enter your server
-  URL (and API key, if any) in the `Configuration` tab and click `Connect`.
-- **Local** → installs the full `nnInteractive` stack (nnU-Net) **and PyTorch**. On the first
-  segmentation the model weights are downloaded automatically from
+- **Remote** → installs the torch-free **`nninteractive-client`** package (plus the `httpx` /
+  `blosc2` wire stack). **No PyTorch is installed.** Then enter your server URL (and API key, if
+  any) in the `Configuration` tab and click `Connect`.
+- **Local** → installs the full **`nnInteractive`** package (nnU-Net) **and PyTorch**. Pick a
+  model in the `Configuration` tab — the dropdown is populated from the available-models manifest —
+  and on the first segmentation its weights are downloaded automatically from
   [Hugging Face](https://huggingface.co/MIC-DKFZ/nnInteractive). For a reliable, CUDA-matched
   PyTorch in Slicer, install the **PyTorch** extension (SlicerPyTorch) from the Extensions Manager
   first; otherwise the extension falls back to `pip install torch`.
@@ -74,33 +85,42 @@ install on demand.
 
 ### Running the official server (Remote mode)
 
-On the GPU machine, install the server role of the official package and start it, pointing it at a
-downloaded checkpoint folder:
+On the GPU machine, install the full package — the server is part of it, there is no separate
+`[server]` extra — and start it. The server downloads the model by name on first use:
 
 ```bash
-pip install nnInteractive[server]
+pip install nnInteractive
 
-# Download the weights once (see the nnInteractive README), then:
 nninteractive-server \
-    --model-dir /path/to/nnInteractive_v1.0 \
-    --fold all \
-    --host 0.0.0.0 \
-    --port 1527 \
+    --model nnInteractive_v1.0 \
+    --host 0.0.0.0 --port 1527 \
     --api-key "$(openssl rand -hex 32)"
 ```
 
-Useful flags: `--device cuda:0`, `--no-torch-compile`, `--max-sessions N`,
-`--idle-timeout-seconds`, `--api-key`. See the official
+List or pre-download models with `nninteractive-available-models` and `nninteractive-download-model`.
+Useful server flags: `--device cuda:0`, `--no-torch-compile`, `--max-sessions N`,
+`--idle-timeout-seconds`. See the official
 [SERVER_CLIENT.md](https://github.com/MIC-DKFZ/nnInteractive/blob/master/SERVER_CLIENT.md) for full
 details (authentication, SSH-tunnel setups, multi-user deployment).
+
+#### …or run the server in Docker
+
+If you'd rather not install anything on the GPU box, the server is also published as a Docker image
+with the model **baked in** (a GPU host with the NVIDIA Container Toolkit is required):
+
+```bash
+docker run --gpus all -p 1527:1527 \
+    -e NN_INTERACTIVE_API_KEY="$(openssl rand -hex 32)" \
+    ghcr.io/mic-dkfz/nninteractive-server:latest
+```
+
+A `lite` tag is also available if you'd rather mount your own checkpoint folder at `/model`. See
+the upstream [DOCKER.md](https://github.com/MIC-DKFZ/nnInteractive/blob/master/nnInteractive/inference/server/DOCKER.md)
+for both flavours and configuration.
 
 In Slicer's `Configuration` tab, set the server URL — e.g. `http://remote_host_name:1527`, or
 `http://localhost:1527` if the server runs on the same machine — and the API key, then click
 `Connect`.
-
-> [!NOTE]
-> When starting the server you can ignore the message `nnUNet_raw is not defined [...]`. Setting up
-> those environment variables is not necessary here.
 
 ## Usage
 
