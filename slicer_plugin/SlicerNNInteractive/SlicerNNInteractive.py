@@ -817,7 +817,142 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     # Prompt and markup setup functions
     ###############################################################################
 
+    def _volume_node_id(self, volume_node):
+        if volume_node is None:
+            return None
+        try:
+            return volume_node.GetID()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def on_segment_editor_node_modified(self, caller, event):
+        """Reset transient prompt state when the Segment Editor source volume changes,
+        and clear the displayed prompts when the user selects a different segment."""
+        self._handle_active_source_volume_change()
+        self._handle_selected_segment_change()
+
+    def _handle_selected_segment_change(self):
+        """When the user picks a different segment to refine, the session re-seeds it
+        (lazily, on the next prompt) and resets its interactions -- so the prompts left
+        over from the previous segment must be cleared too, otherwise they bleed into
+        the newly selected segment. Programmatic selections are guarded out."""
+        # Never touch nodes while the module/scene is being torn down: the Segment Editor
+        # node fires Modified events during shutdown, and doing heavy work (reset_all_prompts,
+        # node access) on a dying scene crashes the app on exit.
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            return
+        if getattr(self, "_suppress_segment_switch", False):
+            return
+        node = getattr(self, "segment_editor_node", None)
+        if node is None:
+            return
+        seg_id = node.GetSelectedSegmentID()
+        prev = getattr(self, "_last_selected_segment_id", None)
+        if seg_id == prev:
+            return
+        self._last_selected_segment_id = seg_id
+        # Only act on a genuine switch between two existing segments (not the first
+        # selection or a cleared selection), and only once the UI is built.
+        if prev is None or not seg_id or not getattr(self, "all_prompt_buttons", None):
+            return
+        active_tool = self._active_prompt_tool()
+        self.reset_all_prompts()  # clears markups + overlays + interactions, like Next/Reset
+        if active_tool is not None:
+            qt.QTimer.singleShot(0, lambda tool=active_tool: self._activate_prompt_tool(tool))
+
+    def _handle_active_source_volume_change(self, volume_node=None):
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            return False
+        if getattr(self, "_handling_source_volume_change", False):
+            return False
+
+        if volume_node is None:
+            volume_node = self.get_volume_node()
+        volume_id = self._volume_node_id(volume_node)
+        if volume_id is None:
+            return False
+
+        previous_id = getattr(self, "_active_source_volume_id", None)
+        if previous_id == volume_id:
+            return False
+
+        self._active_source_volume_id = volume_id
+        if previous_id is None:
+            return False
+
+        self._handling_source_volume_change = True
+        try:
+            debug_print("Source volume changed. Resetting prompt state.")
+            active_tool = (
+                self._active_prompt_tool()
+                if getattr(self, "all_prompt_buttons", None)
+                else None
+            )
+            if getattr(self, "scribble_editor_widget", None) is not None:
+                self.scribble_editor_widget.setActiveEffectByName("")
+            self._remove_scribble_labelmap_observer()
+            self._cancel_lasso_stroke()
+            self.previous_states.pop("image_data", None)
+            self.previous_states.pop("segment_fp", None)
+            self.target_buffer = None
+            self._prev_scribble_masks = {}
+
+            if getattr(self, "prompt_types", None) and getattr(
+                self, "all_prompt_buttons", None
+            ):
+                self.setup_prompts()
+                if active_tool is not None:
+                    qt.QTimer.singleShot(
+                        0, lambda tool=active_tool: self._activate_prompt_tool(tool)
+                    )
+            return True
+        finally:
+            self._handling_source_volume_change = False
+
+    def _get_scribble_prompt_node(self):
+        node = getattr(self, "scribble_segment_node", None)
+        try:
+            if node is not None and node.GetScene() is slicer.mrmlScene:
+                return node
+        except Exception:  # noqa: BLE001
+            pass
+
+        node = slicer.mrmlScene.GetFirstNodeByName(self.scribble_segment_node_name)
+        if node is not None:
+            self.scribble_segment_node = node
+        return node
+
+    def _scribble_prompt_matches_volume(self, volume_node=None):
+        if volume_node is None:
+            volume_node = self.get_volume_node()
+        volume_id = self._volume_node_id(volume_node)
+        return (
+            volume_id is not None
+            and self._get_scribble_prompt_node() is not None
+            and getattr(self, "_scribble_reference_volume_id", None) == volume_id
+        )
+
+    def _remove_scribble_prompt_node(self):
+        self._remove_scribble_labelmap_observer()
+        if getattr(self, "scribble_editor_widget", None) is not None:
+            self.scribble_editor_widget.setActiveEffectByName("")
+
+        existing_nodes = slicer.mrmlScene.GetNodesByName(self.scribble_segment_node_name)
+        if existing_nodes and existing_nodes.GetNumberOfItems() > 0:
+            for i in range(existing_nodes.GetNumberOfItems()):
+                node = existing_nodes.GetItemAsObject(i)
+                slicer.mrmlScene.RemoveNode(node)
+
+        self.scribble_segment_node = None
+        self._scribble_reference_volume_id = None
+        self._prev_scribble_masks = {}
+
     def setup_prompts(self, skip_if_exists=False):
+        volume_node = self.get_volume_node()
         if not skip_if_exists:
             self.remove_prompt_nodes()
 
@@ -861,12 +996,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             icon = qt.QIcon(self.resourcePath(f"Icons/prompts/{light_dark_mode}/{prompt_type['button_icon_filename']}"))
             prompt_type["button"].setIcon(icon)
 
-        if (
-            not skip_if_exists
-            or slicer.mrmlScene.GetFirstNodeByName(self.scribble_segment_node_name)
-            is None
-        ):
-            self.setup_scribble_prompt()
+        scribble_matches_volume = self._scribble_prompt_matches_volume(volume_node)
+        if not skip_if_exists or not scribble_matches_volume:
+            if skip_if_exists and not scribble_matches_volume:
+                self._remove_scribble_prompt_node()
+            self.setup_scribble_prompt(volume_node)
 
             self.ui.pbInteractionScribble.setStyleSheet(
                 f"""
@@ -885,53 +1019,75 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         interaction_node = slicer.app.applicationLogic().GetInteractionNode()
         interaction_node.SetCurrentInteractionMode(interaction_node.ViewTransform)
 
-    def setup_scribble_prompt(self):
+    def setup_scribble_prompt(self, volume_node=None):
         """
-        Creates a hidden "Segment Editor" for the scribble prompt.
+        Creates a hidden "Segment Editor" for the scribble prompt plus a fresh, empty
+        scribble segmentation node. The editor widget and its SegmentEditorNode are
+        created once and reused -- recreating them on every call would leak an MRML
+        node (and a Qt widget) each time, and this runs on every 'Next segment'.
         """
         import qSlicerSegmentationsModuleWidgetsPythonQt
 
-        # Create a background (headless) segment editor
-        self.scribble_editor_widget = (
-            qSlicerSegmentationsModuleWidgetsPythonQt.qMRMLSegmentEditorWidget()
-        )
-        self.scribble_editor_widget.setMRMLScene(slicer.mrmlScene)
-        self.scribble_editor_widget.setMaximumNumberOfUndoStates(10)
+        if volume_node is None:
+            volume_node = self.get_volume_node()
 
-        # Create a separate SegmentEditorNode
-        self.scribble_editor_node = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLSegmentEditorNode"
-        )
-        self.scribble_editor_widget.setMRMLSegmentEditorNode(self.scribble_editor_node)
+        self._remove_scribble_labelmap_observer()
+        if getattr(self, "scribble_editor_widget", None) is not None:
+            self.scribble_editor_widget.setActiveEffectByName("")
 
+        # Create the background (headless) segment editor once, then reuse it.
+        if getattr(self, "scribble_editor_widget", None) is None:
+            self.scribble_editor_widget = (
+                qSlicerSegmentationsModuleWidgetsPythonQt.qMRMLSegmentEditorWidget()
+            )
+            self.scribble_editor_widget.setMRMLScene(slicer.mrmlScene)
+            self.scribble_editor_widget.setMaximumNumberOfUndoStates(10)
+
+        if getattr(self, "scribble_editor_node", None) is None:
+            self.scribble_editor_node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLSegmentEditorNode"
+            )
+            self.scribble_editor_widget.setMRMLSegmentEditorNode(self.scribble_editor_node)
+
+        # The previous scribble segmentation node (if any) was removed by
+        # remove_prompt_nodes(); create a fresh, empty one.
         self.scribble_segment_node = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLSegmentationNode"
         )
-        self.scribble_segment_node.SetReferenceImageGeometryParameterFromVolumeNode(
-            self.get_volume_node()
-        )
+        if volume_node is not None:
+            self.scribble_segment_node.SetReferenceImageGeometryParameterFromVolumeNode(
+                volume_node
+            )
+        self._scribble_reference_volume_id = self._volume_node_id(volume_node)
+        if self._scribble_reference_volume_id is not None:
+            self._active_source_volume_id = self._scribble_reference_volume_id
         self.scribble_segment_node.SetName(self.scribble_segment_node_name)
 
         # Make sure the node exists and is set
         self.scribble_editor_widget.setSegmentationNode(self.scribble_segment_node)
 
         self.scribble_segment_node.CreateDefaultDisplayNodes()
-        self.scribble_segment_node.GetSegmentation().AddEmptySegment(
-            "bg", "bg", [0.0, 0.0, 1.0]
-        )
-        self.scribble_segment_node.GetSegmentation().AddEmptySegment(
-            "fg", "fg", [0.0, 0.0, 1.0]
-        )
+        # bg = negative scribble (red), fg = positive scribble (green).
+        segmentation = self.scribble_segment_node.GetSegmentation()
+        segmentation.AddEmptySegment("bg", "bg", list(self.COLOR_NEGATIVE))
+        segmentation.AddEmptySegment("fg", "fg", list(self.COLOR_POSITIVE))
+        # The colour argument to AddEmptySegment is silently ignored on some Slicer
+        # builds, leaving auto-assigned colours that don't track prompt polarity. Set
+        # the colours explicitly so a positive scribble is always green and a negative
+        # one red.
+        segmentation.GetSegment("bg").SetColor(*self.COLOR_NEGATIVE)
+        segmentation.GetSegment("fg").SetColor(*self.COLOR_POSITIVE)
+
         dn = self.scribble_segment_node.GetDisplayNode()
+        # Fill is kept translucent so the underlying image shows through; the outline
+        # is fully opaque so the polarity colour reads clearly.
+        for seg_id in ("bg", "fg"):
+            dn.SetSegmentOpacity2DFill(seg_id, 0.4)
+            dn.SetSegmentOpacity2DOutline(seg_id, 1.0)
 
-        opacity = 0.2
-        dn.SetSegmentOpacity2DFill("bg", opacity)
-        dn.SetSegmentOpacity2DOutline("bg", opacity)
-        dn.SetSegmentOpacity2DFill("fg", opacity)
-        dn.SetSegmentOpacity2DOutline("fg", opacity)
+        # Per-label ("fg"/"bg") accumulated paint, used to diff out only new strokes.
+        self._prev_scribble_masks = {}
 
-        self._prev_scribble_mask = None
-            
         light_dark_mode = self.is_ui_dark_or_light_mode()
         icon = qt.QIcon(self.resourcePath(f"Icons/prompts/{light_dark_mode}/scribble_icon.svg"))
         self.ui.pbInteractionScribble.setIcon(icon)
@@ -974,27 +1130,39 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self.ui.pbInteractionLassoCancel.setVisible(False)
 
-        _remove(self.scribble_segment_node_name)
+        self._remove_scribble_prompt_node()
 
     def on_interaction_node_modified(self, caller, event):
         """
-        Deselect prompt button if interaction mode is not place point anymore
+        Keep the markups prompt buttons in sync with the interaction mode. The lasso
+        is handled separately (it is a freehand drag, not a Place interaction) and is
+        left untouched here; entering Place mode for another prompt cancels an active
+        freehand lasso and scribble.
         """
-
         interactionNode = slicer.app.applicationLogic().GetInteractionNode()
         selectionNode = slicer.app.applicationLogic().GetSelectionNode()
+        in_place = (
+            interactionNode.GetCurrentInteractionMode()
+            == slicer.vtkMRMLInteractionNode.Place
+        )
         for prompt_type in self.prompt_types.values():
-            if interactionNode.GetCurrentInteractionMode() != slicer.vtkMRMLInteractionNode.Place:
-                if prompt_type["name"] == "LassoPrompt" and (self.ui.pbInteractionLasso.isChecked()):
-                    self.submit_lasso_if_present()
+            # Lasso, Point and BBox run in ViewTransform mode with their own click
+            # capture, so their button state is NOT driven by markups Place mode here.
+            if prompt_type["name"] in ("LassoPrompt", "PointPrompt", "BBoxPrompt"):
+                continue
+            if not in_place:
                 prompt_type["button"].setChecked(False)
-            elif interactionNode.GetCurrentInteractionMode() == slicer.vtkMRMLInteractionNode.Place:
+            else:
                 placingThisNode = (selectionNode.GetActivePlaceNodeID() == prompt_type["node"].GetID())
                 prompt_type["button"].setChecked(placingThisNode)
 
-        # Stop scribble if placing markup
-        if interactionNode.GetCurrentInteractionMode() == slicer.vtkMRMLInteractionNode.Place:
+        # Placing a markup (point/bbox) cancels scribble paint and freehand lasso.
+        if in_place:
             self.ui.pbInteractionScribble.setChecked(False)
+            self.set_lasso_active(False)
+
+        # Recolour the slice-view cursor for the now-active tool (or restore default).
+        self._update_prompt_cursor()
 
     def remove_all_but_last_prompt(self):
         """
@@ -1028,30 +1196,367 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             for i in range(n):
                 node.RemoveNthControlPoint(0)
 
+    # --- Per-interaction visual undo -------------------------------------------------
+    # Each prompt sent to the session pushes one closure that knows how to remove just
+    # that prompt's on-screen marker. on_undo() pops one after session.undo() succeeds.
+    def _push_prompt_undo(self, fn):
+        if getattr(self, "_prompt_undo_stack", None) is None:
+            self._prompt_undo_stack = []
+        self._prompt_undo_stack.append(fn)
+
+    def _pop_prompt_undo(self):
+        stack = getattr(self, "_prompt_undo_stack", None)
+        if stack:
+            fn = stack.pop()
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001 - visual-only; never block undo
+                debug_print(f"prompt-visual undo failed: {exc}")
+
+    def _clear_prompt_undo(self):
+        self._prompt_undo_stack = []
+
+    def _make_control_point_undo(self, node_id, cp_index):
+        """Undo closure that removes a single placed markups control point (point prompt)."""
+
+        def _undo():
+            node = slicer.mrmlScene.GetNodeByID(node_id)
+            if node is not None and 0 <= cp_index < node.GetNumberOfControlPoints():
+                node.RemoveNthControlPoint(cp_index)
+
+        return _undo
+
+    def _make_overlay_restore(self, label, prev_arr):
+        """Undo closure that restores a scribble/lasso overlay label to its prior state.
+
+        Both scribble paint and finished lassos are stamped into the shared green/red
+        overlay (``scribble_segment_node``, labels ``fg``/``bg``). Restoring the label's
+        labelmap to the snapshot taken before the stroke removes exactly that stroke and
+        rewinds the scribble-diff baseline so later strokes still diff correctly.
+        """
+        prev_copy = None if prev_arr is None else prev_arr.copy()
+
+        def _undo():
+            node = getattr(self, "scribble_segment_node", None)
+            volume = self.get_volume_node()
+            if node is None or volume is None:
+                return
+            restore = prev_copy
+            if restore is None:
+                image = self.get_image_data()
+                if image is None:
+                    return
+                restore = np.zeros(image.shape, dtype=np.uint8)
+            try:
+                slicer.util.updateSegmentBinaryLabelmapFromArray(restore, node, label, volume)
+            except Exception as exc:  # noqa: BLE001
+                debug_print(f"overlay undo could not update labelmap: {exc}")
+                return
+            if isinstance(getattr(self, "_prev_scribble_masks", None), dict):
+                self._prev_scribble_masks[label] = restore.copy()
+
+        return _undo
+
     def on_place_button_clicked(self, checked, prompt_name):
         self.setup_prompts(skip_if_exists=True)
 
         interactionNode = slicer.app.applicationLogic().GetInteractionNode()
-        if checked:
-            selectionNode = slicer.app.applicationLogic().GetSelectionNode()
-            selectionNode.SetReferenceActivePlaceNodeClassName(self.prompt_types[prompt_name]["node_class"])
-            selectionNode.SetActivePlaceNodeID(self.prompt_types[prompt_name]["node"].GetID())
-            interactionNode.SetPlaceModePersistence(1)
-            interactionNode.SetCurrentInteractionMode(interactionNode.Place)
-        else:
-            if prompt_name == "lasso":
-                self.submit_lasso_if_present()
+
+        if prompt_name == "lasso":
+            # The lasso is a freehand drag, not a markups Place interaction. Keep the
+            # views in view-transform mode and toggle our custom drag capture instead.
             interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
+            self.set_lasso_active(checked)
+            return
+
+        if prompt_name in ("point", "bbox"):
+            # Point and BBox use the same model as the lasso: stay in ViewTransform so
+            # right-click zoom/pan work natively, and capture left-clicks via the slice-
+            # view event filter (point = click; bbox = drag-and-drop). This avoids
+            # markups Place mode, which consumed the right-click and forced the
+            # second-click-to-zoom behaviour.
+            interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
+            if checked:
+                self._place_tool = prompt_name
+                self._cancel_bbox_drag()  # start a fresh box
+                # Mutual exclusivity with the other tools.
+                self.set_lasso_active(False)
+                if self.ui.pbInteractionScribble.isChecked():
+                    self.ui.pbInteractionScribble.click()
+                sibling = "bbox" if prompt_name == "point" else "point"
+                if self.all_prompt_buttons[sibling].isChecked():
+                    self.all_prompt_buttons[sibling].setChecked(False)
+                self._apply_prompt_cursor(prompt_name)
+            else:
+                self._place_tool = None
+                self._cancel_bbox_drag()
+                self._update_prompt_cursor()
+            return
+
+        # (no other prompt types reach here; scribble has its own handler)
+        if checked:
+            interactionNode.SetCurrentInteractionMode(interactionNode.Place)
+            self._apply_prompt_cursor(prompt_name)
+        else:
+            interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
+            self._update_prompt_cursor()
+
+    # Prompt colours: positive = green, negative = red.
+    COLOR_POSITIVE = (0.20, 0.85, 0.20)
+    COLOR_NEGATIVE = (0.90, 0.15, 0.15)
+
+    def _set_node_color(self, node, positive):
+        """Colour a whole markup node (bbox / lasso) green (pos) or red (neg)."""
+        if node is None:
+            return
+        display_node = node.GetDisplayNode()
+        if display_node is None:
+            return
+        color = self.COLOR_POSITIVE if positive else self.COLOR_NEGATIVE
+        display_node.SetColor(*color)
+        display_node.SetSelectedColor(*color)
+        display_node.SetActiveColor(*color)
+        if hasattr(display_node, "SetSliceProjectionColor"):
+            display_node.SetSliceProjectionColor(*color)
+
+    ###############################################################################
+    # Interaction cursors (green = positive, red = negative)
+    ###############################################################################
+    # The slice-view mouse cursor is recoloured per prompt polarity so the user gets
+    # immediate feedback about whether the next stroke will be a positive (green) or
+    # negative (red) prompt -- without having to glance at the Positive/Negative
+    # buttons. Each prompt type also carries a small badge so the four tools stay
+    # visually distinct. (Scribble additionally shows a coloured Paint brush circle;
+    # should the Paint effect manage its own cursor, that circle still conveys the
+    # polarity colour.)
+
+    def _qcolor(self, rgb):
+        return qt.QColor(int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255))
+
+    def _get_prompt_cursor(self, tool, positive):
+        key = (tool, bool(positive))
+        if key not in self._prompt_cursor_cache:
+            self._prompt_cursor_cache[key] = self._make_prompt_cursor(tool, positive)
+        return self._prompt_cursor_cache[key]
+
+    def _make_prompt_cursor(self, tool, positive):
+        """Build a 32x32 colour cursor: a precise crosshair locator plus a per-tool
+        badge, drawn with a dark halo so it reads on both bright and dark images."""
+        size = 32
+        pm = qt.QPixmap(size, size)
+        pm.fill(qt.QColor(0, 0, 0, 0))  # transparent
+        p = qt.QPainter(pm)
+        p.setRenderHint(qt.QPainter.Antialiasing, True)
+        color = self._qcolor(self.COLOR_POSITIVE if positive else self.COLOR_NEGATIVE)
+        halo = qt.QColor(0, 0, 0, 190)
+        cx, cy = 16, 16
+
+        def crosshair(pen_color, w):
+            pen = qt.QPen(pen_color)
+            pen.setWidth(w)
+            pen.setCapStyle(qt.Qt.RoundCap)
+            p.setPen(pen)
+            p.setBrush(qt.QBrush())
+            gap, arm = 3, 7
+            p.drawLine(cx - arm, cy, cx - gap, cy)
+            p.drawLine(cx + gap, cy, cx + arm, cy)
+            p.drawLine(cx, cy - arm, cx, cy - gap)
+            p.drawLine(cx, cy + gap, cx, cy + arm)
+
+        def badge(pen_color, w, filled):
+            pen = qt.QPen(pen_color)
+            pen.setWidth(w)
+            pen.setCapStyle(qt.Qt.RoundCap)
+            pen.setJoinStyle(qt.Qt.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(qt.QBrush(pen_color) if filled else qt.QBrush())
+            if tool == "point":
+                p.drawEllipse(21, 3, 8, 8)
+            elif tool == "bbox":
+                p.drawRect(21, 4, 8, 8)
+            elif tool == "lasso":
+                p.drawEllipse(20, 3, 10, 8)
+                p.drawLine(25, 11, 28, 14)  # little tail
+            elif tool == "scribble":
+                pts = [(20, 10), (23, 4), (26, 11), (29, 5)]  # squiggle
+                for a, b in zip(pts, pts[1:]):
+                    p.drawLine(a[0], a[1], b[0], b[1])
+
+        # Halo pass (wide, dark) then colour pass (narrow) so the glyph stays legible
+        # over any image intensity.
+        crosshair(halo, 4)
+        badge(halo, 4, False)
+        crosshair(color, 2)
+        badge(color, 2, tool == "point")
+        p.end()
+        return qt.QCursor(pm, cx, cy)
+
+    def _slice_widgets(self):
+        """Slice widgets whose slice views receive prompt interactions."""
+        if getattr(self, "_application_quitting", False):
+            return []
+        widgets = []
+        lm = slicer.app.layoutManager()
+        if lm is None:
+            return widgets
+        for name in lm.sliceViewNames():
+            sw = lm.sliceWidget(name)
+            if sw is not None:
+                widgets.append(sw)
+        return widgets
+
+    def _slice_view_widgets(self):
+        """The slice-view widgets (where the user clicks/drags prompts)."""
+        views = []
+        for sw in self._slice_widgets():
+            try:
+                views.append(sw.sliceView())
+            except Exception:  # noqa: BLE001
+                pass
+        return views
+
+    def _slice_view_cursor_targets(self, slice_widget):
+        """Return the slice view plus its VTK/OpenGL child widgets.
+
+        Slicer/VTK often updates the cursor on the lower-level render widget rather
+        than on the qMRMLSliceView wrapper, so setting only the slice view leaves the
+        stock markups or Paint cursor in control.
+        """
+        targets = []
+
+        def add(widget):
+            if widget is None or not hasattr(widget, "setCursor"):
+                return
+            if any(widget is existing for existing in targets):
+                return
+            targets.append(widget)
+
+        try:
+            slice_view = slice_widget.sliceView()
+        except Exception:  # noqa: BLE001
+            slice_view = slice_widget
+        add(slice_view)
+
+        def add_children(parent):
+            try:
+                children = parent.children()
+            except Exception:  # noqa: BLE001
+                return
+            for child in children:
+                add(child)
+                add_children(child)
+
+        add_children(slice_view)
+        return targets
+
+    def _prepare_cursor_target(self, widget):
+        try:
+            widget.setMouseTracking(True)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            widget.setAttribute(qt.Qt.WA_Hover, True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _set_cursor_on_slice_widget(self, slice_widget, cursor):
+        for widget in self._slice_view_cursor_targets(slice_widget):
+            self._prepare_cursor_target(widget)
+            try:
+                widget.setCursor(cursor)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _apply_prompt_cursor(self, tool):
+        # The filter is used for every prompt type, not only lasso: markups and Paint
+        # can reset the cursor while the mouse is already over the render widget.
+        self._install_lasso_filters()
+        cursor = self._get_prompt_cursor(tool, self.is_positive)
+        for sw in self._slice_widgets():
+            self._set_cursor_on_slice_widget(sw, cursor)
+        self._active_cursor_tool = tool
+
+    def _clear_prompt_cursor(self):
+        for sw in self._slice_widgets():
+            for w in self._slice_view_cursor_targets(sw):
+                try:
+                    w.unsetCursor()
+                except Exception:  # noqa: BLE001
+                    try:
+                        w.setCursor(qt.QCursor(qt.Qt.ArrowCursor))
+                    except Exception:  # noqa: BLE001
+                        pass
+        self._active_cursor_tool = None
+
+    def _reassert_cursor_on_view(self, slice_widget):
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            return
+        if not getattr(self, "all_prompt_buttons", None):
+            return
+        tool = self._active_prompt_tool()
+        if tool is None:
+            return
+        cursor = self._get_prompt_cursor(tool, self.is_positive)
+        self._set_cursor_on_slice_widget(slice_widget, cursor)
+        self._active_cursor_tool = tool
+
+    def _queue_cursor_reassert(self, slice_widget):
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            return
+        pending = getattr(self, "_pending_cursor_reassert_widgets", None)
+        if pending is None:
+            pending = []
+            self._pending_cursor_reassert_widgets = pending
+        if not any(slice_widget is existing for existing in pending):
+            pending.append(slice_widget)
+        if getattr(self, "_cursor_reassert_timer_queued", False):
+            return
+        self._cursor_reassert_timer_queued = True
+        qt.QTimer.singleShot(0, self._flush_cursor_reasserts)
+
+    def _flush_cursor_reasserts(self):
+        self._cursor_reassert_timer_queued = False
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            self._pending_cursor_reassert_widgets = []
+            return
+        pending = list(getattr(self, "_pending_cursor_reassert_widgets", []))
+        self._pending_cursor_reassert_widgets = []
+        for slice_widget in pending:
+            self._reassert_cursor_on_view(slice_widget)
+
+    def _update_prompt_cursor(self):
+        """Single entry point: colour the slice-view cursor for whichever prompt tool
+        is active (green/red by polarity), or restore the default cursor when none is.
+        Safe to call after any tool- or polarity-state change."""
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            return
+        if not getattr(self, "all_prompt_buttons", None):
+            return
+        tool = self._active_prompt_tool()
+        if tool is None:
+            self._clear_prompt_cursor()
+        else:
+            self._apply_prompt_cursor(tool)
 
     def display_node_markup_point(self, display_node):
         """
-        Handles the appearance of the point display node.
+        Handles the appearance of the point display node. Points use the per-control-
+        point "selected" flag to pick a colour: selected -> green (positive),
+        unselected -> red (negative). See on_point_placed().
         """
         display_node.SetTextScale(0)  # Hide text labels
         display_node.SetGlyphScale(0.75)  # Make the points larger
-        display_node.SetColor(0.0, 0.0, 1.0)  # Green color
-        display_node.SetSelectedColor(0.0, 0.0, 1.0)
-        display_node.SetActiveColor(0.0, 0.0, 1.0)
+        display_node.SetColor(*self.COLOR_NEGATIVE)  # unselected control point = negative
+        display_node.SetSelectedColor(*self.COLOR_POSITIVE)  # selected control point = positive
+        display_node.SetActiveColor(1.0, 1.0, 0.0)  # while actively placing
         display_node.SetOpacity(1.0)  # Fully opaque
         display_node.SetSliceProjection(False)  # Make points visible in all slice views
 
@@ -1254,12 +1759,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )  # Clears the active effect
 
             # Optionally clear or reset the segmentation node
-            if hasattr(self, "_scribble_labelmap_callback_tag"):
-                tag = self._scribble_labelmap_callback_tag.get("tag", None)
-                if tag:
-                    self.scribble_segment_node.RemoveObserver(tag)
-                del self._scribble_labelmap_callback_tag
+            self._remove_scribble_labelmap_observer()
 
+            self._update_prompt_cursor()
             return
 
         segment_id = "fg" if self.is_positive else "bg"
@@ -1278,97 +1780,296 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         paint_effect = self.scribble_editor_widget.activeEffect()
         if paint_effect:
-            paint_effect.setParameter("BrushUseAbsoluteSize", "0")  # Use relative mode
+            self._remove_scribble_labelmap_observer()
             paint_effect.setParameter("BrushSphere", "0")  # 2D brush
-            paint_effect.setParameter("BrushRelativeDiameter", ".75")
+            # The brush thickness comes from the model. Make sure a session exists now so
+            # the very first stroke is sized correctly -- otherwise the first scribble
+            # uses a fallback relative brush until a prompt lazily creates the session.
+            self.ensure_session()
+            self._apply_scribble_brush_size(paint_effect)
             self._scribble_labelmap_callback_tag = {
+                "node": self.scribble_segment_node,
                 "tag": self.scribble_segment_node.AddObserver(
                     vtk.vtkCommand.AnyEvent, self.on_scribble_finished
                 ),
                 "label_name": segment_id,
             }
+        # Apply our colour cursor last (after Paint activation) so it wins initially;
+        # the coloured brush circle carries polarity even if Paint later overrides it.
+        self._update_prompt_cursor()
         debug_print(f"Scribble mode (hidden editor) activated on '{segment_id}'")
+
+    def _retarget_scribble_if_active(self):
+        """
+        Re-point an in-progress scribble at the segment for the current polarity
+        (fg = positive/green, bg = negative/red). Polarity can change mid-scribble;
+        without this the next stroke paints into the previous polarity's segment (wrong
+        colour) until on_scribble_finished re-activates it. Toggling the button off/on
+        reuses the proven activation path, cleanly swapping the observer + segment.
+        """
+        if self.ui.pbInteractionScribble.isChecked():
+            self.ui.pbInteractionScribble.click()  # off: deactivate + remove observer
+            self.ui.pbInteractionScribble.click()  # on:  re-select fg/bg + re-add observer
 
     #
     #  -- Lasso/scribble
     #
     @ensure_synched
-    def lasso_or_scribble_prompt(self, mask, positive_click=False, tp="lasso"):
+    def lasso_or_scribble_prompt(
+        self, crop, interaction_bbox, positive_click=False, tp="lasso"
+    ):
         """
-        Uploads lasso or scribble prompt to the server.
+        Adds a lasso or scribble interaction to the session, passing only a tight
+        crop plus its ``interaction_bbox`` (orders of magnitude less data than the
+        full volume; see nnInteractive's API_CHANGES_v2).
+
+        Returns ``True`` if an interaction was actually sent (non-empty crop), else
+        ``False``. The caller registers any overlay-undo / baseline bookkeeping AFTER
+        this returns, so that work stays off the user-perceived latency path (the
+        result is already painted by ``apply_result`` below).
         """
-        if np.sum(mask) == 0:
-            return
-        
-        url = f"{self.server}/add_{tp}_interaction"
+        if crop is None or int(np.sum(crop)) == 0:
+            return False
+
+        add_interaction = (
+            self.session.add_lasso_interaction
+            if tp == "lasso"
+            else self.session.add_scribble_interaction
+        )
+        changed_bbox = add_interaction(
+            crop,
+            include_interaction=bool(positive_click),
+            run_prediction=self.auto_run,
+            interaction_bbox=interaction_bbox,
+        )
+        self.apply_result(changed_bbox)
+        return True
+
+    def _same_mrml_node(self, a, b):
+        if a is b:
+            return True
+        if a is None or b is None:
+            return False
         try:
-            buffer = io.BytesIO()
-            np.save(buffer, mask)
-            compressed_data = gzip.compress(buffer.getvalue())
+            return a.GetID() == b.GetID()
+        except Exception:  # noqa: BLE001
+            return False
 
-            from requests_toolbelt import MultipartEncoder
+    def _remove_scribble_labelmap_observer(self, expected_node=None):
+        tag_info = getattr(self, "_scribble_labelmap_callback_tag", None)
+        if not tag_info:
+            return None
+        node = tag_info.get("node") or getattr(self, "scribble_segment_node", None)
+        if expected_node is not None and not self._same_mrml_node(node, expected_node):
+            return None
+        tag = tag_info.get("tag")
+        label_name = tag_info.get("label_name")
+        if node is not None and tag is not None:
+            try:
+                node.RemoveObserver(tag)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            del self._scribble_labelmap_callback_tag
+        except AttributeError:
+            pass
+        return label_name
 
-            fields = {
-                "file": ("volume.npy.gz", compressed_data, "application/octet-stream"),
-                "positive_click": str(
-                    positive_click
-                ),  # Make sure to send it as a string.
-            }
-            encoder = MultipartEncoder(fields=fields)
-            seg_response = self.request_to_server(
-                url,
-                data=encoder,
-                headers={
-                    "Content-Type": encoder.content_type,
-                    "Content-Encoding": "gzip",
-                },
+    def _scribble_mask_or_none(self, segmentation_node, label_name, volume_node):
+        if segmentation_node is None or label_name is None or volume_node is None:
+            return None
+        try:
+            segmentation = segmentation_node.GetSegmentation()
+        except Exception:  # noqa: BLE001
+            return None
+        if segmentation is None or segmentation.GetSegment(label_name) is None:
+            debug_print(f"Ignoring scribble callback for missing segment '{label_name}'.")
+            return None
+
+        binary_name = (
+            slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+        )
+        try:
+            if not segmentation.ContainsRepresentation(binary_name):
+                return None
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            return slicer.util.arrayFromSegmentBinaryLabelmap(
+                segmentation_node, label_name, volume_node
             )
+        except Exception as exc:  # noqa: BLE001
+            debug_print(f"Ignoring unreadable scribble labelmap for '{label_name}': {exc}")
+            return None
 
-            if seg_response.status_code == 200:
-                unpacked_segmentation = self.unpack_binary_segmentation(
-                    seg_response.content, decompress=False
-                )
-                self.show_segmentation(unpacked_segmentation)
-            else:
-                debug_print(
-                    f"lasso_or_scribble_prompt upload failed with status code: {seg_response.status_code}"
-                )
-        except Exception as e:
-            debug_print(f"Error in lasso_or_scribble_prompt: {e}")
+    def _scribble_new_voxels_region(self, node, label_name, volume_node):
+        """Fast path for the scribble diff.
+
+        Reads only THIS segment's own allocated labelmap extent -- a few small slices
+        for a scribble -- via the zero-copy internal-labelmap view, and diffs it against
+        the per-label baseline restricted to the same extent. The old path rasterized
+        the segment onto the FULL reference-volume geometry on every stroke (allocate +
+        fill the whole volume), then ran a full-volume diff/argwhere/copy; on a large
+        image that dominated the perceived latency of a scribble.
+
+        Returns ``(crop, bbox, commit)`` where ``crop``/``bbox`` are the newly painted
+        voxels in ``(k, j, i)`` half-open form and ``commit`` is a callable -- run only
+        AFTER the result is shown -- that folds the stroke into the baseline and returns
+        an undo closure. Returns ``None`` if the labelmap is not ready yet or nothing
+        new was painted. Raises on unexpected API issues so the caller can fall back to
+        the robust full-volume path.
+        """
+        segmentation = node.GetSegmentation()
+        if segmentation is None or segmentation.GetSegment(label_name) is None:
+            debug_print(f"Ignoring scribble callback for missing segment '{label_name}'.")
+            return None
+        binary_name = (
+            slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+        )
+        if not segmentation.ContainsRepresentation(binary_name):
+            return None
+        vimage = node.GetBinaryLabelmapInternalRepresentation(label_name)
+        if vimage is None:
+            return None
+        # Allocated labelmap extent in IJK (i, j, k), inclusive. The scribble node shares
+        # the volume's geometry (SetReferenceImageGeometryParameterFromVolumeNode), so
+        # these indices address the volume array directly. A SHARED labelmap (fg + bg)
+        # reports the union extent, which is why we filter by THIS segment's value below.
+        ix0, ix1, iy0, iy1, iz0, iz1 = vimage.GetExtent()
+        if ix1 < ix0 or iy1 < iy0 or iz1 < iz0:
+            return None  # nothing allocated yet -- early AnyEvent before the real stroke
+        view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(node, label_name)
+        if view is None:
+            return None
+        label_value = segmentation.GetSegment(label_name).GetLabelValue()
+        cur = view == label_value  # this segment's own voxels (labelmap may be shared)
+
+        if not isinstance(getattr(self, "_prev_scribble_masks", None), dict):
+            self._prev_scribble_masks = {}
+        full_shape = self.get_image_data().shape  # (z, y, x); arrayFromVolume is a view
+        base = self._prev_scribble_masks.get(label_name)
+        if base is None or base.shape != full_shape:
+            base = np.zeros(full_shape, dtype=np.uint8)
+            self._prev_scribble_masks[label_name] = base
+        base_region = base[iz0:iz1 + 1, iy0:iy1 + 1, ix0:ix1 + 1]  # view into the baseline
+        # Newly painted on THIS label since the last stroke (boolean "now AND not before"
+        # over the small extent only -- no full-volume pass).
+        new = cur & (base_region == 0)
+
+        crop, local_bbox = self._mask_to_crop(new)
+        if crop is None:
+            return None  # nothing newly painted
+        (lk0, lk1), (lj0, lj1), (li0, li1) = local_bbox
+        bbox = [
+            [iz0 + lk0, iz0 + lk1],
+            [iy0 + lj0, iy0 + lj1],
+            [ix0 + li0, ix0 + li1],
+        ]
+
+        def commit():
+            # Snapshot the pre-stroke baseline (full, but off the latency path) so the
+            # existing overlay-undo path can roll the whole label back, then fold this
+            # stroke into the baseline so the next stroke diffs correctly.
+            prev_full = base.copy()
+            base_region[new] = 1
+            return self._make_overlay_restore(label_name, prev_full)
+
+        return crop, bbox, commit
+
+    def _scribble_new_voxels_full(self, node, label_name, volume_node):
+        """Fallback scribble diff over the full reference-volume rasterization, used only
+        if ``_scribble_new_voxels_region`` raises. Same ``(crop, bbox, commit)`` contract.
+        """
+        mask = self._scribble_mask_or_none(node, label_name, volume_node)
+        if mask is None:
+            # Early AnyEvent before the binary labelmap is ready -- wait for the stroke.
+            return None
+        if not isinstance(getattr(self, "_prev_scribble_masks", None), dict):
+            self._prev_scribble_masks = {}
+        # Track the previous paint PER LABEL ("fg" vs "bg"). A single shared previous
+        # mask let a negative (bg) scribble be compared against a positive (fg) one.
+        prev = self._prev_scribble_masks.get(label_name)
+        if prev is None or prev.shape != mask.shape:
+            prev = np.zeros_like(mask)
+        # Only the voxels newly painted on THIS label since the last stroke. Use a
+        # boolean "painted now AND not before" instead of a uint8 subtraction, which
+        # underflowed (0 - 1 = 255) and leaked old/other-label scribbles into the prompt.
+        new = np.logical_and(mask > 0, prev == 0)
+        crop, bbox = self._mask_to_crop(new)
+        if crop is None:
+            return None
+
+        def commit():
+            # mask is a freshly extracted array we own, so store it directly as the new
+            # baseline (no extra full-volume copy), and roll back to the pre-stroke one.
+            self._prev_scribble_masks[label_name] = mask
+            return self._make_overlay_restore(label_name, prev)
+
+        return crop, bbox, commit
 
     def on_scribble_finished(self, caller, event):
+        if getattr(self, "_scribble_callback_in_progress", False):
+            return
+        self._scribble_callback_in_progress = True
+        try:
+            self._on_scribble_finished(caller, event)
+        finally:
+            self._scribble_callback_in_progress = False
+
+    def _on_scribble_finished(self, caller, event):
         """
         Called when the user completes a scribble stroke in the Paint effect.
         We calculate the diff in the drawn region and send it to the server.
         """
-        debug_print("Scribble stroke finished - labelmap modified!")
+        debug_print("Scribble labelmap event received.")
 
-        # Clean up observer if you only want it once
-        if hasattr(self, "_scribble_labelmap_callback_tag"):
-            caller.RemoveObserver(self._scribble_labelmap_callback_tag["tag"])
-            label_name = self._scribble_labelmap_callback_tag["label_name"]
-            del self._scribble_labelmap_callback_tag
-        else:
+        tag_info = getattr(self, "_scribble_labelmap_callback_tag", None)
+        if not tag_info:
             return
 
-        mask = slicer.util.arrayFromSegmentBinaryLabelmap(
-            self.scribble_segment_node, label_name, self.get_volume_node()
+        observed_node = tag_info.get("node")
+        if observed_node is not None and not self._same_mrml_node(caller, observed_node):
+            return
+
+        label_name = tag_info.get("label_name")
+        if not self._same_mrml_node(caller, getattr(self, "scribble_segment_node", None)):
+            self._remove_scribble_labelmap_observer(expected_node=caller)
+            return
+
+        volume_node = self.get_volume_node()
+        if not self._scribble_prompt_matches_volume(volume_node):
+            debug_print("Ignoring scribble callback for stale source-volume geometry.")
+            self._remove_scribble_labelmap_observer(expected_node=caller)
+            return
+
+        # Extract only the newly painted voxels of this stroke. The fast path reads just
+        # this segment's allocated labelmap extent; if anything unexpected happens there,
+        # fall back to the robust (slower) full-volume diff so a stroke is never dropped.
+        try:
+            diff = self._scribble_new_voxels_region(caller, label_name, volume_node)
+        except Exception as exc:  # noqa: BLE001
+            debug_print(f"Region scribble diff failed ({exc}); using full-volume diff.")
+            diff = self._scribble_new_voxels_full(caller, label_name, volume_node)
+
+        if diff is None:
+            # Segment Editor emits several early AnyEvent notifications before the binary
+            # labelmap is ready, and a stroke that paints nothing new yields no diff.
+            # Keep the observer and wait for the real stroke.
+            return
+        crop, bbox, commit = diff
+
+        self._remove_scribble_labelmap_observer(expected_node=caller)
+        sent = self.lasso_or_scribble_prompt(
+            crop=crop,
+            interaction_bbox=bbox,
+            positive_click=(label_name == "fg"),
+            tp="scribble",
         )
-
-        if (
-            hasattr(self, "_prev_scribble_mask")
-            and self._prev_scribble_mask is not None
-        ):
-            prev_scribble_mask = self._prev_scribble_mask
-        else:
-            prev_scribble_mask = mask * 0
-
-        diff_mask = mask - prev_scribble_mask
-        self._prev_scribble_mask = mask
-
-        self.lasso_or_scribble_prompt(
-            mask=diff_mask, positive_click=self.is_positive, tp="scribble"
-        )
+        if sent:
+            # Baseline update + undo registration run only after the result is shown, so
+            # they stay off the user-perceived latency path.
+            self._push_prompt_undo(commit())
 
         self.ui.pbInteractionScribble.click()  # turn it off
         self.ui.pbInteractionScribble.click()  # turn it on
@@ -1376,6 +2077,91 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     ###############################################################################
     # Segmentation-related functions
     ###############################################################################
+
+    def reset_all_prompts(self):
+        """
+        Tear down every interactive prompt before starting/clearing an object:
+        remove the displayed point/bbox/lasso markups, rebuild empty scribble
+        segments, drop the per-label scribble history, and clear the session's
+        interactions. Without this, prompts (especially negative scribbles) from the
+        previous object carried over and corrupted the next one.
+        """
+        if getattr(self, "scribble_editor_widget", None) is not None:
+            self.scribble_editor_widget.setActiveEffectByName("")
+        self._remove_scribble_labelmap_observer()
+        self.setup_prompts()  # removes displayed markups + recreates empty scribble segments
+        self._cancel_lasso_stroke()  # clear any persistent freehand-lasso overlay
+        self._prev_scribble_masks = {}
+        self._clear_prompt_undo()
+        if self.session is not None:
+            try:
+                self.session.reset_interactions()
+            except self.SESSION_LOST_ERRORS as exc:
+                self.handle_session_expired(exc)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Deselect the active interaction tool so re-selecting works with a single
+        # click. After teardown a tool button -- the scribble button in particular --
+        # could stay "checked" but inactive, forcing the user to click it twice.
+        self._place_tool = None  # also drop point/bbox click-capture
+        self._cancel_bbox_drag()
+        for button in self.all_prompt_buttons.values():
+            button.setChecked(False)
+        # setChecked() above does not fire the click handlers, so normalize the cursor
+        # here: with every tool now off it reverts to the default (on_next_segment
+        # re-activates the tool afterwards, which re-applies the coloured cursor).
+        self._update_prompt_cursor()
+
+        # Invalidate the segment baseline so the next prompt re-seeds the session for
+        # whatever segment is then selected.
+        self.previous_states.pop("segment_fp", None)
+
+    def on_next_segment(self):
+        """
+        'Next segment' handler (button / 'e' shortcut): fully reset the current
+        prompts and session, then create a fresh empty segment to work on. The
+        active interaction tool is preserved so the user can keep working on the new
+        object without re-selecting it.
+        """
+        active_tool = self._active_prompt_tool()
+
+        # Collapse the finished object's labelmaps once here (a storage optimization
+        # kept off the per-prediction hot path in show_segmentation).
+        seg_node = self.get_segmentation_node()
+        if seg_node is not None and seg_node.GetSegmentation().GetNumberOfSegments() > 0:
+            try:
+                seg_node.GetSegmentation().CollapseBinaryLabelmaps()
+            except Exception:  # noqa: BLE001
+                pass
+
+        self.reset_all_prompts()
+        result = self.make_new_segment()
+
+        # Keep the same tool active on the new segment. Deferred so the prompt nodes
+        # rebuilt by reset_all_prompts have settled before we re-enter place/paint mode.
+        if active_tool is not None:
+            qt.QTimer.singleShot(0, lambda: self._activate_prompt_tool(active_tool))
+        return result
+
+    def _active_prompt_tool(self):
+        """Return the name of the currently active interaction tool, or None."""
+        for name, button in self.all_prompt_buttons.items():
+            if button.isChecked():
+                return name
+        return None
+
+    def _activate_prompt_tool(self, name):
+        """Re-activate an interaction tool by name (no-op if missing/disabled/active)."""
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            return
+        button = self.all_prompt_buttons.get(name)
+        if button is None or not button.isEnabled():
+            return
+        if not button.isChecked():
+            button.click()
 
     def make_new_segment(self):
         """
