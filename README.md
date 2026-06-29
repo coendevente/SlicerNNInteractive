@@ -197,12 +197,13 @@ Read more on how to contribute to this repository [here](CONTRIBUTING.md), while
 For development, `SlicerNNInteractive` can be installed directly from github, without the Extensions Manager of 3D Slicer.
 
 1. `git clone git@github.com:coendevente/SlicerNNInteractive.git` (or download the current project as a `.zip` file from GitHub).
-2. Open 3D Slicer and click the Module dropdown menu in the top left of the 3D Slicer window:
+2. Enable developer mode (the `Extension Wizard` is only available in developer mode): go to `Edit` > `Application Settings` > `Developer`, check `Enable developer mode`, and restart 3D Slicer when prompted.
+3. Open 3D Slicer and click the Module dropdown menu in the top left of the 3D Slicer window:
 	![Slicer dropdown menu](img/dropdown.png)
-3. Go to `Developer Tools` > `Extension Wizard`.
-4. Click `Select Extension`.
-5. Locate the `SlicerNNInteractive` folder you obtained in Step 1, and select the `slicer_plugin` folder.
-6. Go to the Module dropdown menu again and go to `Segmentation` > `SlicerNNInteractive`. This should result in the following view:
+4. Go to `Developer Tools` > `Extension Wizard`.
+5. Click `Select Extension`.
+6. Locate the `SlicerNNInteractive` folder you obtained in Step 1, and select the `slicer_plugin` folder.
+7. Go to the Module dropdown menu again and go to `Segmentation` > `SlicerNNInteractive`. This should result in the following view:
   ![First view of the Slicer extension](img/plugin_first_sight.png)
 	a) If you would like to have `SlicerNNInteractive` available in the top menu (as in the image above), go to `Edit` > `Application Settings` > `Modules` and drag `SlicerNNInteractive` from the `Modules:` list to the `Favorite Modules:` list.
 
