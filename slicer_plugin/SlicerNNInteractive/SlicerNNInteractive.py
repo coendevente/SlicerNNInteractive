@@ -202,7 +202,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._lasso_slice_widget = None
         self._lasso_display_pts = []
         # VTK 2D outline actor for the live freehand contour (see _lasso_overlay_*).
-        # The persistent filled prompt is a labelmap overlay (see _paint_prompt_overlay).
+        # The persistent filled prompt is its own overlay segment (see _add_prompt_overlay_segment).
         self._lasso_points = None
         self._lasso_outline_pd = None
         self._lasso_outline_actor = None
@@ -1254,6 +1254,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "vtkMRMLSegmentEditorNode"
             )
             self.scribble_editor_widget.setMRMLSegmentEditorNode(self.scribble_editor_node)
+            # Don't overwrite other segments when painting: positive (fg) and negative
+            # (bg) scribbles -- and a scribble overlapping a stamped lasso -- must be able
+            # to coexist and stack their (translucent) fills instead of one erasing the
+            # other where they overlap. Without this the earlier prompt vanishes under a
+            # later overlapping one of the opposite polarity.
+            try:
+                self.scribble_editor_node.SetOverwriteMode(
+                    slicer.vtkMRMLSegmentEditorNode.OverwriteNone
+                )
+            except Exception as exc:  # noqa: BLE001 - non-fatal display/edit tweak
+                debug_print(f"Could not set scribble overwrite mode: {exc}")
 
         # The previous scribble segmentation node (if any) was removed by
         # remove_prompt_nodes(); create a fresh, empty one.
@@ -1293,6 +1304,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         # Per-label ("fg"/"bg") accumulated paint, used to diff out only new strokes.
         self._prev_scribble_masks = {}
+        # Fresh node has no per-instance prompt segments yet; restart their numbering.
+        self._prompt_overlay_counter = 0
 
         light_dark_mode = self.is_ui_dark_or_light_mode()
         icon = qt.QIcon(self.resourcePath(f"Icons/prompts/{light_dark_mode}/scribble_icon.svg"))
@@ -1766,6 +1779,30 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             self._apply_prompt_cursor(tool)
 
+    def _restrict_markup_to_2d(self, display_node):
+        """Show a prompt markup only in the slice (2D) views, never in 3D.
+
+        nnInteractive prompts are 2D-only by design (lasso/scribble live in a labelmap
+        overlay and aren't rendered in 3D), so for consistency the point and bbox
+        markups are restricted to the slice views too -- otherwise points (and the bbox
+        box) would be the only prompts appearing in the 3D view. Done by limiting the
+        display node to the slice view nodes; there is no per-node 3D-visibility flag.
+        """
+        if display_node is None:
+            return
+        try:
+            slice_nodes = slicer.util.getNodesByClass("vtkMRMLSliceNode")
+            if not slice_nodes:
+                # No slice views found -- don't restrict to nothing (that would hide the
+                # markup everywhere); leave it as-is.
+                return
+            display_node.SetVisibility2D(True)
+            display_node.RemoveAllViewNodeIDs()
+            for slice_node in slice_nodes:
+                display_node.AddViewNodeID(slice_node.GetID())
+        except Exception as exc:  # noqa: BLE001 - display tweak only, never fatal
+            debug_print(f"Could not restrict markup to 2D views: {exc}")
+
     def display_node_markup_point(self, display_node):
         """
         Handles the appearance of the point display node. Points use the per-control-
@@ -1779,13 +1816,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         display_node.SetActiveColor(1.0, 1.0, 0.0)  # while actively placing
         display_node.SetOpacity(1.0)  # Fully opaque
         display_node.SetSliceProjection(False)  # Make points visible in all slice views
+        self._restrict_markup_to_2d(display_node)  # prompts are 2D-only (no 3D rendering)
 
     def display_node_markup_bbox(self, display_node):
         """
         Handles the appearance of the BBox display node.
         """
         display_node.SetFillOpacity(0)
-        display_node.SetOutlineOpacity(0.5)
+        display_node.SetOutlineOpacity(1.0)  # crisp, opaque box outline even when nested
         display_node.SetSelectedColor(0, 0, 1)
         display_node.SetColor(0, 0, 1)
         display_node.SetActiveColor(0, 0, 1)
@@ -1794,6 +1832,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         display_node.SetGlyphScale(0)
         display_node.SetHandlesInteractive(False)
         display_node.SetTextScale(0)
+        self._restrict_markup_to_2d(display_node)  # prompts are 2D-only (no 3D rendering)
 
     def display_node_markup_lasso(self, display_node):
         """
@@ -1957,22 +1996,21 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             outer_point_two=second_xyz,
             positive_click=self.is_positive,
         )
-        # Persist the box as a hollow outline painted into the prompt overlay, so it
-        # stays visible and tracks pan/zoom/slice like the scribble/lasso prompts (the
-        # live VTK preview is display-space only and is removed on release).
+        # Persist the box as a hollow outline in its OWN overlay segment, so it stays
+        # visible (with its own outline, stacking with anything it overlaps) and tracks
+        # pan/zoom/slice like the scribble/lasso prompts. The live VTK preview is
+        # display-space only and is removed on release.
         crop, bbox = self._bbox_outline_crop(first_xyz, second_xyz)
-        undo_overlay = (
-            self._paint_prompt_overlay(crop, bbox, self.is_positive) if crop is not None else None
+        undo = (
+            self._add_prompt_overlay_segment(crop, bbox, self.is_positive)
+            if crop is not None
+            else None
         )
-        if undo_overlay is not None:
-            label, prev = undo_overlay
-            self._push_prompt_undo(self._make_overlay_restore(label, prev))
-        else:
-            self._push_prompt_undo(lambda: None)
+        self._push_prompt_undo(undo if undo is not None else (lambda: None))
 
     def _bbox_outline_crop(self, xyz_a, xyz_b):
         """Build a 1-voxel-thick rectangle outline for the box spanning two IJK corners,
-        in the (crop, ((k0,k1),(j0,j1),(i0,i1))) form _paint_prompt_overlay expects.
+        in the (crop, ((k0,k1),(j0,j1),(i0,i1))) form _add_prompt_overlay_segment expects.
         Clamped to the image; returns (None, None) if degenerate or out of bounds."""
         image = self.get_image_data()
         if image is None:
@@ -2309,8 +2347,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _lasso_overlay_create(self, slice_view, color):
         """Build the live outline actor for a fresh stroke (display coords, follows the
-        cursor). The persistent filled prompt is a labelmap overlay painted on release
-        (see _paint_prompt_overlay), so the outline actor is transient."""
+        cursor). The persistent filled prompt is its own overlay segment added on release
+        (see _add_prompt_overlay_segment), so the outline actor is transient."""
         self._lasso_overlay_remove()
         renderer = self._lasso_renderer_for(slice_view)
         if renderer is None:
@@ -2421,9 +2459,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
 
         # Send the prompt FIRST so the model result is painted immediately (exactly as
-        # the bbox path does). Only then stamp the filled region into the green/red
-        # prompt-overlay labelmap so it persists and tracks pan/zoom/slice navigation.
-        # _paint_prompt_overlay does a full-volume labelmap read+write that would
+        # the bbox path does). Only then add the filled region as its own overlay
+        # segment so it persists and tracks pan/zoom/slice navigation.
+        # _add_prompt_overlay_segment does a full-volume labelmap write that would
         # otherwise delay the result the user is waiting on. Drop the display-space
         # outline actor up front so the live stroke disappears the instant the user
         # releases, regardless of how long the prompt round-trip takes.
@@ -2435,51 +2473,143 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             tp="lasso",
         )
         if sent:
-            undo_overlay = self._paint_prompt_overlay(crop, bbox, self.is_positive)
-            if undo_overlay is not None:
-                label, prev = undo_overlay
-                self._push_prompt_undo(self._make_overlay_restore(label, prev))
-            else:
-                # Keep the undo stack paired 1:1 with session interactions.
-                self._push_prompt_undo(lambda: None)
+            # Persist the lasso as its own distinct overlay segment (so it stays visible
+            # and outlined even when nested inside another prompt).
+            undo = self._add_prompt_overlay_segment(crop, bbox, self.is_positive)
+            # Keep the undo stack paired 1:1 with session interactions.
+            self._push_prompt_undo(undo if undo is not None else (lambda: None))
 
-    def _paint_prompt_overlay(self, crop, bbox, positive):
-        """
-        Stamp a filled crop into the shared green/red prompt-overlay segmentation
-        (``scribble_segment_node``: fg = positive/green, bg = negative/red) so a
-        finished lasso stays visible and follows the view. The scribble diff baseline
-        is updated in lockstep so this fill is not later re-sent as a scribble.
+    def _add_prompt_overlay_segment(self, crop, bbox, positive):
+        """Render a finished lasso/scribble stroke as its OWN overlay segment.
+
+        Each prompt becomes a distinct, outlined segment (green = positive, red =
+        negative) in ``scribble_segment_node`` instead of merging into the shared fg/bg
+        fill. With the editor's OverwriteNone mode the segments overlap freely, so a
+        prompt drawn inside another keeps its own outline and its translucent fill
+        stacks on top -- a scribble inside a lasso (etc.) stays visible. This is purely
+        visualization: the model interaction was already sent by the caller.
+
+        Returns an undo closure that removes the segment, or None if nothing was drawn.
         """
         node = getattr(self, "scribble_segment_node", None)
         volume = self.get_volume_node()
-        image = self.get_image_data()
-        if node is None or volume is None or image is None:
+        if node is None or volume is None or crop is None:
             return None
-        label = "fg" if positive else "bg"
+        sub = (np.asarray(crop) > 0).astype(np.uint8)
+        if int(sub.sum()) == 0:
+            return None
+        color = self.COLOR_POSITIVE if positive else self.COLOR_NEGATIVE
+        self._prompt_overlay_counter = getattr(self, "_prompt_overlay_counter", 0) + 1
+        seg_id = f"prompt_{self._prompt_overlay_counter}"
+        segmentation = node.GetSegmentation()
+        segmentation.AddEmptySegment(seg_id, seg_id, list(color))
+        segment = segmentation.GetSegment(seg_id)
+        if segment is not None:
+            segment.SetColor(*color)  # explicit (the AddEmptySegment colour is ignored on some builds)
         try:
-            arr = slicer.util.arrayFromSegmentBinaryLabelmap(node, label, volume)
-        except Exception:  # noqa: BLE001
-            arr = None
-        if arr is None or arr.shape != image.shape:
-            arr = np.zeros(image.shape, dtype=np.uint8)
-        # Snapshot the label's overlay before this stroke so the stroke can be undone.
-        prev_overlay = arr.copy()
+            # Region write: only the crop's sub-extent is imported, not a full-volume
+            # array (the segment is fresh, so MODE_REPLACE over the bbox is exact).
+            self._set_segment_region_from_crop(node, seg_id, sub, bbox)
+        except Exception as exc:  # noqa: BLE001 - display only; the prompt was already sent
+            debug_print(f"_add_prompt_overlay_segment: could not write labelmap: {exc}")
+            try:
+                segmentation.RemoveSegment(seg_id)
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        dn = node.GetDisplayNode()
+        if dn is not None:
+            # Translucent fill (so overlaps read as stacked) + opaque outline.
+            dn.SetSegmentOpacity2DFill(seg_id, 0.4)
+            dn.SetSegmentOpacity2DOutline(seg_id, 1.0)
+        return self._make_segment_remove_undo(seg_id)
+
+    def _set_segment_region_from_crop(self, segmentation_node, segment_id, crop, bbox):
+        """Write a tight crop into ``segment_id`` over only its sub-extent (no
+        full-volume array). ``crop`` is the (k, j, i) sub-region; ``bbox`` its half-open
+        absolute extent ``[[k0,k1],[j0,j1],[i0,i1]]``. MODE_REPLACE sets this segment's
+        voxels to the crop inside the bbox and leaves it background elsewhere -- correct
+        for a freshly created segment. Mirrors the fast path of _update_segment_region.
+        """
+        from vtk.util import numpy_support
+
         (k0, k1), (j0, j1), (i0, i1) = bbox
-        arr[k0:k1, j0:j1, i0:i1] = np.logical_or(
-            arr[k0:k1, j0:j1, i0:i1], crop > 0
-        ).astype(np.uint8)
+        sub = np.ascontiguousarray(crop, dtype=np.uint8)
+        oriented = slicer.vtkOrientedImageData()
+        oriented.SetExtent(i0, i1 - 1, j0, j1 - 1, k0, k1 - 1)
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        self.get_volume_node().GetIJKToRASMatrix(ijk_to_ras)
+        oriented.SetImageToWorldMatrix(ijk_to_ras)
+        oriented.GetPointData().SetScalars(
+            numpy_support.numpy_to_vtk(
+                sub.reshape(-1), deep=True, array_type=vtk.VTK_UNSIGNED_CHAR
+            )
+        )
+        slicer.vtkSlicerSegmentationsModuleLogic.SetBinaryLabelmapToSegment(
+            oriented,
+            segmentation_node,
+            segment_id,
+            slicer.vtkSlicerSegmentationsModuleLogic.MODE_REPLACE,
+        )
+
+    def _make_segment_remove_undo(self, seg_id):
+        """Undo closure: remove a per-instance prompt overlay segment (see
+        _add_prompt_overlay_segment)."""
+
+        def _undo():
+            node = getattr(self, "scribble_segment_node", None)
+            if node is None:
+                return
+            segmentation = node.GetSegmentation()
+            if segmentation is not None and segmentation.GetSegment(seg_id) is not None:
+                try:
+                    segmentation.RemoveSegment(seg_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        return _undo
+
+    def _clear_scribble_scratch(self, label_name):
+        """Empty the live paint scratch segment (fg/bg) after its stroke has been frozen
+        into a per-instance overlay segment, and reset that label's diff baseline so the
+        next stroke is detected against an empty segment.
+
+        The scribble observer is already removed by the caller before this runs, so this
+        labelmap write does not re-trigger the scribble callback.
+        """
+        node = getattr(self, "scribble_segment_node", None)
+        if node is None:
+            return
+        cleared = False
         try:
-            slicer.util.updateSegmentBinaryLabelmapFromArray(arr, node, label, volume)
+            # Zero only THIS segment's own (small) allocated extent in place via the
+            # zero-copy internal view -- no full-volume array. The scratch holds just the
+            # stroke we already moved out, so its extent is tiny.
+            segmentation = node.GetSegmentation()
+            segment = segmentation.GetSegment(label_name) if segmentation is not None else None
+            vimage = node.GetBinaryLabelmapInternalRepresentation(label_name)
+            view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(node, label_name)
+            if segment is not None and view is not None and view.size:
+                view[view == segment.GetLabelValue()] = 0  # leave any sibling values intact
+                if vimage is not None:
+                    vimage.Modified()  # numpy write bypasses VTK's MTime
+                segment.Modified()
+                cleared = True
         except Exception as exc:  # noqa: BLE001
-            # Write API unavailable/changed -- skip the persistent overlay (the lasso
-            # prompt is still sent to the model). Logged so it is diagnosable.
-            debug_print(f"_paint_prompt_overlay: could not update labelmap: {exc}")
-            return None
-        # Keep the per-label scribble baseline in sync (see on_scribble_finished).
-        if not hasattr(self, "_prev_scribble_masks") or self._prev_scribble_masks is None:
-            self._prev_scribble_masks = {}
-        self._prev_scribble_masks[label] = arr.copy()
-        return (label, prev_overlay)
+            debug_print(f"_clear_scribble_scratch: in-place clear failed ({exc}); full clear.")
+        if not cleared:
+            # Fallback: full-volume zeros write (robust if the internal view is unavailable).
+            volume = self.get_volume_node()
+            image = self.get_image_data()
+            if node is not None and volume is not None and image is not None:
+                try:
+                    slicer.util.updateSegmentBinaryLabelmapFromArray(
+                        np.zeros(image.shape, dtype=np.uint8), node, label_name, volume
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    debug_print(f"_clear_scribble_scratch: could not clear '{label_name}': {exc}")
+        if isinstance(getattr(self, "_prev_scribble_masks", None), dict):
+            self._prev_scribble_masks[label_name] = None
 
     #
     #  -- Scribble
@@ -2805,7 +2935,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # labelmap is ready, and a stroke that paints nothing new yields no diff.
             # Keep the observer and wait for the real stroke.
             return
-        crop, bbox, commit = diff
+        crop, bbox, commit = diff  # commit (baseline fold) is unused: we move + clear below
 
         self._remove_scribble_labelmap_observer(expected_node=caller)
         sent = self.lasso_or_scribble_prompt(
@@ -2815,9 +2945,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             tp="scribble",
         )
         if sent:
-            # Baseline update + undo registration run only after the result is shown, so
-            # they stay off the user-perceived latency path.
-            self._push_prompt_undo(commit())
+            # Freeze this stroke into its own distinct overlay segment, then empty the
+            # fg/bg paint scratch (and its diff baseline) so strokes don't merge into one
+            # flat fill and the next stroke is detected against an empty segment. Runs
+            # after the result is shown, so it stays off the latency path.
+            undo = self._add_prompt_overlay_segment(
+                crop, bbox, positive=(label_name == "fg")
+            )
+            self._clear_scribble_scratch(label_name)
+            self._push_prompt_undo(undo if undo is not None else (lambda: None))
 
         self.ui.pbInteractionScribble.click()  # turn it off
         self.ui.pbInteractionScribble.click()  # turn it on
@@ -3515,19 +3651,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     do_autozoom=do_autozoom,
                     interactions_storage=storage,
                 )
-                # Load the weights and run a warmup forward pass NOW, so Initialize gets
-                # the model fully ready instead of paying the (often large) first-forward
-                # cost -- cuDNN autotuning, CUDA kernel init, torch.compile compilation --
-                # on the user's first prompt.
+                # Load the weights. initialize_from_trained_model_folder() already runs a
+                # warmup forward pass internally, so Initialize gets the model fully ready
+                # (cuDNN autotuning, CUDA kernel init, torch.compile compilation) instead
+                # of paying that first-forward cost on the user's first prompt -- we must
+                # NOT call warmup() again here or it runs twice.
                 session.initialize_from_trained_model_folder(
                     checkpoint_path, 0, "checkpoint_final.pth"
                 )
-                warmup = getattr(session, "warmup", None)
-                if callable(warmup):
-                    try:
-                        warmup()
-                    except Exception as exc:  # noqa: BLE001 - warmup is optimization only
-                        debug_print(f"Model warmup failed (non-fatal): {exc}")
                 notes["session"] = session
             except BaseException as exc:  # noqa: BLE001 - surfaced on the main thread
                 self._local_load_error = exc
