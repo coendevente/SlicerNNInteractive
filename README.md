@@ -73,7 +73,8 @@ packages into Slicer's Python:
 
 - **Remote** → installs the torch-free **`nninteractive-client`** package (plus the `httpx` /
   `blosc2` wire stack). **No PyTorch is installed.** Then enter your server URL (and API key, if
-  any) in the `Configuration` tab and click `Connect`.
+  any) in the `Configuration` tab, and click `Initialize` at the top of the `nnInteractive Prompts`
+  tab.
 - **Local** → installs the full **`nnInteractive`** package (nnU-Net) **and PyTorch**. Pick a
   model in the `Configuration` tab — the dropdown is populated from the available-models manifest —
   and on the first segmentation its weights are downloaded automatically from
@@ -121,7 +122,7 @@ for both flavours and configuration.
 
 In Slicer's `Configuration` tab, set the server URL — e.g. `http://remote_host_name:1527`, or
 `http://localhost:1527` if the server runs on the same machine — and the API key, then click
-`Connect`.
+`Initialize` at the top of the `nnInteractive Prompts` tab.
 
 ## Usage
 
@@ -129,15 +130,17 @@ Once you have completed the installation above, you can use `SlicerNNInteractive
 
 1. If you haven't done so already, load in your image (e.g., through dragging your image file into Slicer).
 
-2. Click one of the Interaction Tool buttons from the Interactive Prompts tab (point, bounding box, scribble, or lasso) and place your prompt in the image. This should result in a segmentation. (In Local mode, the very first prompt also loads the model, which can take a moment.)
+2. Click `Initialize` at the top of the `nnInteractive Prompts` tab. This is mandatory before any prompt can be placed: it loads the model (Local) or connects to the server (Remote) and uploads the current image, so your first prompt is fast. It can take a moment (the local model may run a `torch.compile` warmup; a remote session has to upload the image). The interaction tools stay disabled until initialization finishes, and the button shows `Uninitialize` once a session is live. Clicking it again — or changing the server, API key, model or any local setting — uninitializes, so you'll need to re-initialize. Only the prompt types the loaded model supports are enabled.
 
-3. Click `Show 3D` button in the segment editor section (below the prompts section) to see the segmentation results in 3D.
+3. Click one of the Interaction Tool buttons from the Interactive Prompts tab (point, bounding box, scribble, or lasso) and place your prompt in the image. This should result in a segmentation.
 
-4. If needed, you can correct the generated segmentation with positive and negative prompts (between which you can toggle using the Positive/Negative buttons). You can undo the last interaction with `Ctrl+Z`.
+4. Click `Show 3D` button in the segment editor section (below the prompts section) to see the segmentation results in 3D.
+
+5. If needed, you can correct the generated segmentation with positive and negative prompts (between which you can toggle using the Positive/Negative buttons). You can undo the last interaction with `Ctrl+Z`.
 
 	a) Alternatively, you can reset the current segment using the "Reset segment button".
 
-5. You can add a new segment by clicking the "Next segment" button, or clicking the "+ Add" button in the Segment Editor. You can always go back to previous segments by selecting it in the Segment Editor.
+6. You can add a new segment by clicking the "Next segment" button, or clicking the "+ Add" button in the Segment Editor. You can always go back to previous segments by selecting it in the Segment Editor.
 
 ### Editing an existing segment
 You can edit an existing segmentation (generated using this plugin, or obtained otherwise, such as through loading in a segmentation file), by selecting the segment in the Segment Editor. Prompts are always applied to the selected segment.
@@ -147,7 +150,7 @@ Each button in the Interactive Prompts tab has a keyboard shortcut, indicated by
 
 ## Common issues
 
-- When the remote server restarts or a session times out, the extension surfaces a "session expired" message — reconnect from the `Configuration` tab; your current segmentation is preserved and re-seeded automatically.
+- When the remote server restarts or a session times out, the extension surfaces a "session expired" message — click `Initialize` at the top of the `nnInteractive Prompts` tab to reconnect; your current segmentation is preserved and re-seeded automatically.
 
 ## Testing
 

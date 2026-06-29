@@ -298,6 +298,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.setup_shortcuts()
 
         self.all_prompt_buttons = {}
+        # Prompt-tool buttons are persistent UI widgets, but setup_prompts() runs on
+        # every reset / Next segment / volume change. Track which ones we've already
+        # wired so we connect each button's `clicked` exactly once -- reconnecting on
+        # every cycle would pile up duplicate slots (and fire the handler N times).
+        self._connected_prompt_buttons = set()
         self.setup_prompts()
 
         self.init_ui_functionality()
@@ -313,11 +318,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.uploadProgressGroup.setVisible(False)
 
         # Build the Configuration-tab model selection + settings (Local | Remote
-        # switch, checkpoint/device/compile, server URL, API key, Connect, ...). This
+        # switch, checkpoint/device/compile, server URL, API key, status, ...). This
         # also loads and wires the saved server URL and sets self.server.
         self.setup_config_ui()
 
-        # Prominent license banner + acknowledgement logos in the Prompts tab.
+        # Mandatory Initialize control + license banner (top of the Prompts tab) and
+        # acknowledgement logos (bottom).
         self.setup_prompts_tab_extras()
 
         # Set initial prompt type
@@ -347,6 +353,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             vtk.vtkCommand.ModifiedEvent,
             self.on_segment_editor_node_modified,
         )
+
+        # Initialization is mandatory: keep every prompt control disabled until a
+        # session is live (_on_session_ready re-enables them, gated per model).
+        self._set_interaction_ui_enabled(False)
 
     def setup_config_ui(self):
         """
@@ -456,15 +466,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.compileCheck.toggled.connect(
             lambda v: self._save_setting_bool("use_torch_compile", v, reinit=True)
         )
-        if not self._torch_compile_supported():
-            # No Python dev headers (Python.h) -> torch.compile/Triton cannot build its
-            # runtime helpers (typical in Slicer's bundled Python). Disable the option so
-            # the user can't turn on something that would fail on the first prediction.
+        compile_reason = self._torch_compile_unsupported_reason()
+        if compile_reason is not None:
+            # torch.compile can't work here (Windows, or no Python.h to build its runtime
+            # helpers -- typical in Slicer's bundled Python). Disable the option so the
+            # user can't turn on something that would fail on the first prediction, and
+            # explain why in the tooltip.
             self.ui.compileCheck.setEnabled(False)
-            self.ui.compileCheck.setToolTip(
-                "Unavailable in this Python build: torch.compile needs the Python "
-                "development headers (Python.h), which are not present."
-            )
+            self.ui.compileCheck.setToolTip(f"Unavailable: {compile_reason}")
         advanced_form.addRow("Use torch.compile:", self.ui.compileCheck)
 
         self.ui.storageCombo = qt.QComboBox()
@@ -504,28 +513,29 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.apiKeyEdit.editingFinished.connect(self._on_api_key_changed)
         remote_layout.addWidget(self.ui.apiKeyEdit)
 
-        # --- Connect + status (common to both modes) ---
-        self.ui.connectButton = qt.QPushButton("Connect")
-        self.ui.connectButton.setMinimumHeight(30)
-        self.ui.connectButton.clicked.connect(self.connect_clicked)
-        model_layout.addWidget(self.ui.connectButton)
-
-        self.ui.connectStatusLabel = qt.QLabel("Status: not connected")
+        # --- Status (common to both modes) ---
+        # The Initialize/Uninitialize action lives at the TOP of the "nnInteractive
+        # Prompts" tab (initialization is mandatory before any prompt can be placed).
+        # Keep a status readout here so the session state is visible while the user
+        # configures the server / model.
+        self.ui.connectStatusLabel = qt.QLabel("Status: not initialized")
         self.ui.connectStatusLabel.setWordWrap(True)
         model_layout.addWidget(self.ui.connectStatusLabel)
 
-        # ===== Settings group =====
-        settings_group = qt.QGroupBox("Settings")
-        settings_form = qt.QFormLayout(settings_group)
+        configure_hint = qt.QLabel(
+            "Configure here, then click <b>Initialize</b> at the top of the "
+            "<b>nnInteractive Prompts</b> tab."
+        )
+        configure_hint.setWordWrap(True)
+        configure_hint.setStyleSheet("color: gray;")
+        model_layout.addWidget(configure_hint)
 
-        self.ui.licenseLabel = qt.QLabel("Model license: —")
-        self.ui.licenseLabel.setWordWrap(True)
-        settings_form.addRow(self.ui.licenseLabel)
+        # The model license is shown only in the Prompts tab (promptsLicenseLabel), where
+        # the user actually works -- not duplicated here in the Configuration tab.
 
-        # Insert the two groups just above the trailing vertical spacer.
+        # Insert the model-selection group just above the trailing vertical spacer.
         idx = max(layout.count() - 1, 0)
         layout.insertWidget(idx, model_group)
-        layout.insertWidget(idx + 1, settings_group)
 
         # Initial switch state + container visibility, and the cached server URL.
         is_local = self.get_mode() == "local"
@@ -534,9 +544,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._update_mode_visibility()
         self.server = self.ui.serverUrlEdit.text.rstrip("/")
 
-        # Reflect the persisted mode on the action button (Connect / Initialize). If
-        # Local is already the active mode, fill the dropdown right after setup finishes
-        # (deferred so we don't pip-install the lightweight listing deps mid-construction).
+        # Reflect the persisted mode in the status readout. If Local is already the
+        # active mode, fill the dropdown right after setup finishes (deferred so we
+        # don't pip-install the lightweight listing deps mid-construction).
         self.update_connect_status(connected=False)
         if is_local:
             qt.QTimer.singleShot(
@@ -557,12 +567,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def on_mode_changed(self, mode):
         if mode == self.get_mode():
-            return  # re-click of the active mode -- don't drop the session
+            return  # re-click of the active mode -- nothing to do
         self.set_mode(mode)
         self._update_mode_visibility()
-        # Switching the toggle does not disconnect/uninitialize; just reflect whether a
-        # session for the now-selected mode already exists.
-        self.update_connect_status(connected=self._session_active_for_mode(mode))
+        # Mode is a session-affecting setting (like the server URL or a local option):
+        # switching it tears down any live session and locks the prompt UI, so the user
+        # explicitly re-initializes for the newly selected mode with a single click.
+        # (Without this, the old session stays live behind a "not initialized" status,
+        # and the first Initialize press would only uninitialize it.)
+        self._teardown_for_settings_change()
         if mode == "local":
             # User explicitly chose Local: prepare the model dropdown now (installing
             # the lightweight listing deps if needed).
@@ -631,21 +644,54 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def setup_prompts_tab_extras(self):
         """
-        Adds a prominent model-license banner (top) and the Helmholtz Imaging + DKFZ
-        acknowledgement logos (bottom) to the Prompts tab -- the view the user
-        actually works in.
+        Adds, at the very top of the Prompts tab (the view the user actually works in),
+        a mandatory Initialize/Uninitialize control, then a prominent model-license
+        banner. The Helmholtz Imaging + DKFZ acknowledgement logos go at the bottom.
+
+        Initialization is mandatory before any prompt can be placed: it loads the local
+        model (and runs the torch.compile / cuDNN warmup) or connects to the remote
+        server, and uploads the current image so the first prompt is fast. The
+        interaction controls below stay disabled until a session is live, and clicking
+        Initialize again -- or changing any session-affecting setting -- uninitializes.
         """
         layout = self.ui.tabPrompts.layout()
+
+        # ===== Initialization (top, above the license) =====
+        init_group = qt.QGroupBox("")
+        init_layout = qt.QVBoxLayout(init_group)
+        init_layout.setContentsMargins(8, 6, 8, 6)
+        init_layout.setSpacing(4)
+
+        self.ui.initializeButton = qt.QPushButton("Initialize")
+        self.ui.initializeButton.setMinimumHeight(34)
+        self.ui.initializeButton.setToolTip(
+            "Load the model / connect to the server and upload the current image.\n"
+            "Required before any prompt can be placed. Click again to uninitialize.\n"
+            "Changing the server, API key, model or any local setting also "
+            "uninitializes and requires re-initializing."
+        )
+        self.ui.initializeButton.clicked.connect(self.connect_clicked)
+        init_layout.addWidget(self.ui.initializeButton)
+
+        self.ui.promptsStatusLabel = qt.QLabel("Status: not initialized")
+        self.ui.promptsStatusLabel.setWordWrap(True)
+        self.ui.promptsStatusLabel.setAlignment(qt.Qt.AlignCenter)
+        init_layout.addWidget(self.ui.promptsStatusLabel)
+
+        layout.insertWidget(0, init_group)
 
         self.ui.promptsLicenseLabel = qt.QLabel("Model license: —")
         self.ui.promptsLicenseLabel.setWordWrap(True)
         self.ui.promptsLicenseLabel.setAlignment(qt.Qt.AlignCenter)
         self.ui.promptsLicenseLabel.setStyleSheet("font-weight: bold; padding: 4px;")
-        layout.insertWidget(0, self.ui.promptsLicenseLabel)
+        layout.insertWidget(1, self.ui.promptsLicenseLabel)
 
         logos = self._build_logos_widget(height=26)
         if logos is not None:
             layout.addWidget(logos)
+
+        # Reflect the current (idle) session state on the freshly created button.
+        self.update_connect_status(connected=self.session is not None)
 
     def _build_logos_widget(self, height=26):
         """Returns a small white box with the HI and DKFZ logos side by side (or None)."""
@@ -792,11 +838,53 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             ),
         )
         dep_thread.start()
-        while not parallel_event.is_set():
+        # Wait on the event with a short timeout (which releases the GIL so the worker
+        # runs at full speed) and pump the Qt event loop between waits. A tight
+        # processEvents() spin would keep re-acquiring the GIL and starve the worker.
+        while not parallel_event.wait(0.03):
             slicer.app.processEvents()
         dep_thread.join()
 
         self.progressbar.close()
+
+    def _run_thread_with_message(self, target, args, message):
+        """Run ``target(*args, done_event)`` in a worker thread while showing a simple
+        modal message dialog -- a label only, NO progress bar -- and pumping the Qt
+        event loop so it stays painted.
+
+        Used for opaque, unmeasurable work like the image upload: the client sends the
+        image in one blocking call with no byte-level progress callback, so a progress
+        bar could only ever jump 0%->done, which is misleading. A plain "please wait"
+        message is the honest UI here.
+        """
+        dialog = qt.QDialog(slicer.util.mainWindow())
+        dialog.setWindowTitle("nnInteractive")
+        dialog.setModal(True)
+        # No close/help buttons: the work cannot be cancelled and the dialog is closed
+        # programmatically once the worker finishes.
+        dialog.setWindowFlags(
+            qt.Qt.Dialog | qt.Qt.CustomizeWindowHint | qt.Qt.WindowTitleHint
+        )
+        dialog_layout = qt.QVBoxLayout(dialog)
+        dialog_layout.setContentsMargins(24, 20, 24, 20)
+        dialog_layout.addWidget(qt.QLabel(message))
+        dialog.show()
+        slicer.app.processEvents()
+
+        done_event = threading.Event()
+        worker = threading.Thread(target=target, args=(*args, done_event))
+        worker.start()
+        # Wait on the event with a short timeout (which releases the GIL so the worker
+        # runs at full speed) and pump the Qt event loop between waits to keep the dialog
+        # responsive. A tight processEvents() spin would instead keep re-acquiring the
+        # GIL and starve the worker, making the work much slower.
+        while not done_event.wait(0.03):
+            slicer.app.processEvents()
+        worker.join()
+
+        dialog.close()
+        dialog.deleteLater()
+        slicer.app.processEvents()
 
     def cleanup(self):
         """
@@ -809,6 +897,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.removeObservers()
         self._remove_slice_event_filters()
         self._remove_scribble_labelmap_observer()
+        # Deactivate Segment Editor effects (Paint etc.) before the scene/widgets are
+        # destroyed, so effect-owned Qt timers don't fire during teardown (avoids the
+        # "QBasicTimer ... QThread" warnings on exit).
+        self._deactivate_segment_editor_effects()
 
         if not getattr(self, "_application_quitting", False):
             # Restore the default slice-view cursor (we may have set a coloured one).
@@ -819,6 +911,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         # Release any remote lease / free the local model.
         self.release_session()
+
+        if not getattr(self, "_application_quitting", False):
+            # Module reload/close (scene still valid): remove the prompt/scribble nodes
+            # we created and drop our references so they are freed rather than leaked.
+            # (At app exit, _on_application_about_to_quit already did this while the
+            # scene was valid, so skip it here to avoid touching a torn-down scene.)
+            try:
+                self.remove_prompt_nodes()
+            except Exception:  # noqa: BLE001
+                pass
+            self.target_buffer = None
+
+        # Tear down the programmatic scribble editor widget we own (parentless QObject).
+        self._destroy_scribble_editor_widget()
 
         if not getattr(self, "_application_quitting", False):
             try:
@@ -836,7 +942,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._cursor_reassert_timer_queued = False
         self._remove_slice_event_filters()
         self._remove_scribble_labelmap_observer()
+        self._deactivate_segment_editor_effects()
         self._stop_heartbeat_timer()
+        # aboutToQuit fires while the scene is still valid: remove the prompt/scribble
+        # nodes we created (and drop our references) now, so their VTK pipelines are
+        # freed before the scene is torn down instead of lingering as reported leaks.
+        try:
+            self.remove_prompt_nodes()
+        except Exception:  # noqa: BLE001 - never block shutdown
+            pass
+        self.target_buffer = None
 
     def _remove_slice_event_filters(self):
         if hasattr(self, "_qt_event_filters"):
@@ -846,6 +961,50 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 except Exception:  # noqa: BLE001
                     pass
             self._qt_event_filters = []
+
+    def _deactivate_segment_editor_effects(self):
+        """Deactivate the active effect on both Segment Editor widgets.
+
+        qMRMLSegmentEditorWidget effects (e.g. Paint, used by the scribble tool) own
+        their own Qt timers and scene observers. If an effect is still active when
+        Slicer destroys the widgets / closes the scene at shutdown, those timers get
+        poked after the thread's Qt event dispatcher is gone, which Qt reports as
+        ``QBasicTimer::start: QBasicTimer can only be used with threads started with
+        QThread``. Deactivating the effect first (as Slicer's own Segment Editor module
+        does on exit) releases those timers cleanly. Safe to call repeatedly and during
+        teardown -- every call is guarded.
+        """
+        for widget in (
+            getattr(self.ui, "editor_widget", None),
+            getattr(self, "scribble_editor_widget", None),
+        ):
+            if widget is None:
+                continue
+            try:
+                widget.setActiveEffectByName("")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _destroy_scribble_editor_widget(self):
+        """Detach the programmatic scribble Segment Editor widget from MRML and delete it.
+
+        We create this qMRMLSegmentEditorWidget ourselves with no Qt parent, so it would
+        otherwise outlive the scene at shutdown (taking its observers/timers with it).
+        Cleared references are re-created lazily by setup_scribble_prompt() if needed.
+        """
+        widget = getattr(self, "scribble_editor_widget", None)
+        if widget is None:
+            return
+        for setter in ("setSegmentationNode", "setMRMLSegmentEditorNode", "setMRMLScene"):
+            try:
+                getattr(widget, setter)(None)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            widget.deleteLater()
+        except Exception:  # noqa: BLE001
+            pass
+        self.scribble_editor_widget = None
 
     def __del__(self):
         """
@@ -1029,7 +1188,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
 
             prompt_type["node"] = node
-            prompt_type["button"].clicked.connect(lambda checked, prompt_name=prompt_name: self.on_place_button_clicked(checked, prompt_name)) 
+            # Connect each button's `clicked` only once for the widget's lifetime (see
+            # _connected_prompt_buttons); the lambda captures only prompt_name/self, so it
+            # stays valid even as the underlying prompt node is recreated.
+            if prompt_name not in self._connected_prompt_buttons:
+                prompt_type["button"].clicked.connect(
+                    lambda checked, prompt_name=prompt_name: self.on_place_button_clicked(checked, prompt_name)
+                )
+                self._connected_prompt_buttons.add(prompt_name)
             self.all_prompt_buttons[prompt_name] = prompt_type["button"]
 
             light_dark_mode = self.is_ui_dark_or_light_mode()
@@ -1167,8 +1333,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         for prompt_type in list(self.prompt_types.values()):
             _remove(prompt_type["name"])
+            # Drop our Python reference to the just-removed node. Otherwise the dict
+            # keeps the node (and the large VTK markups pipeline it owns -- curve
+            # generators, measurements, transforms, locators ...) alive until process
+            # exit, which is what shows up in vtkDebugLeaks. setup_prompts() repopulates
+            # this when it recreates the node.
+            prompt_type["node"] = None
 
-        self.ui.pbInteractionLassoCancel.setVisible(False)
+        try:
+            self.ui.pbInteractionLassoCancel.setVisible(False)
+        except Exception:  # noqa: BLE001 - UI may be gone during teardown
+            pass
 
         self._remove_scribble_prompt_node()
 
@@ -1179,6 +1354,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         left untouched here; entering Place mode for another prompt cancels an active
         freehand lasso and scribble.
         """
+        # Don't touch (possibly half-released) prompt nodes/widgets during teardown.
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            return
         interactionNode = slicer.app.applicationLogic().GetInteractionNode()
         selectionNode = slicer.app.applicationLogic().GetSelectionNode()
         in_place = (
@@ -2692,6 +2872,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         active interaction tool is preserved so the user can keep working on the new
         object without re-selecting it.
         """
+        # The 'e' shortcut bypasses the disabled button, so enforce mandatory init here.
+        if not self._require_initialized():
+            return
         active_tool = self._active_prompt_tool()
 
         # Collapse the finished object's labelmaps once here (a storage optimization
@@ -2781,6 +2964,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Clears the contents (labelmap) of the currently selected segment and
         resets the session's interactions for it.
         """
+        # The 'r' shortcut bypasses the disabled button, so enforce mandatory init here.
+        if not self._require_initialized():
+            return
         # Remember the active tool so it can be re-armed after the reset (below).
         active_tool = self._active_prompt_tool()
 
@@ -3136,10 +3322,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         qt.QSettings().setValue("SlicerNNInteractive/mode", mode)
 
-    def _session_active_for_mode(self, mode):
-        """True if the live session was built for ``mode``."""
-        return self.session is not None and getattr(self, "_session_mode", None) == mode
-
     def get_setting_bool(self, key, default):
         return slicer.util.settingsValue(
             f"SlicerNNInteractive/{key}", default, converter=slicer.util.toBool
@@ -3160,15 +3342,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _teardown_for_settings_change(self):
         """A session-affecting setting changed: drop the current session and reset the
-        action button so the user explicitly restarts (Initialize) / reconnects
-        (Connect) with the new settings applied. The next session is rebuilt from
-        scratch, so it always reads the updated settings."""
+        UI so the user explicitly re-initializes with the new settings applied. The
+        next session is rebuilt from scratch, so it always reads the updated settings."""
         had_session = self.session is not None
         self.release_session()
         self.update_connect_status(connected=False)
         if had_session:
-            action = "Initialize" if self.get_mode() == "local" else "Connect"
-            slicer.util.showStatusMessage(f"Settings changed — click {action} to apply.", 5000)
+            slicer.util.showStatusMessage(
+                "Settings changed — click Initialize (top of the Prompts tab) to apply.",
+                5000,
+            )
 
     def update_server(self):
         """Reads the server URL from the UI and persists it. Changing it disconnects the
@@ -3262,18 +3445,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return import_fn()
 
     def _construct_local_session(self):
-        """Build an in-process nnInteractiveInferenceSession (local compute)."""
-        # Heavy imports are deferred to local mode so remote-only users never load torch.
-        def _imp():
-            import torch
-            from nnInteractive.inference.inference_session import (
-                nnInteractiveInferenceSession,
-            )
-            return torch, nnInteractiveInferenceSession
+        """Build an in-process nnInteractiveInferenceSession (local compute).
 
-        torch, nnInteractiveInferenceSession = self._import_with_install(
-            self.install_local_dependencies, _imp
-        )
+        The slow, torch-heavy work -- importing torch, initializing the device,
+        constructing the session, loading the weights and the warmup forward pass --
+        runs in ONE worker thread behind a single rendered "Loading ..." dialog. This
+        is the bulk of the wait; doing it off the main thread lets the dialog appear
+        immediately and stay painted, and -- with the GIL released during the heavy
+        CUDA/torch work -- keeps loading fast. The worker never touches Qt/MRML; status
+        notes are collected and shown on the main thread afterwards.
+
+        The main-thread-only steps run first: installing dependencies (pip creates Qt
+        objects) and downloading the weights (its own progress dialog).
+        """
+        # Ensure deps are present (fast no-op when already installed); pip must run on
+        # the main thread. The worker's import is the source of truth: if it fails we
+        # repair and retry below (self-heals an aborted/partial install).
+        self.install_local_dependencies(force=False)
 
         checkpoint_path = self.get_checkpoint_path()  # downloads weights if needed
 
@@ -3284,82 +3472,128 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             model_id = self.get_setting_str("model_id", "").strip() or "default"
             model_desc = f"'{model_id}' ({checkpoint_path})"
         print(f"[nnInteractive] Local session using model: {model_desc}")
-        slicer.util.showStatusMessage(f"nnInteractive model: {model_desc}", 5000)
 
-        if torch.cuda.is_available():
-            device = torch.device(self.get_local_device())
-        else:
+        # Settings read on the main thread (QSettings access).
+        requested_device = self.get_local_device()
+        want_autozoom = self.get_setting_bool("autozoom", True)
+        want_compile = self.get_setting_bool("use_torch_compile", False)
+        compile_reason = self._torch_compile_unsupported_reason()
+        storage = self.get_setting_str("interactions_storage", "auto")
+
+        notes = {}
+
+        def _load_worker(done_event):
+            try:
+                import torch
+                from nnInteractive.inference.inference_session import (
+                    nnInteractiveInferenceSession,
+                )
+
+                if torch.cuda.is_available():
+                    device = torch.device(requested_device)
+                else:
+                    print("[nnInteractive] No CUDA GPU detected - running on CPU (slow).")
+                    notes["cpu"] = True
+                    device = torch.device("cpu")
+
+                do_autozoom = want_autozoom and device.type == "cuda"
+
+                use_torch_compile = want_compile
+                if use_torch_compile and compile_reason is not None:
+                    # torch.compile can't run here (Windows, or no Python.h to build its
+                    # runtime helpers); it would fail on the first prediction. Fall back
+                    # to eager execution and report why on the main thread.
+                    use_torch_compile = False
+                    print(f"[nnInteractive] {compile_reason} Running without torch.compile.")
+                    notes["no_compile"] = compile_reason
+
+                session = nnInteractiveInferenceSession(
+                    device=device,
+                    use_torch_compile=use_torch_compile,
+                    torch_n_threads=os.cpu_count(),
+                    verbose=False,
+                    do_autozoom=do_autozoom,
+                    interactions_storage=storage,
+                )
+                # Load the weights and run a warmup forward pass NOW, so Initialize gets
+                # the model fully ready instead of paying the (often large) first-forward
+                # cost -- cuDNN autotuning, CUDA kernel init, torch.compile compilation --
+                # on the user's first prompt.
+                session.initialize_from_trained_model_folder(
+                    checkpoint_path, 0, "checkpoint_final.pth"
+                )
+                warmup = getattr(session, "warmup", None)
+                if callable(warmup):
+                    try:
+                        warmup()
+                    except Exception as exc:  # noqa: BLE001 - warmup is optimization only
+                        debug_print(f"Model warmup failed (non-fatal): {exc}")
+                notes["session"] = session
+            except BaseException as exc:  # noqa: BLE001 - surfaced on the main thread
+                self._local_load_error = exc
+            finally:
+                done_event.set()
+
+        message = "Loading the nnInteractive model ..."
+        self._local_load_error = None
+        self._run_thread_with_message(_load_worker, (), message)
+
+        # Self-heal a broken/partial install: if the import failed, repair on the main
+        # thread (pip needs the main thread) and retry the worker once.
+        if isinstance(self._local_load_error, ImportError):
+            debug_print(f"Local import failed ({self._local_load_error}); repairing and retrying.")
+            self.install_local_dependencies(force=True)
+            importlib.invalidate_caches()
+            notes.clear()
+            self._local_load_error = None
+            self._run_thread_with_message(_load_worker, (), message)
+
+        if self._local_load_error is not None:
+            err, self._local_load_error = self._local_load_error, None
+            raise err
+
+        # Surface notes collected in the worker, now back on the main thread.
+        if notes.get("cpu"):
             slicer.util.showStatusMessage(
                 "No CUDA GPU detected - running nnInteractive on CPU (slow).", 5000
             )
-            device = torch.device("cpu")
-
-        do_autozoom = self.get_setting_bool("autozoom", True) and device.type == "cuda"
-
-        use_torch_compile = self.get_setting_bool("use_torch_compile", False)
-        if use_torch_compile and not self._torch_compile_supported():
-            # torch.compile (Triton/inductor) compiles C/CUDA helpers at runtime and
-            # needs the Python development headers (Python.h). Slicer's bundled Python
-            # ships without them, so compilation fails on the first prediction. Fall
-            # back to eager execution instead of crashing the session.
-            use_torch_compile = False
-            msg = (
-                "torch.compile is unavailable in this Python (missing development "
-                "headers / Python.h); running without it."
+        elif notes.get("no_compile"):
+            slicer.util.showStatusMessage(
+                f"{notes['no_compile']} Running without torch.compile.", 6000
             )
-            print(f"[nnInteractive] {msg}")
-            slicer.util.showStatusMessage(msg, 6000)
+        slicer.util.showStatusMessage(f"nnInteractive model: {model_desc}", 5000)
+        return notes["session"]
 
-        session = nnInteractiveInferenceSession(
-            device=device,
-            use_torch_compile=use_torch_compile,
-            torch_n_threads=os.cpu_count(),
-            verbose=False,
-            do_autozoom=do_autozoom,
-            interactions_storage=self.get_setting_str("interactions_storage", "auto"),
-        )
+    @staticmethod
+    def _torch_compile_unsupported_reason():
+        """Why torch.compile can't be used here, or None if it can.
 
-        # Load the weights and run a warmup forward pass NOW, so Initialize gets the model
-        # fully ready instead of paying the (often large) first-forward cost -- cuDNN
-        # autotuning, CUDA kernel init, and torch.compile compilation -- on the user's
-        # first prompt. Shown behind a busy dialog because it blocks the main thread.
-        progress = slicer.util.createProgressDialog(
-            parent=slicer.util.mainWindow(),
-            maximum=0,  # indeterminate / busy
-            labelText="Loading nnInteractive model ...",
-            windowTitle="nnInteractive",
-        )
-        slicer.app.processEvents()
-        try:
-            session.initialize_from_trained_model_folder(
-                checkpoint_path, 0, "checkpoint_final.pth"
+        Two hard blockers:
+        * Windows -- torch.compile (Triton/inductor) is not supported on Windows at all.
+        * Elsewhere it compiles small C/CUDA helpers at runtime, which need the Python
+          development headers (Python.h). Slicer's bundled Python does not ship them.
+
+        In either case torch.compile would fail on the first prediction, so we detect it
+        up front and run eager instead.
+        """
+        import sys
+        import sysconfig
+
+        if sys.platform.startswith("win"):
+            return "torch.compile is not supported on Windows."
+
+        include_dir = sysconfig.get_paths().get("include")
+        if not (include_dir and os.path.isfile(os.path.join(include_dir, "Python.h"))):
+            return (
+                "torch.compile needs the Python development headers (Python.h), "
+                "which are not present in this Python build."
             )
-            warmup = getattr(session, "warmup", None)
-            if callable(warmup):
-                progress.setLabelText("Warming up the model (first run only) ...")
-                slicer.app.processEvents()
-                try:
-                    warmup()
-                except Exception as exc:  # noqa: BLE001 - warmup is an optimization only
-                    debug_print(f"Model warmup failed (non-fatal): {exc}")
-        finally:
-            progress.close()
-            slicer.app.processEvents()
-        return session
+        return None
 
     @staticmethod
     def _torch_compile_supported():
-        """True only if this Python can build the C/CUDA helpers torch.compile needs.
-
-        torch.compile -> Triton/inductor compiles small C extensions at runtime, which
-        requires the Python development headers (Python.h). Slicer's bundled Python does
-        not ship them, so we detect their absence and disable torch.compile rather than
-        let the first prediction fail with a compiler error.
-        """
-        import sysconfig
-
-        include_dir = sysconfig.get_paths().get("include")
-        return bool(include_dir) and os.path.isfile(os.path.join(include_dir, "Python.h"))
+        """True only if torch.compile can actually run in this environment."""
+        return SlicerNNInteractiveWidget._torch_compile_unsupported_reason() is None
 
     def _construct_remote_session(self):
         """Connect to an official nninteractive-server (remote compute)."""
@@ -3385,7 +3619,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.update_server()
         if not self.server:
             raise RuntimeError(
-                "No server URL set. Enter it in the 'Configuration' tab and click Connect."
+                "No server URL set. Enter it in the 'Configuration' tab, then click "
+                "Initialize at the top of the 'nnInteractive Prompts' tab."
             )
 
         api_key = self.api_key or None
@@ -3525,14 +3760,76 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             raise RuntimeError("Failed to prepare the nnInteractive model weights.")
         return self._resolved_model_dir
 
+    def _interaction_widgets(self):
+        """Controls that require a live session (disabled until Initialize)."""
+        widgets = [
+            self.ui.pbPromptTypePositive,
+            self.ui.pbPromptTypeNegative,
+            self.ui.pbResetSegment,
+            self.ui.pbNextSegment,
+        ]
+        if getattr(self, "all_prompt_buttons", None):
+            widgets.extend(self.all_prompt_buttons.values())
+        return widgets
+
+    def _set_interaction_ui_enabled(self, enabled):
+        """Enable/disable everything that needs a live nnInteractive session.
+
+        Initialization is mandatory before prompting: while no session is live, the
+        prompt-type toggle, Reset/Next-segment and all interaction tools are disabled.
+        When enabling, the individual tool buttons are then further gated by the
+        model's supported_interactions (see _on_session_ready). When disabling, any
+        active tool is deactivated first so a now-disabled button can't stay 'armed'.
+        """
+        if not getattr(self, "all_prompt_buttons", None):
+            return
+        if not enabled:
+            self._deactivate_all_tools()
+        for widget in self._interaction_widgets():
+            widget.setEnabled(enabled)
+
+    def _require_initialized(self):
+        """Guard for prompt-affecting actions reachable by keyboard shortcut (which
+        bypass the disabled buttons). Returns True if a session is live; otherwise it
+        nudges the user to Initialize and returns False."""
+        if self.session is not None:
+            return True
+        slicer.util.showStatusMessage(
+            "Click Initialize (top of the Prompts tab) before using nnInteractive.", 4000
+        )
+        return False
+
+    def _deactivate_all_tools(self):
+        """Turn off any active interaction tool (used when uninitializing)."""
+        self._place_tool = None
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            # During teardown just drop transient state; don't poke views/cursors.
+            return
+        self._cancel_bbox_drag()
+        self.set_lasso_active(False)
+        if (
+            self.ui.pbInteractionScribble.isChecked()
+            and getattr(self, "scribble_editor_widget", None) is not None
+        ):
+            self.scribble_editor_widget.setActiveEffectByName("")
+        for button in self.all_prompt_buttons.values():
+            button.setChecked(False)
+        interaction_node = slicer.app.applicationLogic().GetInteractionNode()
+        interaction_node.SetCurrentInteractionMode(interaction_node.ViewTransform)
+        self._update_prompt_cursor()
+
     def _on_session_ready(self):
         """Reflect a freshly created session in the UI (license, capability gating)."""
         session = self.session
         license_text = self._license_display_text(getattr(session, "license", None))
-        if hasattr(self.ui, "licenseLabel"):
-            self.ui.licenseLabel.setText(license_text)
         if hasattr(self.ui, "promptsLicenseLabel"):
             self.ui.promptsLicenseLabel.setText(license_text)
+
+        # Initialized: unlock the interaction UI, then gate the individual tools by
+        # what this particular model actually supports (point/bbox/lasso/scribble).
+        self._set_interaction_ui_enabled(True)
 
         supported = getattr(session, "supported_interactions", {}) or {}
 
@@ -3688,8 +3985,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.update_connect_status(connected=False)
         slicer.util.warningDisplay(
             "The connection to the nnInteractive server was lost (session expired or "
-            "server restarted). Reconnect from the 'Configuration' tab; your current "
-            "segmentation is preserved and will be re-seeded automatically.",
+            "server restarted). Click Initialize at the top of the 'nnInteractive "
+            "Prompts' tab to reconnect; your current segmentation is preserved and "
+            "will be re-seeded automatically.",
             parent=slicer.util.mainWindow(),
         )
 
@@ -3709,12 +4007,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._clear_prompt_undo()
         # Force a re-sync of image/segment on the next prompt.
         self.previous_states.pop("image_data", None)
+        # No session -> lock the interaction UI again (re-Initialize to unlock).
+        self._set_interaction_ui_enabled(False)
 
     def connect_clicked(self):
-        """Configuration-tab action button: toggle the session for the current mode.
+        """Initialize/Uninitialize toggle (top of the 'nnInteractive Prompts' tab).
 
-        Remote: Connect / Disconnect. Local: Initialize / Uninitialize. If a session
-        is live, clicking tears it down; otherwise it (re)builds one.
+        Initialize builds the session for the current mode -- loads and warms up the
+        local model (the torch.compile / cuDNN dry run happens here), or connects to
+        the remote server -- and then uploads the current image so the user's first
+        prompt is fast (sending the image is the slow step for remote sessions).
+        Clicking again uninitializes. Initialization is mandatory: the prompt controls
+        stay disabled until a session is live.
         """
         mode = self.get_mode()
         if self.session is not None:
@@ -3728,30 +4032,119 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
-        if self.ensure_session():
-            slicer.util.showStatusMessage(
-                f"Connected to nnInteractive server at {self.server}."
-                if mode == "remote"
-                else "Local nnInteractive session ready.",
-                4000,
+        if not self.ensure_session():
+            # ensure_session showed the error; leave the UI in the idle state.
+            self.update_connect_status(connected=self.session is not None)
+            return
+
+        # Front-load the image upload + segment seeding now, so the first prompt does
+        # not pay that cost (it is the expensive step for remote: the image is sent
+        # over the wire).
+        try:
+            self._preload_image_and_segment()
+        except self.SESSION_LOST_ERRORS as exc:
+            self.handle_session_expired(exc)
+            return
+        except Exception as exc:  # noqa: BLE001 - don't leave a half-initialized session
+            self.release_session()
+            self.update_connect_status(connected=False)
+            slicer.util.errorDisplay(
+                f"Could not upload the image to nnInteractive:\n\n{exc}",
+                parent=slicer.util.mainWindow(),
             )
-        # ensure_session updates the status on success (via _on_session_ready); refresh
-        # here too so a failed attempt leaves the button in the correct (idle) state.
+            return
+
+        slicer.util.showStatusMessage(
+            f"Connected to nnInteractive server at {self.server}."
+            if mode == "remote"
+            else "Local nnInteractive session ready.",
+            4000,
+        )
         self.update_connect_status(connected=self.session is not None)
 
+    def _preload_image_and_segment(self):
+        """Upload the current image and seed the selected segment right after Initialize.
+
+        Pays the (often slow, especially remote) image-upload cost up front so the first
+        prompt is fast, and records the image/segment baselines so ensure_synched does
+        not redundantly re-upload on that first prompt. No-op if no volume is loaded yet
+        -- the first prompt then uploads lazily.
+
+        The blocking upload runs in a worker thread while the main thread pumps the Qt
+        event loop (_run_thread_with_message, which shows a plain "please wait" message
+        with no progress bar). This is required for the dialog to render: sending the
+        image over the wire blocks the calling thread, so doing it on the main thread
+        leaves the window unpainted (an empty box). All MRML access (image / segment
+        extraction) happens on the main thread first; only the network/compute calls on
+        ``self.session`` run in the worker -- it never touches Qt or MRML.
+        """
+        if self.session is None:
+            return
+        image = self.get_image_data()
+        if image is None:
+            return
+
+        # --- Everything that reads MRML must run on the MAIN thread. ---
+        image_4d = np.ascontiguousarray(image[None])  # nnInteractive wants [C, X, Y, Z]
+        spacing = self.get_image_spacing()
+        buffer = np.zeros(image.shape, dtype=np.uint8)
+
+        seed = None
+        if getattr(self.session, "supports_initial_label", True) and not self._selected_segment_is_empty():
+            seg = self.get_segment_data().astype(np.uint8)
+            if seg.sum() > 0:
+                seed = seg
+
+        # --- The blocking upload + seeding run off the main thread. ---
+        self._preload_error = None
+
+        def _worker(image_4d, spacing, buffer, seed, done_event):
+            try:
+                self.session.set_image(image_4d, {"spacing": spacing})
+                self.session.set_target_buffer(buffer)
+                self.session.reset_interactions()
+                if seed is not None:
+                    self.session.add_initial_seg_interaction(seed, run_prediction=False)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+                self._preload_error = exc
+            finally:
+                done_event.set()
+
+        message = (
+            "Sending image to the nnInteractive server ..."
+            if self.get_mode() == "remote"
+            else "Preparing image for nnInteractive ..."
+        )
+        self._run_thread_with_message(_worker, (image_4d, spacing, buffer, seed), message)
+
+        if self._preload_error is not None:
+            err, self._preload_error = self._preload_error, None
+            raise err
+
+        # Worker succeeded: publish the shared target buffer and record the image/segment
+        # baselines (main thread) so the first prompt skips a redundant re-upload/re-seed.
+        self.target_buffer = buffer
+        self._clear_prompt_undo()
+        self.previous_states["image_data"] = self._image_fingerprint()
+        self.previous_states["segment_fp"] = self._segment_fingerprint()
+
     def update_connect_status(self, connected):
-        """Sync the action button label + status text to the mode and session state."""
+        """Sync the Initialize/Uninitialize button + status readouts to the session state."""
         mode = self.get_mode()
-        if mode == "remote":
-            action = "Disconnect" if connected else "Connect"
-            status = "connected" if connected else "not connected"
+        action = "Uninitialize" if connected else "Initialize"
+        if connected:
+            status = "initialized (remote)" if mode == "remote" else "initialized (local)"
         else:
-            action = "Uninitialize" if connected else "Initialize"
-            status = "initialized" if connected else "not initialized"
-        if hasattr(self.ui, "connectButton"):
-            self.ui.connectButton.setText(action)
-        if hasattr(self.ui, "connectStatusLabel"):
-            self.ui.connectStatusLabel.setText(f"Status: {status}")
+            status = "not initialized"
+        if hasattr(self.ui, "initializeButton"):
+            self.ui.initializeButton.setText(action)
+            self.ui.initializeButton.setStyleSheet(
+                self.selected_style if connected else self.unselected_style
+            )
+        for label_name in ("connectStatusLabel", "promptsStatusLabel"):
+            label = getattr(self.ui, label_name, None)
+            if label is not None:
+                label.setText(f"Status: {status}")
         # After a successful local Initialize the listing deps are present; fill the
         # dropdown if it was still empty when the user opened the tab.
         if connected and mode == "local":
@@ -4114,6 +4507,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Toggle between positive and negative (triggered by 'T' key).
         """
+        # The 'T' shortcut bypasses the disabled buttons, so enforce mandatory init here.
+        if not self._require_initialized():
+            return
         debug_print("Toggling prompt type (positive <> negative)")
         if self.current_prompt_type_positive:
             self.on_prompt_type_negative_clicked()
