@@ -259,7 +259,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def install_dependencies(self):
         """
         Checks for (and installs if needed) python packages needed by the module.
+        Runs pip directly on the main thread to avoid macOS NSWindow-on-thread
+        crashes that occur when Qt dialogs are created from background threads.
         """
+        import subprocess
+        import sys
+
         dependencies = {
             "requests_toolbelt": "requests_toolbelt",
             "skimage": "scikit-image",
@@ -269,10 +274,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         for dependency in dependencies:
             if self.check_dependency_installed(dependency, dependencies[dependency]):
                 continue
-            self.run_with_progress_bar(
-                self.pip_install_wrapper,
-                (dependencies[dependency],),
-                "Installing dependencies: %s" % dependency,
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", dependencies[dependency]]
             )
 
     def check_dependency_installed(self, import_name, module_name_and_version):
@@ -305,8 +308,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def pip_install_wrapper(self, command, event):
         """
         Installs pip packages.
+        Uses subprocess directly to avoid slicer.util.pip_install showing Qt
+        dialogs (e.g. restart warnings) from a background thread, which crashes
+        on macOS because NSWindow must be created on the main thread.
         """
-        slicer.util.pip_install(command)
+        import subprocess
+        import sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install", command])
         event.set()
 
     def run_with_progress_bar(self, target, args, title):
