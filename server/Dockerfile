@@ -20,7 +20,7 @@ RUN /bin/bash -c "\
     source /opt/conda/etc/profile.d/conda.sh && \
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
-    conda create -y -n nnInteractive python=3.12 -c conda-forge --override-channels && \
+    conda create -y -n nnInteractive python=3.12 pip -c conda-forge --override-channels && \
     conda clean -afy \
 "
 
