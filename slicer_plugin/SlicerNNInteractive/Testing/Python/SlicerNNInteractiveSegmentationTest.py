@@ -228,8 +228,9 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
 
         if not widget.ensure_session():
             self.fail(
-                "Could not start an nnInteractive session. For local tests make sure "
-                "Local mode is set up (PyTorch + nnInteractive[local]); for server "
+                "Could not start an nnInteractive session. For local tests make sure the "
+                "Full backend is installed (PyTorch + nnInteractive) via the first-run "
+                "dialog or the 'Reinstall / Update nnInteractive' button; for server "
                 "tests set SLICER_NNI_TEST_SERVER_URL to a reachable server."
             )
 

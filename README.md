@@ -17,7 +17,8 @@ https://github.com/user-attachments/assets/c9f9ee0a-f74d-4907-aa21-484dcfd10948
 - [Compute modes](#compute-modes)
 - [Installation](#installation)
   - [Install the extension in 3D Slicer](#install-the-extension-in-3d-slicer)
-  - [First run: choose Local or Remote](#first-run-choose-local-or-remote)
+  - [First run: choose what to install](#first-run-choose-what-to-install)
+  - [Updating or changing the installed backend](#updating-or-changing-the-installed-backend)
   - [Running the official server (Remote mode)](#running-the-official-server-remote-mode)
 - [Usage](#usage)
   - [Editing an existing segment](#editing-an-existing-segment)
@@ -52,10 +53,12 @@ Accordingly, you can run inference in two ways:
   that talks to an `nninteractive-server` running on a GPU machine (which may be the same
   computer).
 
-You choose the mode the first time you open the module (and can change it later in the
-`Configuration` tab). The extension installs only the Python packages that the selected mode
-needs — **Remote mode stays PyTorch-free**. If only `nninteractive-client` is present, Local mode
-stays disabled until you install the full `nnInteractive` package and restart Slicer.
+The first time you open the module, a dialog asks **what to install** (see
+[First run](#first-run-choose-what-to-install)). Installs are always explicit — they happen only
+from that dialog or the `Reinstall / Update nnInteractive` button in the `Configuration` tab, never
+silently in the background. A **Client-only** install keeps Slicer PyTorch-free and leaves Local
+mode disabled; a **Full** install enables both Local and Remote, and you can switch between them at
+any time with the toggle in the `Configuration` tab (toggling never triggers an install).
 
 ## Installation
 
@@ -65,25 +68,48 @@ stays disabled until you install the full `nnInteractive` package and restart Sl
 2. [Install the **nnInteractive** extension](https://slicer.readthedocs.io/en/latest/user_guide/extensions_manager.html#install-extensions) from the Extensions Manager.
    (For development without the Extensions Manager, see [Development](#development).)
 
-### First run: choose Local or Remote
+### First run: choose what to install
 
-The first time you open the `nnInteractive` module, a dialog asks whether you want **Local GPU
-compute** or a **Remote server**. Based on your choice the extension installs the matching Python
-packages into Slicer's Python:
+The first time you open the `nnInteractive` module, a dialog asks **what to install** into Slicer's
+Python. Nothing is installed until you choose, and nothing is ever installed lazily in the
+background:
 
-- **Remote** → installs the torch-free **`nninteractive-client`** package (plus the `httpx` /
-  `blosc2` wire stack). **No PyTorch is installed.** Then enter your server URL (and API key, if
-  any) in the `Configuration` tab, and click `Initialize` at the top of the `nnInteractive Prompts`
-  tab.
-- **Local** → installs the full **`nnInteractive`** package (nnU-Net) **and PyTorch**. Pick a
-  model in the `Configuration` tab — the dropdown is populated from the available-models manifest —
-  and on the first segmentation its weights are downloaded automatically from
-  [Hugging Face](https://huggingface.co/MIC-DKFZ/nnInteractive). For a reliable, CUDA-matched
-  PyTorch in Slicer, install the **PyTorch** extension (SlicerPyTorch) from the Extensions Manager
-  first; otherwise the extension falls back to `pip install torch`.
+- **Full (local + remote)** → installs the full **`nnInteractive`** package (nnU-Net + model code)
+  **and PyTorch**. This enables **both** Local and Remote mode. Pick a model in the `Configuration`
+  tab — the dropdown is populated from the available-models manifest — and on the first local
+  segmentation its weights are downloaded automatically from
+  [Hugging Face](https://huggingface.co/MIC-DKFZ/nnInteractive).
+- **Client only (remote)** → installs just the torch-free **`nninteractive-client`** package (plus
+  the `httpx` / `blosc2` / `scikit-image` wire stack). **No PyTorch.** Local mode stays disabled;
+  enter your server URL (and API key, if any) in the `Configuration` tab.
 
-You can switch modes later in the `Configuration` tab — switching to Local triggers the heavy
-install on demand.
+After installing, click `Initialize` at the top of the `nnInteractive Prompts` tab — this loads the
+model (Full/Local) or connects to the server (Remote). If you dismiss the dialog without choosing,
+nothing is installed, the dialog reappears next time you open Slicer, and `Initialize` will ask you
+to install first.
+
+> [!NOTE]
+> The extension only ever installs `nnInteractive` / `nninteractive-client` **below v3.0.0**, to
+> guard against future API changes.
+
+**PyTorch (Full installs).** For a reliable, CUDA-matched PyTorch inside Slicer, install the
+**PyTorch** extension (SlicerPyTorch) from the Extensions Manager first — the extension uses it when
+present. Otherwise it falls back to `pip install torch`. On **Windows** the default PyPI torch wheel
+is **CPU-only**, so the fallback instead installs from PyTorch's CUDA wheel index
+(`https://download.pytorch.org/whl/cu126` by default) — otherwise GPU inference would silently run
+on CPU. To match a different CUDA build (e.g. an older driver), change the **PyTorch pip index URL**
+under `Configuration ▸ Advanced` (e.g. swap `cu126` for `cu121`) before installing.
+
+### Updating or changing the installed backend
+
+The `Configuration` tab shows what is installed and whether it is current — **"✓ nnInteractive is
+up to date"** (green) or **"⟳ nnInteractive update available"** (orange), checked automatically
+against PyPI on startup. To update to the latest version (still capped below v3.0.0), or to switch
+between **Full** and **Client only**, click **`Reinstall / Update nnInteractive`** and pick a
+flavor. This — and the first-run dialog — are the only actions that install or update packages.
+Reinstalling first uninstalls the existing `nnInteractive` / `nninteractive-client` packages (their
+shared dependencies, e.g. PyTorch, are left in place), so switching to **Client only** cleanly
+removes local support.
 
 ### Running the official server (Remote mode)
 
@@ -158,7 +184,7 @@ Each button in the Interactive Prompts tab has a keyboard shortcut, indicated by
 
 How to run the test from Slicer:
 1. Make sure `Developer Mode` is enabled in Slicer (`Edit > Application Settings > Developer`, check `Enable developer mode`).
-2. Launch Slicer and (optionally) load the `SlicerNNInteractive` module via the Extension Wizard. For local testing, make sure Local mode has been set up (PyTorch + `nnInteractive[local]` installed).
+2. Launch Slicer and (optionally) load the `SlicerNNInteractive` module via the Extension Wizard. For local testing, make sure the **Full** backend is installed (PyTorch + `nnInteractive`), e.g. via the first-run dialog or the `Reinstall / Update nnInteractive` button.
 3. Open the `Self Tests` module, pick `SlicerNNInteractive`, and click `Reload and Test`. A "All SlicerNNInteractive segmentation tests passed" message will appear in the Python Console if everything matches the stored references.
 
 Reference outputs are stored at `slicer_plugin/SlicerNNInteractive/Testing/Data/` (compressed NIfTI files). You normally do not need to regenerate these. If you do (e.g. after an intentional behavior change), set `SLICER_NNI_GENERATE_TEST_MASK=1` before launching Slicer, run the test once, manually review the newly written masks, then rerun without the variable so the test compares against the frozen references.

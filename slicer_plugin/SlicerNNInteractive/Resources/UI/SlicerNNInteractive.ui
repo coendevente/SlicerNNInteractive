@@ -272,29 +272,6 @@
            </layout>
           </widget>
          </item>
-         <item>
-          <widget class="QGroupBox" name="uploadProgressGroup">
-           <property name="title">
-            <string>Upload progress:</string>
-           </property>
-           <layout class="QVBoxLayout" name="verticalLayout_12b">
-            <item>
-             <layout class="QVBoxLayout" name="verticalLayout_tools">
-              <item>
-               <widget class="QProgressBar" name="uploadProgressBar">
-                <property name="visible">
-                 <bool>true</bool>
-                </property>
-                <property name="value">
-                 <number>0</number>
-                </property>
-               </widget>
-              </item>
-             </layout>
-            </item>
-           </layout>
-          </widget>
-         </item>
         </layout>
        </widget>
        <widget class="QWidget" name="tabConfig">

@@ -28,6 +28,21 @@ from PythonQt.QtGui import QMessageBox
 
 DEBUG_MODE = False
 
+# Hard upper bound on the nnInteractive / nninteractive-client versions this extension
+# will ever install. nnInteractive 3.x may change the inference API; pin below it so a
+# future release can't silently break this plugin. The "up to date" indicator and every
+# install command honour this ceiling. Bump deliberately once 3.x is supported.
+NNINTERACTIVE_VERSION_CEILING = "3.0.0"
+NNINTERACTIVE_PKG = f"nnInteractive<{NNINTERACTIVE_VERSION_CEILING}"
+NNINTERACTIVE_CLIENT_PKG = f"nninteractive-client<{NNINTERACTIVE_VERSION_CEILING}"
+
+# On Windows, PyPI's default ``pip install torch`` is a CPU-only wheel, so local GPU
+# inference would silently fall back to CPU. Point pip at PyTorch's CUDA wheel index
+# instead. Overridable per-machine via the Advanced "PyTorch pip index URL" setting
+# (e.g. swap cu126 for cu121/cu118 to match an older GPU driver). The SlicerPyTorch
+# extension (PyTorchUtils) is still preferred when available -- this is the fallback.
+DEFAULT_WINDOWS_TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu126"
+
 
 def debug_print(*args):
     if DEBUG_MODE:
@@ -52,6 +67,8 @@ def ensure_synched(func):
             # end-to-end latency goes beyond the model's prediction itself.
             t0 = time.time()
             if self._handle_active_source_volume_change():
+                # Volume changed without the editor observer catching it; prompt state was
+                # just reset. The image_changed()/sync below uploads the new image.
                 debug_print("Source volume changed before prompt. Prompt state reset.")
             t1 = time.time()
             if self.image_changed():
@@ -229,13 +246,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         except Exception:  # noqa: BLE001
             pass
 
-        # DON'T install packages here. Dependency installation is lazy and
-        # import-verified (see ensure_session / the _construct_* methods), so an
-        # aborted/partial install simply gets retried the next time the user connects
-        # or prompts, instead of leaving the module wedged. The first-run mode dialog
-        # is deferred to the event loop (modal dialogs during setup() are unreliable),
-        # and is also resolved lazily in ensure_session() as a safety net.
-        qt.QTimer.singleShot(0, self.resolve_mode_first_run)
+        # Background "update available?" check: a worker thread fetches PyPI while a
+        # main-thread poll timer picks up the result (all Qt access stays on the main
+        # thread). See _check_for_updates_async / _poll_update_check.
+        self._update_poll_timer = None
+        self._update_check_result = None
+
+        # DON'T install packages here, and never install lazily. Installation happens
+        # only from the explicit first-run popup or the Configuration tab's
+        # "Reinstall / Update nnInteractive" button. The first-run popup is deferred to
+        # the event loop (modal dialogs during setup() are unreliable).
+        qt.QTimer.singleShot(0, self._resolve_install_on_startup)
 
         ui_widget = slicer.util.loadUI(self.resourcePath("UI/SlicerNNInteractive.ui"))
         self.layout.addWidget(ui_widget)
@@ -315,8 +336,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Connect UI elements to functions.
         """
-        self.ui.uploadProgressGroup.setVisible(False)
-
         # Build the Configuration-tab model selection + settings (Local | Remote
         # switch, checkpoint/device/compile, server URL, API key, status, ...). This
         # also loads and wires the saved server URL and sets self.server.
@@ -353,6 +372,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             vtk.vtkCommand.ModifiedEvent,
             self.on_segment_editor_node_modified,
         )
+        # Re-evaluate the Initialize button when volumes are added/removed: Initialize is
+        # only available once an image is loaded (so the image is uploaded at init time
+        # rather than deferred to the slow first prompt).
+        self.addObserver(
+            slicer.mrmlScene, slicer.vtkMRMLScene.NodeAddedEvent, self.on_scene_nodes_changed
+        )
+        self.addObserver(
+            slicer.mrmlScene, slicer.vtkMRMLScene.NodeRemovedEvent, self.on_scene_nodes_changed
+        )
 
         # Initialization is mandatory: keep every prompt control disabled until a
         # session is live (_on_session_ready re-enables them, gated per model).
@@ -373,6 +401,30 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # The old .ui server widgets are replaced by the model-selection group below.
         self.ui.serverGroup.setVisible(False)
         self.ui.pbTestServer.setVisible(False)
+
+        # ===== Installation group (top of the Configuration tab) =====
+        install_group = qt.QGroupBox("nnInteractive Installation")
+        install_layout = qt.QVBoxLayout(install_group)
+
+        self.ui.installFlavorLabel = qt.QLabel()
+        self.ui.installFlavorLabel.setWordWrap(True)
+        install_layout.addWidget(self.ui.installFlavorLabel)
+
+        self.ui.updateStatusLabel = qt.QLabel()
+        self.ui.updateStatusLabel.setWordWrap(True)
+        install_layout.addWidget(self.ui.updateStatusLabel)
+
+        self.ui.reinstallButton = qt.QPushButton("Reinstall / Update nnInteractive")
+        self.ui.reinstallButton.setMinimumHeight(30)
+        self.ui.reinstallButton.setToolTip(
+            "Choose Full (local + remote) or Client only (remote), and update the "
+            "installed backend to the latest version."
+        )
+        self.ui.reinstallButton.clicked.connect(
+            lambda: self._prompt_install_choice(reinstall=True)
+        )
+        install_layout.addWidget(self.ui.reinstallButton)
+        layout.insertWidget(0, install_group)
 
         switch_style = (
             f"QPushButton {{ {self.unselected_style} }}"
@@ -461,6 +513,31 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         advanced_form.addRow("Device:", self.ui.deviceCombo)
 
+        # PyTorch pip index URL, used only when torch is installed via pip fallback
+        # (SlicerPyTorch is preferred). Pre-filled with the CUDA index on Windows so the
+        # default install isn't the CPU-only wheel; editable to match a different CUDA
+        # version. Takes effect on the next Full install / Reinstall.
+        self.ui.torchIndexEdit = qt.QLineEdit()
+        self.ui.torchIndexEdit.setText(
+            self.get_setting_str(
+                "torch_index_url",
+                DEFAULT_WINDOWS_TORCH_INDEX_URL if os.name == "nt" else "",
+            )
+        )
+        self.ui.torchIndexEdit.setPlaceholderText(
+            "blank = default PyPI (CUDA on Linux; CPU-only on Windows)"
+        )
+        self.ui.torchIndexEdit.setToolTip(
+            "pip --index-url for installing PyTorch. On Windows, leave the CUDA index "
+            "(e.g. .../whl/cu126) so GPU inference works; change the cuXXX tag to match "
+            "your GPU driver. Used only by the pip fallback; the SlicerPyTorch extension "
+            "is preferred when installed."
+        )
+        self.ui.torchIndexEdit.editingFinished.connect(
+            lambda: self._save_setting("torch_index_url", self.ui.torchIndexEdit.text.strip())
+        )
+        advanced_form.addRow("PyTorch pip index URL:", self.ui.torchIndexEdit)
+
         self.ui.compileCheck = qt.QCheckBox()
         self.ui.compileCheck.setChecked(self.get_setting_bool("use_torch_compile", False))
         self.ui.compileCheck.toggled.connect(
@@ -545,13 +622,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.server = self.ui.serverUrlEdit.text.rstrip("/")
 
         # Reflect the persisted mode in the status readout. If Local is already the
-        # active mode, fill the dropdown right after setup finishes (deferred so we
-        # don't pip-install the lightweight listing deps mid-construction).
+        # active mode, fill the dropdown right after setup finishes (deferred so it runs
+        # once the UI is fully built).
         self.update_connect_status(connected=False)
         if is_local:
-            qt.QTimer.singleShot(
-                0, lambda: self._ensure_model_combo_populated(allow_install=True)
-            )
+            qt.QTimer.singleShot(0, self._ensure_model_combo_populated)
+
+        # Reflect what's installed, then kick off the background "update available?" check.
+        self._refresh_install_status_ui()
+        self._check_for_updates_async()
 
     def _on_api_key_changed(self):
         # API keys are intentionally not persisted to QSettings.
@@ -577,9 +656,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # and the first Initialize press would only uninitialize it.)
         self._teardown_for_settings_change()
         if mode == "local":
-            # User explicitly chose Local: prepare the model dropdown now (installing
-            # the lightweight listing deps if needed).
-            self._ensure_model_combo_populated(allow_install=True)
+            # User switched to Local: fill the model dropdown from the already-installed
+            # backend. Never installs here (the Full install brings huggingface_hub +
+            # model_management up front); the dropdown stays empty if nothing is installed.
+            self._ensure_model_combo_populated()
 
     def _update_mode_visibility(self):
         is_local = self.get_mode() == "local"
@@ -611,8 +691,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         disable the Local button — and fall back to Remote — so the user never lands on
         a Local page that cannot work. The disabled button's tooltip explains how to
         enable Local support.
+
+        Keyed off the recorded install flavor (the user's active choice) rather than a
+        live import check: after switching Full -> Client the uninstalled full package
+        can linger in sys.modules until restart, but Local must become unavailable
+        immediately. ensure_session still verifies the import before building a local
+        session.
         """
-        available = self._local_inference_available()
+        available = self.get_install_flavor() == "full"
         btn = getattr(self.ui, "localModeButton", None)
         if btn is not None:
             btn.setEnabled(available)
@@ -624,10 +710,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 btn.setToolTip(
                     "Local (in-process) inference is not installed in this Slicer.\n"
                     "Only the lightweight remote client (nninteractive-client) is present.\n\n"
-                    "To enable Local mode, install the full backend (PyTorch + nnU-Net)\n"
-                    "into Slicer's Python and restart Slicer:\n"
-                    "    import slicer.util\n"
-                    '    slicer.util.pip_install("nnInteractive")'
+                    "To enable Local mode, click 'Reinstall / Update nnInteractive' in the\n"
+                    "Installation section above and choose 'Full (local + remote)'."
                 )
         if not available and self.get_mode() != "remote":
             self.set_mode("remote")
@@ -764,33 +848,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 shortcut.deleteLater()
                 shortcut = None
 
-    def check_dependency_installed(self, import_name, module_name_and_version):
-        """
-        Checks if a package is installed with the correct version.
-        """
-        if "==" in module_name_and_version:
-            module_name, module_version = module_name_and_version.split("==")
-        else:
-            module_name = module_name_and_version
-            module_version = None
-
-        spec = importlib.util.find_spec(import_name)
-        if spec is None:
-            # Not installed
-            return False
-
-        if module_version is not None:
-            import importlib.metadata as metadata
-            try:
-                version = metadata.version(module_name)
-                if version != module_version:
-                    # Version mismatch
-                    return False
-            except metadata.PackageNotFoundError:
-                debug_print(f"Could not determine version for {module_name}.")
-
-        return True
-
     def _pip_install(self, command, message):
         """
         Install pip package(s) on the MAIN thread.
@@ -799,8 +856,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         thread -- doing so throws "QObject ... different thread" errors and deadlocks.
         We show a non-cancelable busy dialog; the UI is blocked while pip runs (a
         one-time cost) and pip's output streams to the Python Console. Failures are
-        recorded and ultimately surfaced by the import verification in
-        _import_with_install().
+        recorded in ``self._last_pip_error`` and surfaced by the caller
+        (_install_full / _install_client).
         """
         self._last_pip_error = None
         progress = slicer.util.createProgressDialog(
@@ -815,6 +872,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         except Exception as exc:  # noqa: BLE001
             self._last_pip_error = exc
             debug_print(f"pip install '{command}' failed: {exc}")
+        finally:
+            progress.close()
+            slicer.app.processEvents()
+
+    def _pip_uninstall(self, command, message):
+        """pip-uninstall package(s) on the MAIN thread, with a busy dialog (mirrors
+        _pip_install). pip uninstall removes only the named distributions, never their
+        dependencies. Failures are recorded in ``self._last_pip_error``; the subsequent
+        install (which resets that flag) is the source of truth for success."""
+        self._last_pip_error = None
+        progress = slicer.util.createProgressDialog(
+            parent=slicer.util.mainWindow(),
+            maximum=0,  # indeterminate / busy
+            labelText=message,
+            windowTitle="nnInteractive",
+        )
+        slicer.app.processEvents()
+        try:
+            slicer.util.pip_uninstall(command)
+        except Exception as exc:  # noqa: BLE001
+            self._last_pip_error = exc
+            debug_print(f"pip uninstall '{command}' failed: {exc}")
         finally:
             progress.close()
             slicer.app.processEvents()
@@ -926,6 +1005,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Tear down the programmatic scribble editor widget we own (parentless QObject).
         self._destroy_scribble_editor_widget()
 
+        self._stop_update_poll_timer()
+
         if not getattr(self, "_application_quitting", False):
             try:
                 slicer.app.aboutToQuit.disconnect(self._on_application_about_to_quit)
@@ -944,6 +1025,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._remove_scribble_labelmap_observer()
         self._deactivate_segment_editor_effects()
         self._stop_heartbeat_timer()
+        self._stop_update_poll_timer()
         # aboutToQuit fires while the scene is still valid: remove the prompt/scribble
         # nodes we created (and drop our references) now, so their VTK pipelines are
         # freed before the scene is torn down instead of lingering as reported leaks.
@@ -1027,8 +1109,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def on_segment_editor_node_modified(self, caller, event):
         """Reset transient prompt state when the Segment Editor source volume changes,
         and clear the displayed prompts when the user selects a different segment."""
-        self._handle_active_source_volume_change()
+        self._handle_active_source_volume_change(reupload=True)
         self._handle_selected_segment_change()
+        self._update_initialize_button_state()
+
+    def on_scene_nodes_changed(self, caller, event, calldata=None):
+        """Volumes added/removed: re-evaluate whether Initialize can be used."""
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            return
+        self._update_initialize_button_state()
 
     def _handle_selected_segment_change(self):
         """When the user picks a different segment to refine, the session re-seeds it
@@ -1061,7 +1152,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if active_tool is not None:
             qt.QTimer.singleShot(0, lambda tool=active_tool: self._activate_prompt_tool(tool))
 
-    def _handle_active_source_volume_change(self, volume_node=None):
+    def _handle_active_source_volume_change(self, volume_node=None, reupload=False):
         if getattr(self, "_cleanup_in_progress", False) or getattr(
             self, "_application_quitting", False
         ):
@@ -1085,7 +1176,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self._handling_source_volume_change = True
         try:
-            debug_print("Source volume changed. Resetting prompt state.")
+            debug_print("Source volume changed. Resetting prompts; uploading the new image.")
+            # Keep the live session (no full re-initialize -- that would needlessly reload
+            # the model); we just reset the prompts and push the newly selected image to
+            # the session below.
+            session_live = self.session is not None
             active_tool = (
                 self._active_prompt_tool()
                 if getattr(self, "all_prompt_buttons", None)
@@ -1108,9 +1203,40 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     qt.QTimer.singleShot(
                         0, lambda tool=active_tool: self._activate_prompt_tool(tool)
                     )
+
+            # Push the newly selected image to the live session. Deferred to the event
+            # loop so we don't run a blocking upload inside this VTK modified-event
+            # callback; _reupload_image_after_volume_change shows the same progress dialog
+            # as Initialize, so the user sees why Slicer pauses. Only the editor observer
+            # asks for this (reupload=True); the defensive ensure_synched caller lets its
+            # own image_changed()/sync handle the upload instead.
+            if reupload and session_live:
+                qt.QTimer.singleShot(0, self._reupload_image_after_volume_change)
             return True
         finally:
             self._handling_source_volume_change = False
+
+    def _reupload_image_after_volume_change(self):
+        """Upload the newly selected source volume to the live session (mirrors what
+        Initialize does), keeping the session instead of re-initializing. Shows the
+        Initialize progress dialog so a slow (especially remote) upload is visible."""
+        if self.session is None:
+            return
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            return
+        try:
+            self._preload_image_and_segment()
+        except self.SESSION_LOST_ERRORS as exc:
+            self.handle_session_expired(exc)
+        except Exception as exc:  # noqa: BLE001 - don't leave a half-synced session
+            self.release_session()
+            self.update_connect_status(connected=False)
+            slicer.util.errorDisplay(
+                f"Could not upload the new image to nnInteractive:\n\n{exc}",
+                parent=slicer.util.mainWindow(),
+            )
 
     def _get_scribble_prompt_node(self):
         node = getattr(self, "scribble_segment_node", None)
@@ -3458,6 +3584,37 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         qt.QSettings().setValue("SlicerNNInteractive/mode", mode)
 
+    def get_install_flavor(self):
+        """Returns the recorded install flavor: 'full', 'client', or '' (none yet)."""
+        flavor = slicer.util.settingsValue("SlicerNNInteractive/install_flavor", "")
+        return flavor if flavor in ("full", "client") else ""
+
+    def set_install_flavor(self, flavor):
+        """Persists the install flavor ('full' or 'client')."""
+        qt.QSettings().setValue("SlicerNNInteractive/install_flavor", flavor)
+
+    def _detect_install_flavor(self):
+        """Probe the Python environment for which backend is actually importable.
+
+        'full' (in-process local inference) implies the client too, so it wins. Returns
+        '' when neither the full backend nor the lightweight client is present.
+        """
+        if self._local_inference_available():
+            return "full"
+        try:
+            if importlib.util.find_spec("nnInteractive.inference.remote") is not None:
+                return "client"
+        except ImportError:
+            pass
+        return ""
+
+    def _backend_installed_for_mode(self, mode):
+        """True if the backend needed for ``mode`` is importable. Local needs the full
+        in-process backend; remote works with either the client or the full package."""
+        if mode == "local":
+            return self._local_inference_available()
+        return self._detect_install_flavor() != ""
+
     def get_setting_bool(self, key, default):
         return slicer.util.settingsValue(
             f"SlicerNNInteractive/{key}", default, converter=slicer.util.toBool
@@ -3535,9 +3692,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return True
             self.release_session()
 
-        # Make sure a mode has been chosen (shows the first-run dialog if needed).
-        self.resolve_mode_first_run()
-        mode = self.get_mode()
+        # No lazy install: if the backend for the current mode isn't installed, send the
+        # user to the Configuration tab instead of silently pip-installing.
+        if not self._backend_installed_for_mode(mode):
+            need = "Full (local + remote)" if mode == "local" else "the client (or Full)"
+            slicer.util.errorDisplay(
+                f"nnInteractive is not installed for {mode} mode.\n\n"
+                f"Open the Configuration tab and click "
+                f"'Reinstall / Update nnInteractive' to install {need}, "
+                f"or restart Slicer to get the install prompt.",
+                parent=slicer.util.mainWindow(),
+            )
+            return False
 
         try:
             if mode == "local":
@@ -3563,23 +3729,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._on_session_ready()
         return True
 
-    def _import_with_install(self, install_fn, import_fn):
-        """
-        Install the deps for a mode, then import. The import is the source of truth:
-        if it fails (deps missing, or a previous install was aborted and left a
-        partial/broken package that ``find_spec`` wrongly accepts), force a repair
-        reinstall and retry once. This is what makes an aborted install self-heal on
-        the next connect/prompt instead of staying wedged.
-        """
-        install_fn(force=False)
-        try:
-            return import_fn()
-        except ImportError as first_error:
-            debug_print(f"Import failed ({first_error}); repairing install and retrying.")
-            install_fn(force=True)
-            importlib.invalidate_caches()
-            return import_fn()
-
     def _construct_local_session(self):
         """Build an in-process nnInteractiveInferenceSession (local compute).
 
@@ -3591,14 +3740,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         CUDA/torch work -- keeps loading fast. The worker never touches Qt/MRML; status
         notes are collected and shown on the main thread afterwards.
 
-        The main-thread-only steps run first: installing dependencies (pip creates Qt
-        objects) and downloading the weights (its own progress dialog).
+        The main-thread-only step runs first: downloading the weights (its own progress
+        dialog). Dependencies are NOT installed here -- ensure_session() has already
+        verified the full backend is installed (installs happen only from the explicit
+        install popup / the Configuration tab's Reinstall button).
         """
-        # Ensure deps are present (fast no-op when already installed); pip must run on
-        # the main thread. The worker's import is the source of truth: if it fails we
-        # repair and retry below (self-heals an aborted/partial install).
-        self.install_local_dependencies(force=False)
-
         checkpoint_path = self.get_checkpoint_path()  # downloads weights if needed
 
         custom = self.get_setting_str("checkpoint_path", "").strip()
@@ -3669,15 +3815,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._local_load_error = None
         self._run_thread_with_message(_load_worker, (), message)
 
-        # Self-heal a broken/partial install: if the import failed, repair on the main
-        # thread (pip needs the main thread) and retry the worker once.
+        # No lazy repair: if the import failed (e.g. a partial/broken install), surface a
+        # clear message pointing at the Reinstall button rather than silently reinstalling.
         if isinstance(self._local_load_error, ImportError):
-            debug_print(f"Local import failed ({self._local_load_error}); repairing and retrying.")
-            self.install_local_dependencies(force=True)
-            importlib.invalidate_caches()
-            notes.clear()
-            self._local_load_error = None
-            self._run_thread_with_message(_load_worker, (), message)
+            raise RuntimeError(
+                "The local nnInteractive backend could not be imported (the install may "
+                "be incomplete). Open the Configuration tab and click "
+                "'Reinstall / Update nnInteractive' (choose Full), then restart Slicer."
+            ) from self._local_load_error
 
         if self._local_load_error is not None:
             err, self._local_load_error = self._local_load_error, None
@@ -3727,22 +3872,24 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         return SlicerNNInteractiveWidget._torch_compile_unsupported_reason() is None
 
     def _construct_remote_session(self):
-        """Connect to an official nninteractive-server (remote compute)."""
-        def _imp():
+        """Connect to an official nninteractive-server (remote compute).
+
+        The client must already be installed (ensure_session verifies this); we never
+        install here.
+        """
+        try:
             from nnInteractive.inference.remote.remote_session import (
                 ServerAtCapacityError,
                 SessionExpiredError,
                 nnInteractiveRemoteInferenceSession,
             )
-            return (
-                nnInteractiveRemoteInferenceSession,
-                SessionExpiredError,
-                ServerAtCapacityError,
-            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "The nnInteractive client is not installed. Open the Configuration tab "
+                "and click 'Reinstall / Update nnInteractive'."
+            ) from exc
 
-        RemoteSession, SessionExpiredError, ServerAtCapacityError = self._import_with_install(
-            self.install_client_dependencies, _imp
-        )
+        RemoteSession = nnInteractiveRemoteInferenceSession
 
         # Remember which exceptions mean "the lease is gone" so callers can reconnect.
         self.SESSION_LOST_ERRORS = (SessionExpiredError,)
@@ -3820,40 +3967,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         combo.setCurrentIndex(select_index)
         combo.blockSignals(False)
 
-    def _install_listing_dependencies(self):
-        """Install just enough to LIST models (no torch): the nnInteractive package
-        and huggingface_hub. Much lighter than the full local compute stack, so the
-        model dropdown can be filled before the user commits to a local Initialize."""
-        # `nnInteractive` is now a PEP 420 namespace package shared with the
-        # 'nninteractive-client' distribution, so find_spec("nnInteractive") is truthy
-        # even when only the lightweight client is installed. Key the install off a
-        # full-package-only module (model_management) so we still install the full
-        # package when only the client is present.
-        if importlib.util.find_spec("nnInteractive.model_management") is None:
-            self._pip_install("--no-deps nnInteractive", "Preparing nnInteractive model list...")
-        self._pip_install_if_missing("huggingface_hub", "huggingface_hub")
-        importlib.invalidate_caches()
+    def _ensure_model_combo_populated(self):
+        """Fill the model dropdown from the already-installed backend (never installs).
 
-    def _ensure_model_combo_populated(self, allow_install=True):
-        """Fill the model dropdown, optionally installing the lightweight listing deps.
-
-        Slicer's bundled Python does not ship huggingface_hub (and may not have the
-        nnInteractive package yet in remote mode), so the dropdown is empty until those
-        are present. When ``allow_install`` is True (e.g. the user just picked Local)
-        we install them on demand; otherwise we only populate if they already exist.
+        A Full install brings huggingface_hub + nnInteractive.model_management up front,
+        so the dropdown fills here. With nothing installed (or only the client) it is
+        left empty -- Local mode is disabled in that case anyway.
         """
         combo = getattr(self.ui, "modelComboBox", None)
         # Note: in Slicer's PythonQt binding, QComboBox.count is a property, not a method.
         if combo is None or combo.count > 0:
             return
-        # Check model_management (a full-package-only module), not bare "nnInteractive":
-        # the latter is a namespace package that also exists with only the lightweight
-        # client installed, which would wrongly skip installing the listing backend.
-        if allow_install and (
-            importlib.util.find_spec("nnInteractive.model_management") is None
-            or importlib.util.find_spec("huggingface_hub") is None
-        ):
-            self._install_listing_dependencies()
         self._populate_model_combo()
 
     def _on_model_combo_changed(self, index):
@@ -4198,8 +4322,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         Pays the (often slow, especially remote) image-upload cost up front so the first
         prompt is fast, and records the image/segment baselines so ensure_synched does
-        not redundantly re-upload on that first prompt. No-op if no volume is loaded yet
-        -- the first prompt then uploads lazily.
+        not redundantly re-upload on that first prompt. Initialize is gated on a loaded
+        volume (see _update_initialize_button_state), so an image is normally present;
+        the guard below is just defensive.
 
         The blocking upload runs in a worker thread while the main thread pumps the Qt
         event loop (_run_thread_with_message, which shows a plain "please wait" message
@@ -4276,47 +4401,51 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             label = getattr(self.ui, label_name, None)
             if label is not None:
                 label.setText(f"Status: {status}")
-        # After a successful local Initialize the listing deps are present; fill the
+        # After a successful local Initialize the full backend is present; fill the
         # dropdown if it was still empty when the user opened the tab.
         if connected and mode == "local":
-            self._ensure_model_combo_populated(allow_install=False)
+            self._ensure_model_combo_populated()
+        self._update_initialize_button_state()
 
-    ###############################################################################
-    # Dependency installation (mode-gated: client vs local)
-    ###############################################################################
+    def _has_volume_loaded(self):
+        """True if a source volume is available to initialize on. Side-effect free
+        (unlike get_volume_node, which auto-selects a volume)."""
+        if self.ui.editor_widget.sourceVolumeNode() is not None:
+            return True
+        return len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")) > 0
 
-    def _pip_install_if_missing(self, import_name, pip_name, force=False):
-        # With force=True we reinstall regardless of find_spec, to repair a partial /
-        # aborted install that find_spec would otherwise wrongly accept.
-        if not force and importlib.util.find_spec(import_name) is not None:
+    def _update_initialize_button_state(self):
+        """Enable Initialize only when an image is loaded, so the image is uploaded at
+        init time instead of being deferred to the (slow) first prompt. While a session
+        is live the button is the Uninitialize action and stays enabled."""
+        btn = getattr(self.ui, "initializeButton", None)
+        if btn is None:
             return
-        command = f"--force-reinstall {pip_name}" if force else pip_name
-        self._pip_install(command, f"Installing dependency: {pip_name} ...")
-
-    def install_client_dependencies(self, force=False):
-        """
-        Lightweight, torch-free client deps for remote mode. The remote client lives
-        in the dedicated 'nninteractive-client' distribution, which provides
-        nnInteractive.inference.remote and pulls only the wire stack
-        (numpy/httpx/blosc2) — no torch / nnU-Net. (The full 'nnInteractive' package
-        depends on this client, so a full local install includes it too. Installing
-        '--no-deps nnInteractive' here would NOT work: the remote client is no longer
-        part of that distribution.)
-        """
-        if force or importlib.util.find_spec("nnInteractive.inference.remote") is None:
-            flags = "--force-reinstall " if force else ""
-            self._pip_install(
-                f"{flags}nninteractive-client",
-                "Installing nnInteractive client (no PyTorch)...",
+        if self.session is not None:
+            btn.setEnabled(True)
+            return
+        has_volume = self._has_volume_loaded()
+        btn.setEnabled(has_volume)
+        if not has_volume:
+            btn.setToolTip(
+                "Load a volume into Slicer first — Initialize uploads the current image "
+                "so your first prompt is fast."
             )
-        self._pip_install_if_missing("httpx", "httpx", force=force)
-        self._pip_install_if_missing("blosc2", "blosc2", force=force)
-        self._pip_install_if_missing("skimage", "scikit-image", force=force)
+        else:
+            btn.setToolTip(
+                "Load the model / connect to the server and upload the current image.\n"
+                "Required before any prompt can be placed. Click again to uninitialize."
+            )
+
+    ###############################################################################
+    # Explicit dependency installation (first-run popup / Reinstall button only)
+    ###############################################################################
 
     def ensure_torch_installed(self):
         if importlib.util.find_spec("torch") is not None:
             return
-        # Prefer Slicer's PyTorch extension (PyTorchUtils) for a CUDA-matched build.
+        # Prefer Slicer's PyTorch extension (PyTorchUtils): it installs a CUDA-matched
+        # build for the current platform (including the correct CUDA wheel on Windows).
         try:
             import PyTorchUtils
 
@@ -4325,62 +4454,345 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return
         except Exception:  # noqa: BLE001
             pass
-        self._pip_install("torch", "Installing PyTorch (this can take a while)...")
+        # Fallback: plain pip. On Windows the default PyPI torch wheel is CPU-only, so
+        # point pip at PyTorch's CUDA index (otherwise GPU inference silently runs on
+        # CPU). On Linux the default wheel already bundles CUDA. The index URL is
+        # overridable via the Advanced "PyTorch pip index URL" setting.
+        index_url = self.get_setting_str("torch_index_url", "").strip()
+        if not index_url and os.name == "nt":
+            index_url = DEFAULT_WINDOWS_TORCH_INDEX_URL
+        command = f"torch --index-url {index_url}" if index_url else "torch"
+        self._pip_install(command, "Installing PyTorch (this can take a while)...")
 
-    def install_local_dependencies(self, force=False):
-        """Full in-process compute stack (torch + nnU-Net + nnInteractive)."""
-        self._pip_install_if_missing("skimage", "scikit-image", force=force)
-        self._pip_install_if_missing("httpx", "httpx", force=force)
-        self._pip_install_if_missing("blosc2", "blosc2", force=force)
-        # Install torch first (preferring SlicerPyTorch) so the nnInteractive install
-        # finds it already satisfied and doesn't pull a mismatched wheel.
+    # ------------------------------------------------------------------ #
+    # Explicit install API. These run ONLY from the first-run popup / the
+    # Configuration tab's Reinstall button -- never lazily. Every install
+    # is capped below NNINTERACTIVE_VERSION_CEILING.
+    # ------------------------------------------------------------------ #
+
+    def _install_full(self):
+        """Install the full in-process backend (torch + nnU-Net + nnInteractive), capped.
+
+        The caller uninstalls any existing nnInteractive packages first, so this always
+        installs the latest version below the ceiling. torch goes in first (preferring
+        SlicerPyTorch for a CUDA-matched build) so the nnInteractive install finds it
+        satisfied and doesn't pull a mismatched wheel. nnInteractive declares its own
+        up-to-date requirements, so the single install pulls nnU-Net, huggingface_hub,
+        scikit-image, blosc2, httpx, etc. Returns True if pip reported success.
+        """
         self.ensure_torch_installed()
-        if force:
-            # Repair a partial/broken nnInteractive without clobbering torch:
-            # reinstall just the package files (--no-deps), then install any missing
-            # dependencies (without --force, so the existing torch is left alone).
-            self._pip_install(
-                "--force-reinstall --no-deps nnInteractive", "Repairing nnInteractive ..."
-            )
-            self._pip_install("nnInteractive", "Installing nnInteractive dependencies ...")
-        else:
-            # Default nnInteractive install brings nnU-Net, acvl_utils, batchgenerators, etc.
-            self._pip_install_if_missing("nnunetv2", "nnInteractive")
-        self._pip_install_if_missing("huggingface_hub", "huggingface_hub", force=force)
+        self._pip_install(
+            NNINTERACTIVE_PKG,
+            "Installing nnInteractive (full: local + remote)...",
+        )
+        if self._last_pip_error is not None:
+            return False
+        importlib.invalidate_caches()
+        self.set_install_flavor("full")
+        return True
 
-    def resolve_mode_first_run(self):
-        """On first use, ask whether to use local GPU compute or a remote server."""
+    def _install_client(self):
+        """Install the lightweight, torch-free remote client (capped). The
+        'nninteractive-client' distribution declares its own wire-stack requirements
+        (numpy/httpx/blosc2/scikit-image), so the single install pulls everything the
+        remote path needs. Returns True if pip reported success."""
+        self._pip_install(
+            NNINTERACTIVE_CLIENT_PKG,
+            "Installing nnInteractive client (remote only, no PyTorch)...",
+        )
+        if self._last_pip_error is not None:
+            return False
+        importlib.invalidate_caches()
+        self.set_install_flavor("client")
+        return True
+
+    def _uninstall_nninteractive_packages(self):
+        """Uninstall the nnInteractive / nninteractive-client distributions (only those
+        packages, NOT their dependencies) before a (re)install, so switching flavor is
+        clean -- e.g. reinstalling client-only after a full install actually drops the
+        local backend instead of leaving it importable. pip uninstall never removes
+        dependencies, so torch / nnU-Net / huggingface_hub / ... are left in place for a
+        fast reinstall. No-op when nothing is installed (first run)."""
+        import importlib.metadata as metadata
+
+        installed = []
+        for dist in ("nnInteractive", "nninteractive-client"):
+            try:
+                metadata.version(dist)
+                installed.append(dist)
+            except metadata.PackageNotFoundError:
+                continue
+        if not installed:
+            return
+        self._pip_uninstall(
+            " ".join(installed), "Removing existing nnInteractive packages ..."
+        )
+        importlib.invalidate_caches()
+
+    def _prompt_install_choice(self, reinstall=False):
+        """Ask the user what to install (Full vs Client only) and run the install.
+
+        This is the ONLY way packages get installed (besides the identical first-run
+        path) -- there is no lazy install. Any installed nnInteractive packages are
+        uninstalled first (dependencies untouched) so the chosen flavor is the only one
+        present afterwards, and the latest capped version is installed. With ``reinstall``
+        the dialog is framed as Reinstall/Update. Cancelling installs nothing, so the
+        first-run prompt re-appears on the next launch.
+        """
         if getattr(self, "_cleanup_in_progress", False) or getattr(
             self, "_application_quitting", False
         ):
             return
-        existing = slicer.util.settingsValue("SlicerNNInteractive/mode", "")
-        if existing in ("local", "remote"):
-            self._sync_mode_switch()
-            return
-        if not self._local_inference_available():
-            # Only the lightweight remote client is installed: Remote is the only viable
-            # mode, so persist it and skip the prompt. (Install the full package and
-            # restart to unlock Local — see the Local button's tooltip.)
-            qt.QSettings().setValue("SlicerNNInteractive/mode", "remote")
-            self._sync_mode_switch()
-            return
+        prev_flavor = self.get_install_flavor()
+
         msg = qt.QMessageBox(slicer.util.mainWindow())
-        msg.setWindowTitle("nnInteractive: choose compute mode")
+        msg.setWindowTitle(
+            "Reinstall / Update nnInteractive" if reinstall else "Install nnInteractive"
+        )
         msg.setIcon(qt.QMessageBox.Question)
         msg.setText(
-            "How would you like to run nnInteractive?\n\n"
-            "Remote server  -  lightweight install (no PyTorch); connects to an "
-            "nninteractive-server running on a GPU machine.\n\n"
-            "Local GPU compute  -  runs in-process inside Slicer; downloads the full "
-            "nnInteractive + PyTorch stack (needs a GPU)."
+            "Which nnInteractive backend should be installed into Slicer's Python?\n\n"
+            "Full (local + remote)  -  runs in-process on this machine's GPU AND can "
+            "connect to a remote server. Downloads the full nnInteractive + PyTorch "
+            "stack (large; a GPU is needed for local inference).\n\n"
+            "Client only (remote)  -  lightweight, no PyTorch. Connects to an "
+            "nninteractive-server on a GPU machine; Local mode stays disabled."
         )
-        remote_btn = msg.addButton("Remote server", qt.QMessageBox.AcceptRole)
-        local_btn = msg.addButton("Local GPU compute", qt.QMessageBox.AcceptRole)
+        full_btn = msg.addButton("Full (local + remote)", qt.QMessageBox.AcceptRole)
+        client_btn = msg.addButton("Client only (remote)", qt.QMessageBox.AcceptRole)
+        cancel_btn = msg.addButton(qt.QMessageBox.Cancel)
+        msg.setDefaultButton(full_btn if prev_flavor == "full" else client_btn)
         msg.exec_()
-        mode = "local" if msg.clickedButton() == local_btn else "remote"
-        qt.QSettings().setValue("SlicerNNInteractive/mode", mode)
+
+        clicked = msg.clickedButton()
+        if clicked is None or clicked == cancel_btn:
+            return
+        # Clean slate first: remove any installed nnInteractive packages (deps left in
+        # place) so the chosen flavor is the only one present -- this is what makes a
+        # Full -> Client switch actually drop local support.
+        self._uninstall_nninteractive_packages()
+        if clicked == full_btn:
+            ok = self._install_full()
+            new_flavor = "full"
+        else:
+            ok = self._install_client()
+            new_flavor = "client"
+        self._post_install(prev_flavor, new_flavor, ok)
+
+    def _post_install(self, prev_flavor, new_flavor, ok):
+        """After an install attempt: choose a sensible default mode, tear down any stale
+        session, refresh the toggle / dropdown / install + update readouts, and warn if
+        the freshly installed backend isn't importable in this session (restart needed).
+        """
+        if not ok:
+            slicer.util.errorDisplay(
+                "nnInteractive installation failed. See the Python Console for the pip "
+                "output, check your internet connection, and try again.",
+                parent=slicer.util.mainWindow(),
+            )
+        elif new_flavor == "client":
+            self.set_mode("remote")  # local impossible with a client-only install
+        elif prev_flavor != "full":
+            self.set_mode("local")  # newly gained in-process compute -> default to it
+
+        # Refresh UI regardless of success: a partial install still changes availability.
+        self._teardown_for_settings_change()
+        self._apply_local_mode_availability()
         self._sync_mode_switch()
+        self._ensure_model_combo_populated()
+        self._refresh_install_status_ui()
+        self._check_for_updates_async()
+
+        if ok and not self._backend_installed_for_mode(self.get_mode()):
+            slicer.util.infoDisplay(
+                "nnInteractive was installed, but is not loadable in this running "
+                "Slicer session yet (this can happen for freshly installed compiled "
+                "packages such as PyTorch). Please restart Slicer.",
+                parent=slicer.util.mainWindow(),
+            )
+
+    def _resolve_install_on_startup(self):
+        """First-run install resolver, deferred from setup() to the event loop.
+
+        If a flavor is already recorded, do nothing. Otherwise adopt a pre-existing
+        install (e.g. a Slicer-bundled backend) if one is importable; if nothing is
+        installed, prompt the user to choose what to install. Dismissing the prompt
+        leaves nothing installed, so it re-appears on the next launch.
+        """
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            return
+        if self.get_install_flavor():
+            self._sync_mode_switch()
+            return
+        detected = self._detect_install_flavor()
+        if detected:
+            self.set_install_flavor(detected)
+            self._apply_local_mode_availability()
+            self._refresh_install_status_ui()
+            self._sync_mode_switch()
+            self._check_for_updates_async()
+            return
+        self._prompt_install_choice(reinstall=False)
+
+    def _refresh_install_status_ui(self):
+        """Reflect the recorded install flavor in the Configuration-tab label/button."""
+        label = getattr(self.ui, "installFlavorLabel", None)
+        if label is not None:
+            flavor = self.get_install_flavor()
+            if flavor == "full":
+                label.setText("Installed: <b>Full</b> (local + remote)")
+            elif flavor == "client":
+                label.setText("Installed: <b>Client only</b> (remote)")
+            else:
+                label.setText("Installed: <b>nothing yet</b>")
+        btn = getattr(self.ui, "reinstallButton", None)
+        if btn is not None:
+            btn.setText(
+                "Reinstall / Update nnInteractive"
+                if self.get_install_flavor()
+                else "Install nnInteractive"
+            )
+
+    # ------------------------------------------------------------------ #
+    # "Update available?" check -- background network, all Qt on the main
+    # thread. The worker stores a plain dict; a poll timer renders it.
+    # ------------------------------------------------------------------ #
+
+    def _check_for_updates_async(self):
+        """Start a background check of whether the installed backend is up to date.
+
+        Fails silently when offline. No-op until a flavor is installed.
+        """
+        if getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        ):
+            return
+        label = getattr(self.ui, "updateStatusLabel", None)
+        if label is None:
+            return
+        flavor = self.get_install_flavor()
+        if not flavor:
+            label.setText("")
+            return
+        label.setText("Checking for nnInteractive updates ...")
+        label.setStyleSheet("color: gray;")
+        packages = (
+            ["nnInteractive", "nninteractive-client"]
+            if flavor == "full"
+            else ["nninteractive-client"]
+        )
+        self._update_check_result = None
+        if self._update_poll_timer is None:
+            self._update_poll_timer = qt.QTimer()
+            self._update_poll_timer.setSingleShot(False)
+            self._update_poll_timer.timeout.connect(self._poll_update_check)
+        worker = threading.Thread(
+            target=self._update_check_worker, args=(packages,), daemon=True
+        )
+        worker.start()
+        self._update_poll_timer.start(300)
+
+    def _update_check_worker(self, packages):
+        """Worker thread: collect installed + latest-capped versions. NO Qt access."""
+        import importlib.metadata as metadata
+
+        result = {"status": "ok", "packages": []}
+        try:
+            for pkg in packages:
+                try:
+                    installed = metadata.version(pkg)
+                except Exception:  # noqa: BLE001
+                    installed = None
+                latest = self._pypi_latest_capped(pkg)
+                result["packages"].append(
+                    {"name": pkg, "installed": installed, "latest": latest}
+                )
+            if all(p["latest"] is None for p in result["packages"]):
+                result["status"] = "error"  # couldn't reach / parse PyPI
+        except Exception:  # noqa: BLE001
+            result["status"] = "error"
+        self._update_check_result = result
+
+    def _pypi_latest_capped(self, pkg):
+        """Latest released version of ``pkg`` on PyPI that is < the version ceiling, or
+        None on any failure. Skips pre-releases and fully-yanked releases. Worker-thread
+        safe (stdlib + packaging only, no Qt)."""
+        import json
+        import urllib.request
+
+        try:
+            from packaging.version import Version
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            url = f"https://pypi.org/pypi/{pkg}/json"
+            with urllib.request.urlopen(url, timeout=4) as resp:
+                data = json.load(resp)
+        except Exception:  # noqa: BLE001
+            return None
+        ceiling = Version(NNINTERACTIVE_VERSION_CEILING)
+        best = None
+        for ver, files in (data.get("releases") or {}).items():
+            if not files or all(f.get("yanked") for f in files):
+                continue
+            try:
+                v = Version(ver)
+            except Exception:  # noqa: BLE001
+                continue
+            if v.is_prerelease or v >= ceiling:
+                continue
+            if best is None or v > best:
+                best = v
+        return str(best) if best is not None else None
+
+    def _poll_update_check(self):
+        """Main thread: pick up the worker's result (if ready) and render the label."""
+        result = self._update_check_result
+        if result is None:
+            return
+        self._stop_update_poll_timer()
+        self._render_update_label(result)
+
+    def _stop_update_poll_timer(self):
+        timer = getattr(self, "_update_poll_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _render_update_label(self, result):
+        label = getattr(self.ui, "updateStatusLabel", None)
+        if label is None:
+            return
+        if result.get("status") != "ok":
+            label.setText("Could not check for nnInteractive updates.")
+            label.setStyleSheet("color: gray;")
+            return
+        from packaging.version import Version
+
+        outdated = []
+        for p in result["packages"]:
+            inst, latest = p["installed"], p["latest"]
+            if inst is None or latest is None:
+                continue
+            try:
+                if Version(inst) < Version(latest):
+                    outdated.append(f"{p['name']} {inst} → {latest}")
+            except Exception:  # noqa: BLE001
+                continue
+        if outdated:
+            label.setText(
+                "⟳ nnInteractive update available ("
+                + "; ".join(outdated)
+                + "). Click 'Reinstall / Update nnInteractive'."
+            )
+            label.setStyleSheet("color: #d35400; font-weight: bold;")
+        else:
+            label.setText("✓ nnInteractive is up to date")
+            label.setStyleSheet("color: #27ae60; font-weight: bold;")
 
     ###############################################################################
     # Utility / converters functions
