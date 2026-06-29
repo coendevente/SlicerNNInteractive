@@ -10,7 +10,7 @@ The deployed endpoint is a drop-in replacement for the local server at port 1527
 Point the Slicer extension at the Modal URL instead of http://localhost:1527.
 
 Changes from the upstream v1.0.1 server:
-  - nninteractive upgraded from 1.0.1 → 2.4.2
+  - nninteractive upgraded from 1.0.1 to 2.4.2
   - Removed use_pinned_memory (replaced by interactions_storage='auto')
   - Added interaction_bbox to lasso/scribble calls for 3-orders-of-magnitude speedup
   - Added /health and /reset endpoints
