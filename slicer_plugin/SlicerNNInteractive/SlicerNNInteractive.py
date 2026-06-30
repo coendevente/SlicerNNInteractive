@@ -38,9 +38,10 @@ NNINTERACTIVE_CLIENT_PKG = f"nninteractive-client<{NNINTERACTIVE_VERSION_CEILING
 
 # On Windows, PyPI's default ``pip install torch`` is a CPU-only wheel, so local GPU
 # inference would silently fall back to CPU. Point pip at PyTorch's CUDA wheel index
-# instead. Overridable per-machine via the Advanced "PyTorch pip index URL" setting
-# (e.g. swap cu126 for cu121/cu118 to match an older GPU driver). The SlicerPyTorch
-# extension (PyTorchUtils) is still preferred when available -- this is the fallback.
+# instead. The SlicerPyTorch extension (PyTorchUtils) is still preferred when
+# available -- this is the fallback. To install a different build (a CUDA version for
+# an older GPU driver, or a pinned torch version), run pip from Slicer's Python Console
+# (see the README).
 DEFAULT_WINDOWS_TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu126"
 
 
@@ -514,31 +515,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             lambda v: self._save_setting("device", v, reinit=True)
         )
         advanced_form.addRow("Device:", self.ui.deviceCombo)
-
-        # PyTorch pip index URL, used only when torch is installed via pip fallback
-        # (SlicerPyTorch is preferred). Pre-filled with the CUDA index on Windows so the
-        # default install isn't the CPU-only wheel; editable to match a different CUDA
-        # version. Takes effect on the next Full install / Reinstall.
-        self.ui.torchIndexEdit = qt.QLineEdit()
-        self.ui.torchIndexEdit.setText(
-            self.get_setting_str(
-                "torch_index_url",
-                DEFAULT_WINDOWS_TORCH_INDEX_URL if os.name == "nt" else "",
-            )
-        )
-        self.ui.torchIndexEdit.setPlaceholderText(
-            "blank = default PyPI (CUDA on Linux; CPU-only on Windows)"
-        )
-        self.ui.torchIndexEdit.setToolTip(
-            "pip --index-url for installing PyTorch. On Windows, leave the CUDA index "
-            "(e.g. .../whl/cu126) so GPU inference works; change the cuXXX tag to match "
-            "your GPU driver. Used only by the pip fallback; the SlicerPyTorch extension "
-            "is preferred when installed."
-        )
-        self.ui.torchIndexEdit.editingFinished.connect(
-            lambda: self._save_setting("torch_index_url", self.ui.torchIndexEdit.text.strip())
-        )
-        advanced_form.addRow("PyTorch pip index URL:", self.ui.torchIndexEdit)
 
         self.ui.compileCheck = qt.QCheckBox()
         self.ui.compileCheck.setChecked(self.get_setting_bool("use_torch_compile", False))
@@ -4462,12 +4438,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             pass
         # Fallback: plain pip. On Windows the default PyPI torch wheel is CPU-only, so
         # point pip at PyTorch's CUDA index (otherwise GPU inference silently runs on
-        # CPU). On Linux the default wheel already bundles CUDA. The index URL is
-        # overridable via the Advanced "PyTorch pip index URL" setting.
-        index_url = self.get_setting_str("torch_index_url", "").strip()
-        if not index_url and os.name == "nt":
-            index_url = DEFAULT_WINDOWS_TORCH_INDEX_URL
-        command = f"torch --index-url {index_url}" if index_url else "torch"
+        # CPU). On Linux the default wheel already bundles CUDA. To install a different
+        # build (a CUDA version for an older GPU driver, or a pinned torch version),
+        # run pip from Slicer's Python Console -- see the README.
+        if os.name == "nt":
+            command = f"torch --index-url {DEFAULT_WINDOWS_TORCH_INDEX_URL}"
+        else:
+            command = "torch"
         self._pip_install(command, "Installing PyTorch (this can take a while)...")
 
     # ------------------------------------------------------------------ #
@@ -4484,7 +4461,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         SlicerPyTorch for a CUDA-matched build) so the nnInteractive install finds it
         satisfied and doesn't pull a mismatched wheel. nnInteractive declares its own
         up-to-date requirements, so the single install pulls nnU-Net, huggingface_hub,
-        scikit-image, blosc2, httpx, etc. Returns True if pip reported success.
+        scikit-image, blosc2, httpx, etc. To install a specific PyTorch build (older CUDA
+        for an old GPU driver, or a pinned version), run pip from Slicer's Python Console
+        -- see the README. Returns True if pip reported success.
         """
         self.ensure_torch_installed()
         self._pip_install(

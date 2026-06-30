@@ -92,13 +92,28 @@ to install first.
 > The extension only ever installs `nnInteractive` / `nninteractive-client` **below v3.0.0**, to
 > guard against future API changes.
 
-**PyTorch (Full installs).** For a reliable, CUDA-matched PyTorch inside Slicer, install the
-**PyTorch** extension (SlicerPyTorch) from the Extensions Manager first — the extension uses it when
-present. Otherwise it falls back to `pip install torch`. On **Windows** the default PyPI torch wheel
-is **CPU-only**, so the fallback instead installs from PyTorch's CUDA wheel index
-(`https://download.pytorch.org/whl/cu126` by default) — otherwise GPU inference would silently run
-on CPU. To match a different CUDA build (e.g. an older driver), change the **PyTorch pip index URL**
-under `Configuration ▸ Advanced` (e.g. swap `cu126` for `cu121`) before installing.
+**PyTorch (Full installs).** A Full install pulls in PyTorch automatically. On **Windows** it pulls
+from PyTorch's CUDA wheel index (`https://download.pytorch.org/whl/cu126`) because the default PyPI
+wheel is **CPU-only**; on **Linux** the default wheel already bundles CUDA. If you need a **different**
+PyTorch build — a CUDA version matching an older GPU driver, or a pinned torch version — install it
+yourself from Slicer's **Python Console** (`View ▸ Python Console`), then restart Slicer and click
+`Initialize` again. Uninstall the existing torch first so pip actually replaces it:
+
+```python
+# Windows — (re)install the default CUDA 12.6 GPU wheel
+slicer.util.pip_uninstall("torch")
+slicer.util.pip_install("torch --index-url https://download.pytorch.org/whl/cu126")
+```
+
+```python
+# Older GPU / driver — pin a specific torch version and CUDA build
+slicer.util.pip_uninstall("torch")
+slicer.util.pip_install("torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126")
+```
+
+Pick the `cuXXX` tag that matches your driver (e.g. `cu121`/`cu118` for older drivers); see the
+[PyTorch install matrix](https://pytorch.org/get-started/locally/) for the right combination. If
+`slicer.util` isn't defined in the console, run `import slicer.util` first.
 
 ### Updating or changing the installed backend
 
@@ -203,9 +218,9 @@ For development, `SlicerNNInteractive` can be installed directly from github, wi
 4. Go to `Developer Tools` > `Extension Wizard`.
 5. Click `Select Extension`.
 6. Locate the `SlicerNNInteractive` folder you obtained in Step 1, and select the `slicer_plugin` folder.
-7. Go to the Module dropdown menu again and go to `Segmentation` > `SlicerNNInteractive`. This should result in the following view:
+7. Go to the Module dropdown menu again and go to `Segmentation` > `nnInteractive`. This should result in the following view:
   ![First view of the Slicer extension](img/plugin_first_sight.png)
-	a) If you would like to have `SlicerNNInteractive` available in the top menu (as in the image above), go to `Edit` > `Application Settings` > `Modules` and drag `SlicerNNInteractive` from the `Modules:` list to the `Favorite Modules:` list.
+	a) If you would like to have `nnInteractive` available in the top menu (as in the image above), go to `Edit` > `Application Settings` > `Modules` and drag `nnInteractive` from the `Modules:` list to the `Favorite Modules:` list.
 
 ## Citation
 
