@@ -402,7 +402,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.serverGroup.setVisible(False)
         self.ui.pbTestServer.setVisible(False)
 
-        # ===== Installation group (top of the Configuration tab) =====
+        # ===== Installation group (pinned to the bottom of the Configuration tab;
+        # placed into the layout after the Model Selection group below) =====
         install_group = qt.QGroupBox("nnInteractive Installation")
         install_layout = qt.QVBoxLayout(install_group)
 
@@ -424,7 +425,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             lambda: self._prompt_install_choice(reinstall=True)
         )
         install_layout.addWidget(self.ui.reinstallButton)
-        layout.insertWidget(0, install_group)
+        # NOTE: install_group is added to the tab layout at the very bottom, after the
+        # Model Selection group is inserted (see end of this method).
 
         switch_style = (
             f"QPushButton {{ {self.unselected_style} }}"
@@ -614,6 +616,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         idx = max(layout.count() - 1, 0)
         layout.insertWidget(idx, model_group)
 
+        # Append the Installation group after the trailing spacer so it stays pinned to
+        # the bottom of the Configuration tab, below the model-selection controls.
+        layout.addWidget(install_group)
+
         # Initial switch state + container visibility, and the cached server URL.
         is_local = self.get_mode() == "local"
         self.ui.localModeButton.setChecked(is_local)
@@ -711,7 +717,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     "Local (in-process) inference is not installed in this Slicer.\n"
                     "Only the lightweight remote client (nninteractive-client) is present.\n\n"
                     "To enable Local mode, click 'Reinstall / Update nnInteractive' in the\n"
-                    "Installation section above and choose 'Full (local + remote)'."
+                    "Installation section below and choose 'Full (local + remote)'."
                 )
         if not available and self.get_mode() != "remote":
             self.set_mode("remote")

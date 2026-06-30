@@ -82,6 +82,9 @@ temp/
 # vscode
 .vscode
 
+# JetBrains IDEs (PyCharm, IntelliJ, etc.)
+.idea*
+
 *.DS_Store
 *.pth
 
