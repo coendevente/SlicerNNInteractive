@@ -92,28 +92,34 @@ to install first.
 > The extension only ever installs `nnInteractive` / `nninteractive-client` **below v3.0.0**, to
 > guard against future API changes.
 
-**PyTorch (Full installs).** A Full install pulls in PyTorch automatically. On **Windows** it pulls
-from PyTorch's CUDA wheel index (`https://download.pytorch.org/whl/cu126`) because the default PyPI
-wheel is **CPU-only**; on **Linux** the default wheel already bundles CUDA. If you need a **different**
-PyTorch build — a CUDA version matching an older GPU driver, or a pinned torch version — install it
-yourself from Slicer's **Python Console** (`View ▸ Python Console`), then restart Slicer and click
-`Initialize` again. Uninstall the existing torch first so pip actually replaces it:
+**PyTorch (Full installs).** A Full install pulls in PyTorch (and `torchvision`) automatically. On
+**Windows** it pulls from PyTorch's CUDA wheel index (`https://download.pytorch.org/whl/cu126`)
+because the default PyPI wheel is **CPU-only**; on **Linux** the default wheel already bundles CUDA.
+If you need a **different** PyTorch build — a CUDA version matching an older GPU driver, or a pinned
+torch version — install it yourself from Slicer's **Python Console** (`View ▸ Python Console`), then
+restart Slicer and click `Initialize` again. **`torchvision` is version-locked to `torch`, so always
+change the two together in the same command** — a leftover, mismatched `torchvision` fails to load and
+takes the whole backend down with it. Uninstall the existing torch **and** torchvision first so pip
+actually replaces them:
 
 ```python
-# Windows — (re)install the default CUDA 12.6 GPU wheel
-slicer.util.pip_uninstall("torch")
-slicer.util.pip_install("torch --index-url https://download.pytorch.org/whl/cu126")
+# Windows — (re)install the default CUDA 12.6 GPU wheels
+slicer.util.pip_uninstall("torch torchvision")
+slicer.util.pip_install("torch torchvision --index-url https://download.pytorch.org/whl/cu126")
 ```
 
 ```python
-# Older GPU / driver — pin a specific torch version and CUDA build
-slicer.util.pip_uninstall("torch")
-slicer.util.pip_install("torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126")
+# Older GPU / driver — pin a matching torch + torchvision pair and a CUDA build
+slicer.util.pip_uninstall("torch torchvision")
+slicer.util.pip_install("torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128 --force-reinstall")
 ```
 
-Pick the `cuXXX` tag that matches your driver (e.g. `cu121`/`cu118` for older drivers); see the
-[PyTorch install matrix](https://pytorch.org/get-started/locally/) for the right combination. If
-`slicer.util` isn't defined in the console, run `import slicer.util` first.
+Pick the `cuXXX` tag that matches your driver (e.g. `cu121`/`cu118` for older drivers), and a
+`torch`/`torchvision` pair that are released together (e.g. torch `2.8.0` ↔ torchvision `0.23.0`); see
+the [PyTorch install matrix](https://pytorch.org/get-started/locally/) and the
+[torch ↔ torchvision compatibility table](https://github.com/pytorch/vision#installation) for the
+right combination. `--force-reinstall` makes pip replace a stubborn wheel even if a version already
+looks present. If `slicer.util` isn't defined in the console, run `import slicer.util` first.
 
 ### Updating or changing the installed backend
 
@@ -181,17 +187,33 @@ Once you have completed the installation above, you can use `SlicerNNInteractive
 
 	a) Alternatively, you can reset the current segment using the "Reset segment button".
 
-6. You can add a new segment by clicking the "Next segment" button, or clicking the "+ Add" button in the Segment Editor. You can always go back to previous segments by selecting it in the Segment Editor.
+6. You can add a new segment by clicking the "Next segment" button, or clicking the "+ Add" button in the Segment Editor. You can always go back to previous segments by selecting it in the Segment Editor. To remove the currently selected segment entirely, use the Segment Editor's delete (`Remove`) button, or press `Del`.
 
 ### Editing an existing segment
 You can edit an existing segmentation (generated using this plugin, or obtained otherwise, such as through loading in a segmentation file), by selecting the segment in the Segment Editor. Prompts are always applied to the selected segment.
 
 ### Keyboard shortcuts
-Each button in the Interactive Prompts tab has a keyboard shortcut, indicated by the underlined letter. The last interaction can be undone with `Ctrl+Z`.
+Most buttons in the `nnInteractive Prompts` tab have a keyboard shortcut, shown in brackets in the button label (for example, `Bounding Box (B)`). The full list:
+
+| Shortcut | Action |
+| --- | --- |
+| `P` | Point tool |
+| `B` | Bounding Box tool |
+| `S` | Scribble tool |
+| `L` | Lasso tool |
+| `T` | Toggle prompt type (positive / negative) |
+| `E` | Next segment |
+| `R` | Reset segment (empty the selected segment) |
+| `Del` | Delete the selected segment |
+| `Ctrl+Z` | Undo the last interaction |
+
+`Ctrl+Z` has no dedicated button, so it is the only shortcut not shown as a bracketed label.
 
 ## Common issues
 
 - When the remote server restarts or a session times out, the extension surfaces a "session expired" message — click `Initialize` at the top of the `nnInteractive Prompts` tab to reconnect; your current segmentation is preserved and re-seeded automatically.
+
+- **No GPU detected / running on CPU (Local mode).** If, after `Initialize`, a red warning appears below the button saying nnInteractive is running on the CPU, PyTorch could not find a usable CUDA GPU. Local inference then falls back to the CPU, which is **very slow**. This usually means either no compatible GPU is present, or the installed PyTorch build does not match your GPU (a common case is the **CPU-only** PyTorch wheel getting installed). Install a matching CUDA build of PyTorch as described under [PyTorch (Full installs)](#first-run-choose-what-to-install), then restart Slicer and click `Initialize` again. To confirm what PyTorch sees, run this in Slicer's Python Console (`View ▸ Python Console`): `import torch; print(torch.cuda.is_available(), torch.version.cuda)`.
 
 ## Testing
 

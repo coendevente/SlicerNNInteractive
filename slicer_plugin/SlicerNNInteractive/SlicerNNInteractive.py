@@ -116,7 +116,7 @@ class SlicerNNInteractive(ScriptedLoadableModule):
         self.parent.helpText = """
             This is an 3D Slicer extension for using nnInteractive.
 
-            Read more about this plugin here: https://github.com/coendevente/SlicerNNInteractive.
+            Read more about this plugin here: https://git.dkfz.de/mic/personal/group2/isensee/slicernninteractive.
             """
         self.parent.acknowledgementText = """When using SlicerNNInteractive, please cite as described here: https://github.com/coendevente/SlicerNNInteractive?tab=readme-ov-file#citation."""
 
@@ -206,6 +206,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Compute mode the live session was built for ("local"/"remote"), so the
         # Local/Remote toggle can keep it instead of tearing it down.
         self._session_mode = None
+        # True when the live local session fell back to the CPU (no usable CUDA GPU);
+        # drives the persistent red warning shown below Initialize.
+        self._local_running_on_cpu = False
         # Tracks the editor's selected segment so switching to a different mask clears
         # the displayed prompts. _suppress_segment_switch guards programmatic changes.
         self._last_selected_segment_id = None
@@ -707,6 +710,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.localModeButton.setChecked(is_local)  # setChecked emits toggled, not clicked
         self.ui.remoteModeButton.setChecked(not is_local)
         self._update_mode_visibility()
+        # Keep the idle Initialize label ("Initialize (Local/Remote)") in step with the
+        # mode, including paths that change it without a teardown (startup, reinstall).
+        self.update_connect_status(connected=self.session is not None)
 
     def setup_prompts_tab_extras(self):
         """
@@ -743,6 +749,21 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.promptsStatusLabel.setWordWrap(True)
         self.ui.promptsStatusLabel.setAlignment(qt.Qt.AlignCenter)
         init_layout.addWidget(self.ui.promptsStatusLabel)
+
+        # Persistent (red) warning shown only after a local Initialize that fell back to
+        # the CPU because no usable CUDA GPU was found. A transient status message is easy
+        # to miss, and CPU inference is very slow, so this stays visible until the next
+        # (successful) init. Hidden by default; populated by _update_device_warning().
+        self.ui.promptsDeviceWarningLabel = qt.QLabel("")
+        self.ui.promptsDeviceWarningLabel.setWordWrap(True)
+        self.ui.promptsDeviceWarningLabel.setAlignment(qt.Qt.AlignCenter)
+        self.ui.promptsDeviceWarningLabel.setTextFormat(qt.Qt.RichText)
+        self.ui.promptsDeviceWarningLabel.setOpenExternalLinks(True)
+        self.ui.promptsDeviceWarningLabel.setStyleSheet(
+            "color: #d9534f; font-weight: bold; padding: 4px;"
+        )
+        self.ui.promptsDeviceWarningLabel.setVisible(False)
+        init_layout.addWidget(self.ui.promptsDeviceWarningLabel)
 
         layout.insertWidget(0, init_group)
 
@@ -801,12 +822,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Sets up keyboard shortcuts.
         """
         shortcuts = {
-            "o": self.ui.pbInteractionPoint.click,
+            "p": self.ui.pbInteractionPoint.click,
             "b": self.ui.pbInteractionBBox.click,
             "l": self.ui.pbInteractionLasso.click,
             "s": self.ui.pbInteractionScribble.click,
             "e": self.on_next_segment,
             "r": self.clear_current_segment,
+            "Delete": self.on_delete_segment,  # Delete the currently selected segment
             "t": self.toggle_prompt_type,  # Add 'T' shortcut to toggle between positive/negative
             "Ctrl+Z": self.on_undo,  # Undo the last nnInteractive interaction
         }
@@ -3253,6 +3275,65 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             debug_print("No segment selected to clear.")
 
+    def on_delete_segment(self):
+        """
+        'Delete segment' handler ('Del' shortcut): remove the currently selected
+        segment entirely, drop its prompts/interactions, and land on a neighbouring
+        segment -- or a fresh empty one if it was the last -- with the active tool
+        preserved (mirrors Reset / Next segment). Unlike Reset, which only empties the
+        segment's labelmap, this removes the segment from the segmentation.
+
+        There is no dedicated button (the Segment Editor below already offers segment
+        deletion); this handler backs the 'Del' keyboard shortcut only.
+        """
+        # 'Del' requires a live session, matching the other prompt-affecting shortcuts.
+        if not self._require_initialized():
+            return
+
+        segmentation_node = self.get_segmentation_node()
+        selected_segment_id = self.get_current_segment_id()
+        if segmentation_node is None or not selected_segment_id:
+            debug_print("No segment selected to delete.")
+            return
+
+        active_tool = self._active_prompt_tool()
+        segmentation = segmentation_node.GetSegmentation()
+
+        # Remember the deleted segment's position so we can select its neighbour
+        # afterwards instead of leaving the editor on an empty selection.
+        segment_ids = list(segmentation.GetSegmentIDs())
+        try:
+            removed_index = segment_ids.index(selected_segment_id)
+        except ValueError:
+            removed_index = 0
+
+        # One programmatic operation: RemoveSegment moves the selection, which would
+        # otherwise fire _handle_selected_segment_change on top of the reset we do here.
+        self._suppress_segment_switch = True
+        try:
+            self.reset_all_prompts()  # clears markups/overlays/session interactions
+            segmentation.RemoveSegment(selected_segment_id)
+
+            remaining_ids = list(segmentation.GetSegmentIDs())
+            if remaining_ids:
+                # Prefer the previous segment; fall back to the new first one.
+                new_index = min(max(removed_index - 1, 0), len(remaining_ids) - 1)
+                new_segment_id = remaining_ids[new_index]
+                self.segment_editor_node.SetSelectedSegmentID(new_segment_id)
+                self._last_selected_segment_id = new_segment_id
+        finally:
+            self._suppress_segment_switch = False
+
+        # Removed the last segment: start a fresh empty one so the user can keep
+        # working (make_new_segment manages its own switch-suppression + selection).
+        if not remaining_ids:
+            self.make_new_segment()
+
+        # Re-arm the active tool on the newly selected / created segment. Deferred so
+        # the prompt nodes rebuilt by reset_all_prompts have settled first.
+        if active_tool is not None:
+            qt.QTimer.singleShot(0, lambda: self._activate_prompt_tool(active_tool))
+
     def _update_segment_region(self, mask, bbox, segmentationNode, segmentId):
         """Update only the changed sub-extent of the segment instead of rewriting the whole
         volume. ``bbox`` is the backend's clipped paste bbox -- half-open and directly
@@ -3687,6 +3768,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return False
 
+        # Recomputed by _construct_local_session; a remote session never runs on our CPU.
+        # (The early-return reuse path above keeps the previous value untouched.)
+        self._local_running_on_cpu = False
         try:
             if mode == "local":
                 self.session = self._construct_local_session()
@@ -3810,7 +3894,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             err, self._local_load_error = self._local_load_error, None
             raise err
 
-        # Surface notes collected in the worker, now back on the main thread.
+        # Surface notes collected in the worker, now back on the main thread. The CPU
+        # fallback also drives a persistent red warning below Initialize (the transient
+        # status message alone is easy to miss); see _update_device_warning().
+        self._local_running_on_cpu = bool(notes.get("cpu"))
         if notes.get("cpu"):
             slicer.util.showStatusMessage(
                 "No CUDA GPU detected - running nnInteractive on CPU (slow).", 5000
@@ -4369,10 +4456,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def update_connect_status(self, connected):
         """Sync the Initialize/Uninitialize button + status readouts to the session state."""
         mode = self.get_mode()
-        action = "Uninitialize" if connected else "Initialize"
         if connected:
+            # The status line already reports the live mode, so the button stays plain.
+            action = "Uninitialize"
             status = "initialized (remote)" if mode == "remote" else "initialized (local)"
         else:
+            # Show which mode a press will start, so the user sees it before clicking.
+            action = "Initialize (Local)" if mode == "local" else "Initialize (Remote)"
             status = "not initialized"
         if hasattr(self.ui, "initializeButton"):
             self.ui.initializeButton.setText(action)
@@ -4388,6 +4478,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if connected and mode == "local":
             self._ensure_model_combo_populated()
         self._update_initialize_button_state()
+        self._update_device_warning(connected)
+
+    def _update_device_warning(self, connected):
+        """Show a persistent red warning below Initialize when the live local session
+        fell back to the CPU (no usable CUDA GPU). Hidden for remote / GPU sessions and
+        whenever no session is live."""
+        label = getattr(self.ui, "promptsDeviceWarningLabel", None)
+        if label is None:
+            return
+        show = bool(connected) and getattr(self, "_local_running_on_cpu", False)
+        if show:
+            url = (
+                "https://git.dkfz.de/mic/personal/group2/isensee/slicernninteractive"
+                "#common-issues"
+            )
+            label.setText(
+                "⚠ No GPU detected — nnInteractive is running on the CPU, which is very "
+                "slow. Likely either no compatible GPU is present, or the installed "
+                "PyTorch build does not match your GPU. "
+                f'See <a href="{url}">Common issues</a> in the README.'
+            )
+        label.setVisible(show)
 
     def _has_volume_loaded(self):
         """True if a source volume is available to initialize on. Side-effect free
