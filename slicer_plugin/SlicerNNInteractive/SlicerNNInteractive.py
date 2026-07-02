@@ -542,14 +542,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         advanced_form.addRow("Interaction storage:", self.ui.storageCombo)
 
-        # Auto-zoom is a local-only setting (it is baked into the local session at
-        # construction). For remote sessions the server decides, so this lives here in
-        # the local container rather than the shared Settings group.
-        self.ui.autozoomCheck = qt.QCheckBox()
-        self.ui.autozoomCheck.setChecked(self.get_setting_bool("autozoom", True))
-        self.ui.autozoomCheck.toggled.connect(self.on_autozoom_toggled)
-        advanced_form.addRow("Auto-zoom:", self.ui.autozoomCheck)
-
         # --- Remote container ---
         self.ui.remoteContainer = qt.QWidget()
         remote_layout = qt.QVBoxLayout(self.ui.remoteContainer)
@@ -570,6 +562,22 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # a change can disconnect without firing on every keystroke.
         self.ui.apiKeyEdit.editingFinished.connect(self._on_api_key_changed)
         remote_layout.addWidget(self.ui.apiKeyEdit)
+
+        # --- Auto-zoom (common to both modes) ---
+        # Both backends honour auto-zoom: the local session takes it at construction and
+        # the remote client forwards it to the server (set_do_autozoom). Toggling it
+        # applies to the live session immediately -- no re-initialization needed.
+        autozoom_row = qt.QHBoxLayout()
+        self.ui.autozoomCheck = qt.QCheckBox("Auto-zoom")
+        self.ui.autozoomCheck.setChecked(self.get_setting_bool("autozoom", True))
+        self.ui.autozoomCheck.setToolTip(
+            "Let nnInteractive zoom out to capture context around larger objects.\n"
+            "Applies to both Local and Remote sessions and takes effect immediately."
+        )
+        self.ui.autozoomCheck.toggled.connect(self.on_autozoom_toggled)
+        autozoom_row.addWidget(self.ui.autozoomCheck)
+        autozoom_row.addStretch(1)
+        model_layout.addLayout(autozoom_row)
 
         # --- Status (common to both modes) ---
         # The Initialize/Uninitialize action lives at the TOP of the "nnInteractive
@@ -812,10 +820,29 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         return f"Model license: {license_str}"
 
     def on_autozoom_toggled(self, checked):
-        # Auto-zoom is baked into the local session at construction, so changing it
-        # tears the session down (like the other session-affecting settings); the user
-        # re-initializes to apply it.
-        self._save_setting_bool("autozoom", checked, reinit=True)
+        # Both the local and remote sessions expose set_do_autozoom(), so persist the
+        # choice and push it to the live session immediately (no re-initialize/teardown).
+        self._save_setting_bool("autozoom", checked, reinit=False)
+        self._apply_autozoom_to_session()
+
+    def _apply_autozoom_to_session(self):
+        """Push the current auto-zoom setting to the live session. Both the local and the
+        remote session expose set_do_autozoom() (the remote client forwards it to the
+        server), so this works in either mode -- and the setting is honoured regardless of
+        the compute device (auto-zoom on CPU is slower but still respected). No-op when
+        nothing is initialized."""
+        session = self.session
+        if session is None:
+            return
+        setter = getattr(session, "set_do_autozoom", None)
+        if not callable(setter):
+            return
+        try:
+            setter(self.get_setting_bool("autozoom", True))
+        except self.SESSION_LOST_ERRORS as exc:
+            self.handle_session_expired(exc)
+        except Exception as exc:  # noqa: BLE001 - a failed toggle must not break the UI
+            debug_print(f"Could not apply auto-zoom to the session: {exc}")
 
     def setup_shortcuts(self):
         """
@@ -3844,7 +3871,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     notes["cpu"] = True
                     device = torch.device("cpu")
 
-                do_autozoom = want_autozoom and device.type == "cuda"
+                # Honour the user's Auto-zoom choice regardless of device -- it is slower
+                # on CPU, but the setting is respected there too (per user request).
+                do_autozoom = want_autozoom
 
                 use_torch_compile = want_compile
                 if use_torch_compile and compile_reason is not None:
@@ -3976,8 +4005,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         except ServerAtCapacityError as exc:
             raise RuntimeError(f"The nnInteractive server is at capacity: {exc}") from exc
 
-        # Auto-zoom is decided by the server for remote sessions; the client does not
-        # override it (the Auto-zoom setting is local-only).
+        # The session starts from the server's auto-zoom default; _on_session_ready()
+        # then pushes the user's Auto-zoom choice via set_do_autozoom().
         return session
 
     def _populate_model_combo(self):
@@ -4167,6 +4196,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbInteractionLasso.setEnabled(_supports("lasso"))
         self.ui.pbInteractionScribble.setEnabled(_supports("scribble"))
         self.update_connect_status(connected=True)
+
+        # Apply the user's auto-zoom choice to the fresh session. The local session was
+        # already built with it, but the remote session starts from the server default,
+        # so this is what makes the setting take effect for remote sessions after init.
+        self._apply_autozoom_to_session()
 
         # For remote sessions, keep the lease alive with a main-thread Qt timer.
         # The client also has a background daemon heartbeat, but a Qt timer driven by
