@@ -53,7 +53,7 @@
                </size>
               </property>
               <property name="text">
-               <string>&amp;Reset segment</string>
+               <string>Reset segment (R)</string>
               </property>
              </widget>
             </item>
@@ -66,7 +66,7 @@
                </size>
               </property>
               <property name="text">
-               <string>N&amp;ext segment</string>
+               <string>Next segment (E)</string>
               </property>
              </widget>
             </item>
@@ -76,7 +76,7 @@
          <item>
           <widget class="QGroupBox" name="promptTypeGroup">
            <property name="title">
-            <string>Prompt &amp;Type:</string>
+            <string>Prompt Type (T to toggle):</string>
            </property>
            <layout class="QVBoxLayout" name="verticalLayout_14">
             <item>
@@ -153,7 +153,7 @@
                  <string>Place point prompt</string>
                 </property>
                 <property name="text">
-                 <string> P&amp;oint</string>
+                 <string> Point (P)</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -178,7 +178,7 @@
                  <string>Place BBox prompt</string>
                 </property>
                 <property name="text">
-                 <string> &amp;Bounding Box</string>
+                 <string> Bounding Box (B)</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -203,7 +203,7 @@
                  <string>Place a scribble prompt</string>
                 </property>
                 <property name="text">
-                 <string> &amp;Scribble</string>
+                 <string> Scribble (S)</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -236,7 +236,7 @@
                    <string>Draw a freehand contour with the left mouse button held down. Release to close and fill it, and submit it as a 2D prompt.</string>
                   </property>
                   <property name="text">
-                   <string> &amp;Lasso</string>
+                   <string> Lasso (L)</string>
                   </property>
                   <property name="checkable">
                    <bool>true</bool>
