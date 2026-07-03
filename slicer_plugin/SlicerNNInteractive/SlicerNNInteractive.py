@@ -3947,14 +3947,26 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._local_load_error = None
         self._run_thread_with_message(_load_worker, (), message)
 
-        # No lazy repair: if the import failed (e.g. a partial/broken install), surface a
-        # clear message pointing at the Reinstall button rather than silently reinstalling.
+        # No lazy repair: if the import failed, surface a clear message rather than
+        # silently reinstalling. ALWAYS include the underlying error -- an ImportError
+        # here is often NOT a broken nnInteractive install (find_spec already confirmed
+        # the package is on disk) but a torch/torchvision/numpy the user changed
+        # themselves that now fails to import. Hiding the reason sends them uselessly to
+        # Reinstall, which does not touch torch and cannot fix it.
         if isinstance(self._local_load_error, ImportError):
+            cause = self._local_load_error
             raise RuntimeError(
-                "The local nnInteractive backend could not be imported (the install may "
-                "be incomplete). Open the Configuration tab and click "
-                "'Reinstall / Update nnInteractive' (choose Full), then restart Slicer."
-            ) from self._local_load_error
+                "The local nnInteractive backend could not be imported. The underlying "
+                "error was:\n\n"
+                f"    {type(cause).__name__}: {cause}\n\n"
+                "If this mentions torch, torchvision or numpy, a Python package in "
+                "Slicer's environment (often one you installed manually) is broken or "
+                "mismatched -- fix or uninstall that package. Note that 'Reinstall / "
+                "Update nnInteractive' will NOT change torch, so it cannot fix this.\n\n"
+                "Otherwise the nnInteractive install may be incomplete: open the "
+                "Configuration tab, click 'Reinstall / Update nnInteractive' (choose "
+                "Full), then restart Slicer."
+            ) from cause
 
         if self._local_load_error is not None:
             err, self._local_load_error = self._local_load_error, None
@@ -4100,13 +4112,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             f"into it:\n    {sys_path}\nThis crashes local GPU inference "
             f"(CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH). Your system cuDNN is not broken "
             f"-- the two versions simply cannot be combined in one process.\n\n"
-            f"Fix (no change to your system CUDA/cuDNN needed) -- pick one:\n"
+            f"Fix -- pick one (options 1 and 2 leave your system CUDA/cuDNN untouched):\n"
             f"  1. Install a matching PyTorch in Slicer's Python Console, then restart "
             f"Slicer:\n"
             f'       slicer.util.pip_install("torch==2.8.0 torchvision==0.23.0 '
-            f'--index-url https://download.pytorch.org/whl/cu129")\n'
+            f'--index-url https://download.pytorch.org/whl/cu129 --force-reinstall")\n'
             f"  2. Switch to Remote mode (Configuration tab) to run inference on a "
-            f"server -- no local CUDA is loaded.\n\n"
+            f"server -- no local CUDA is loaded.\n"
+            f"  3. If nothing on your system actually needs that system-wide cuDNN, "
+            f"remove it (or drop its directory from LD_LIBRARY_PATH) so only Slicer's "
+            f"bundled cuDNN is found:\n"
+            f"       {sys_path}\n\n"
             f"See 'Common issues' in the README: {url}"
         )
 
