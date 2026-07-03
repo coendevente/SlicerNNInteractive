@@ -204,16 +204,22 @@ Most buttons in the `nnInteractive Prompts` tab have a keyboard shortcut, shown 
 | `T` | Toggle prompt type (positive / negative) |
 | `E` | Next segment |
 | `R` | Reset segment (empty the selected segment) |
+| `V` | Toggle visibility of the current segment |
 | `Del` | Delete the selected segment |
 | `Ctrl+Z` | Undo the last interaction |
 
-`Ctrl+Z` has no dedicated button, so it is the only shortcut not shown as a bracketed label.
+`V`, `Del` and `Ctrl+Z` have no dedicated button. `V` is advertised by a small hint line at the bottom of the `nnInteractive Prompts` tab; the other two are listed here only.
 
 ## Common issues
 
 - When the remote server restarts or a session times out, the extension surfaces a "session expired" message — click `Initialize` at the top of the `nnInteractive Prompts` tab to reconnect; your current segmentation is preserved and re-seeded automatically.
 
 - **No GPU detected / running on CPU (Local mode).** If, after `Initialize`, a red warning appears below the button saying nnInteractive is running on the CPU, PyTorch could not find a usable CUDA GPU. Local inference then falls back to the CPU, which is **very slow**. This usually means either no compatible GPU is present, or the installed PyTorch build does not match your GPU (a common case is the **CPU-only** PyTorch wheel getting installed). Install a matching CUDA build of PyTorch as described under [PyTorch (Full installs)](#first-run-choose-what-to-install), then restart Slicer and click `Initialize` again. To confirm what PyTorch sees, run this in Slicer's Python Console (`View ▸ Python Console`): `import torch; print(torch.cuda.is_available(), torch.version.cuda)`.
+
+- **`CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH` (or a `cublasLt` symbol error) on the first prompt.** This happens on machines that already have a **system-wide cuDNN/CUDA installed** (e.g. the `libcudnn9-*` apt package, or a CUDA toolkit under `/usr/local/cuda*`) of a **different version** than the one Slicer's bundled PyTorch ships. Slicer's cuDNN loads some engine sub-libraries by bare name at runtime; when its bundled wheel omits one (newer PyTorch builds do this), the loader picks up the mismatched system copy and mixes cuDNN versions in one process, which crashes inference. Your system cuDNN is not broken — the two versions simply cannot be combined. The extension now detects this at `Initialize` and shows the fix; you do **not** need to touch your system CUDA/cuDNN. Pick one:
+    - **Use a matching PyTorch inside Slicer** (recommended). In Slicer's Python Console (`View ▸ Python Console`) run `slicer.util.pip_install("torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu129")` (adjust the CUDA suffix to your driver if needed), then restart Slicer. This torch bundles a cuDNN that does not collide.
+    - **Run inference remotely.** Switch to `Remote` mode on the Configuration tab — no local CUDA is loaded at all.
+    - Only if you don't need the system cuDNN for other tools, remove/relocate it (e.g. `sudo apt remove libcudnn9-cuda-12`).
 
 ## Testing
 

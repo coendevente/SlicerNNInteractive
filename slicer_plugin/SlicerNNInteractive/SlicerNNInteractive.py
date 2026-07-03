@@ -857,6 +857,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             "r": self.clear_current_segment,
             "Delete": self.on_delete_segment,  # Delete the currently selected segment
             "t": self.toggle_prompt_type,  # Add 'T' shortcut to toggle between positive/negative
+            "v": self.toggle_segment_visibility,  # Show/hide the segment being worked on
             "Ctrl+Z": self.on_undo,  # Undo the last nnInteractive interaction
         }
         self.shortcut_items = {}
@@ -3532,6 +3533,32 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         debug_print(f"show_segmentation took {time.time() - t0}")
 
+    def toggle_segment_visibility(self):
+        """
+        'V' shortcut: toggle the visibility of the segment currently being worked on.
+
+        A pure display toggle -- it deliberately does NOT require an initialized
+        session and never creates a segment. We therefore read the segmentation node
+        straight from the editor widget rather than via get_segmentation_node(), which
+        would add an empty node when none exists.
+        """
+        segmentation_node = self.ui.editor_widget.segmentationNode()
+        selected_segment_id = self.get_current_segment_id()
+        if segmentation_node is None or not selected_segment_id:
+            debug_print("No segment selected to toggle visibility.")
+            return
+
+        display_node = segmentation_node.GetDisplayNode()
+        if display_node is None:
+            debug_print("Segmentation has no display node; cannot toggle visibility.")
+            return
+
+        new_visibility = not display_node.GetSegmentVisibility(selected_segment_id)
+        display_node.SetSegmentVisibility(selected_segment_id, new_visibility)
+        debug_print(
+            f"Toggled visibility of segment {selected_segment_id} to {new_visibility}"
+        )
+
     def get_segmentation_node(self):
         """
         Returns the currently referenced segmentation node (from the Segment Editor).
@@ -3871,6 +3898,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     notes["cpu"] = True
                     device = torch.device("cpu")
 
+                # Proactive guard: on Linux a system-wide cuDNN of a different version on
+                # the library path gets mixed into Slicer's bundled cuDNN (cuDNN dlopens
+                # engine sub-libraries by bare soname), which crashes the first
+                # convolution with CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH. Catch it here
+                # and fail with actionable guidance instead of a cryptic crash later.
+                if device.type == "cuda":
+                    conflict = self._detect_cudnn_library_conflict()
+                    if conflict is not None:
+                        raise RuntimeError(conflict)
+
                 # Honour the user's Auto-zoom choice regardless of device -- it is slower
                 # on CPU, but the setting is respected there too (per user request).
                 do_autozoom = want_autozoom
@@ -3937,6 +3974,141 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
         slicer.util.showStatusMessage(f"nnInteractive model: {model_desc}", 5000)
         return notes["session"]
+
+    @staticmethod
+    def _format_cudnn_version(v):
+        """91002 -> '9.10.2' (cuDNN packs version as major*10000 + minor*100 + patch)."""
+        return f"{v // 10000}.{(v // 100) % 100}.{v % 100}"
+
+    @staticmethod
+    def _find_cudnn_conflict(bundled_ver_int, cudnn_dir, search_dirs):
+        """Pure core of the cuDNN-shadowing check (no torch/Slicer imports, so it is
+        unit-testable). Returns (system_version_int, system_lib_path) when Slicer's
+        bundled cuDNN reaches for an engine sub-library it does NOT ship AND a copy of
+        that sub-library of a DIFFERENT version sits on the loader search path -- the
+        exact condition that yields CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH. Else None.
+
+        ``cudnn_dir`` is the bundled cuDNN lib dir; ``search_dirs`` are the directories
+        the dynamic loader would consult for a bare-soname dlopen (LD_LIBRARY_PATH plus
+        the standard default dirs), excluding the bundle itself.
+        """
+        import os, re, glob
+
+        try:
+            bundled_files = os.listdir(cudnn_dir)
+        except OSError:
+            return None
+
+        # Which engine sub-libraries does the bundled cuDNN dlopen (by bare soname) but
+        # NOT ship? Scan the dispatcher / graph libs for referenced engine sonames.
+        referenced = set()
+        for name in ("libcudnn_graph.so.9", "libcudnn.so.9"):
+            path = os.path.join(cudnn_dir, name)
+            try:
+                with open(path, "rb") as fh:
+                    blob = fh.read()
+            except OSError:
+                continue
+            for match in re.finditer(rb"libcudnn_engines_[a-z_]+\.so", blob):
+                referenced.add(match.group().decode())
+
+        missing = [
+            base
+            for base in {s[: s.index(".so")] for s in referenced}
+            if not any(f.startswith(base + ".so") for f in bundled_files)
+        ]
+        if not missing:
+            return None
+
+        def _parse_ver(path):
+            # .../libcudnn_engines_tensor_ir.so.9.23.2 -> 92302
+            m = re.search(r"\.so\.(\d+)\.(\d+)\.(\d+)", os.path.realpath(path))
+            if not m:
+                return None
+            a, b, c = (int(x) for x in m.groups())
+            return a * 10000 + b * 100 + c
+
+        for base in missing:
+            for d in search_dirs:
+                for cand in sorted(glob.glob(os.path.join(d, base + ".so.9*"))):
+                    sys_ver = _parse_ver(cand)
+                    if sys_ver is not None and sys_ver != bundled_ver_int:
+                        return sys_ver, cand
+        return None
+
+    @classmethod
+    def _detect_cudnn_library_conflict(cls):
+        """Fast, best-effort guard for the cuDNN library conflict that crashes GPU
+        inference on machines with a system-wide cuDNN of a different version than the
+        one Slicer's bundled PyTorch ships.
+
+        The bundled cuDNN dlopens some engine sub-libraries by bare soname at runtime;
+        when the wheel omits such a sub-library (e.g. libcudnn_engines_tensor_ir.so),
+        the loader falls through to the default search path and can pick up a DIFFERENT
+        version from a system cuDNN, mixing e.g. a 9.23 engine into a 9.20 core. That
+        fails the first convolution with CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH.
+
+        Returns an actionable message string when this exact situation is detected, else
+        None. Linux-only (the failure is specific to the ELF loader search). Cheap: a
+        couple of directory listings and one scan of the bundled dispatcher lib.
+        """
+        import sys, os
+
+        if not sys.platform.startswith("linux"):
+            return None
+        try:
+            import torch
+
+            bundled_ver_int = torch.backends.cudnn.version()
+            site_packages = os.path.dirname(os.path.dirname(torch.__file__))
+        except Exception:  # noqa: BLE001 - a detection failure must never block init
+            return None
+        if not bundled_ver_int:
+            return None
+
+        cudnn_dir = os.path.join(site_packages, "nvidia", "cudnn", "lib")
+        search_dirs = [
+            d
+            for d in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+            if d and os.path.abspath(d) != os.path.abspath(cudnn_dir)
+        ] + [
+            "/usr/lib/x86_64-linux-gnu",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/lib64",
+            "/usr/lib",
+            "/lib",
+        ]
+
+        try:
+            hit = cls._find_cudnn_conflict(bundled_ver_int, cudnn_dir, search_dirs)
+        except Exception:  # noqa: BLE001 - never let the guard itself break init
+            return None
+        if hit is None:
+            return None
+
+        sys_ver_int, sys_path = hit
+        bundled = cls._format_cudnn_version(bundled_ver_int)
+        system = cls._format_cudnn_version(sys_ver_int)
+        url = (
+            "https://git.dkfz.de/mic/personal/group2/isensee/slicernninteractive"
+            "#common-issues"
+        )
+        return (
+            f"GPU library conflict. Slicer's bundled PyTorch uses cuDNN {bundled}, but a "
+            f"different system-wide cuDNN {system} is on your library path and gets mixed "
+            f"into it:\n    {sys_path}\nThis crashes local GPU inference "
+            f"(CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH). Your system cuDNN is not broken "
+            f"-- the two versions simply cannot be combined in one process.\n\n"
+            f"Fix (no change to your system CUDA/cuDNN needed) -- pick one:\n"
+            f"  1. Install a matching PyTorch in Slicer's Python Console, then restart "
+            f"Slicer:\n"
+            f'       slicer.util.pip_install("torch==2.8.0 torchvision==0.23.0 '
+            f'--index-url https://download.pytorch.org/whl/cu129")\n'
+            f"  2. Switch to Remote mode (Configuration tab) to run inference on a "
+            f"server -- no local CUDA is loaded.\n\n"
+            f"See 'Common issues' in the README: {url}"
+        )
 
     @staticmethod
     def _torch_compile_unsupported_reason():

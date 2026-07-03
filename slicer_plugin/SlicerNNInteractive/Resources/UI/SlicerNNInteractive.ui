@@ -272,6 +272,22 @@
            </layout>
           </widget>
          </item>
+         <item>
+          <widget class="QLabel" name="hotkeyLegendLabel">
+           <property name="toolTip">
+            <string>Press V to show/hide the segment you are currently working on.</string>
+           </property>
+           <property name="text">
+            <string>V — toggle current segment visibility</string>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">color: gray;</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
         </layout>
        </widget>
        <widget class="QWidget" name="tabConfig">
