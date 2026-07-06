@@ -164,8 +164,8 @@ a Creative Commons Attribution 4.0 International License (CC BY
   et al., 2023</xref>), SegVol
   (<xref alt="Du et al., 2024" rid="ref-du2024segvol" ref-type="bibr">Du
   et al., 2024</xref>), and SAM-Med-3D
-  (<xref alt="Wang et al., 2023" rid="ref-wang2023sam" ref-type="bibr">Wang
-  et al., 2023</xref>). Alongside the
+  (<xref alt="Wang et al., 2025" rid="ref-wang2023sam" ref-type="bibr">Wang
+  et al., 2025</xref>). Alongside the
   <monospace>nnInteractive</monospace> model, plugins in the medical
   image viewers MITK
   (<xref alt="MITK Team, 2024" rid="ref-MITK_Team_MITK_2024" ref-type="bibr">MITK Team,
@@ -516,12 +516,18 @@ a Creative Commons Attribution 4.0 International License (CC BY
         <name><surname>Su</surname><given-names>Yanzhou</given-names></name>
         <name><surname>Huang</surname><given-names>Ziyan</given-names></name>
         <name><surname>Shen</surname><given-names>Yiqing</given-names></name>
-        <name><surname>others</surname></name>
+        <name><surname>Fu</surname><given-names>Bin</given-names></name>
+        <name><surname>Zhang</surname><given-names>Shaoting</given-names></name>
+        <name><surname>He</surname><given-names>Junjun</given-names></name>
       </person-group>
-      <article-title>SAM-Med3D: Towards general-purpose segmentation models for volumetric medical images</article-title>
-      <source>arXiv preprint arXiv:2310.15161</source>
-      <year iso-8601-date="2023">2023</year>
-      <pub-id pub-id-type="doi">10.48550/arXiv.2310.15161</pub-id>
+      <article-title>SAM-Med3D: A vision foundation model for general-purpose segmentation on volumetric medical images</article-title>
+      <source>IEEE Transactions on Neural Networks and Learning Systems</source>
+      <year iso-8601-date="2025">2025</year>
+      <volume>36</volume>
+      <issue>10</issue>
+      <pub-id pub-id-type="doi">10.1109/TNNLS.2025.3586694</pub-id>
+      <fpage>17599</fpage>
+      <lpage>17612</lpage>
     </element-citation>
   </ref>
   <ref id="ref-Sofroniew2025-ty">

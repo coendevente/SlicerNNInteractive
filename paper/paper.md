@@ -22,7 +22,6 @@ authors:
     affiliation: 3
     orcid: 0000-0003-2028-8972
   - name: Clara I. Sánchez
-    affiliation: 3
     affiliation: "1, 2"
     orcid: 0000-0001-9787-8319
 affiliations:
