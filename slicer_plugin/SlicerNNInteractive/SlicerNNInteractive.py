@@ -1769,9 +1769,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 p.drawEllipse(20, 3, 10, 8)
                 p.drawLine(25, 11, 28, 14)  # little tail
             elif tool == "scribble":
-                pts = [(20, 10), (23, 4), (26, 11), (29, 5)]  # squiggle
-                for a, b in zip(pts, pts[1:]):
-                    p.drawLine(a[0], a[1], b[0], b[1])
+                # A smooth squiggle drawn as a cubic Bezier chain (never a filled shape).
+                path = qt.QPainterPath()
+                path.moveTo(19.5, 9.0)
+                path.cubicTo(21.0, 3.0, 23.0, 3.0, 24.5, 8.0)
+                path.cubicTo(26.0, 13.0, 28.0, 13.0, 29.5, 6.5)
+                p.setBrush(qt.QBrush())
+                p.drawPath(path)
 
         # Halo pass (wide, dark) then colour pass (narrow) so the glyph stays legible
         # over any image intensity.
