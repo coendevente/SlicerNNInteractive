@@ -2,7 +2,6 @@ import io
 import gzip
 import requests
 import copy
-import threading
 import time
 
 import importlib.util
@@ -266,14 +265,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             "matplotlib": "matplotlib",
         }
 
-        for dependency in dependencies:
-            if self.check_dependency_installed(dependency, dependencies[dependency]):
-                continue
-            self.run_with_progress_bar(
-                self.pip_install_wrapper,
-                (dependencies[dependency],),
-                "Installing dependencies: %s" % dependency,
-            )
+        missing_dependencies = [
+            requirement
+            for import_name, requirement in dependencies.items()
+            if not self.check_dependency_installed(import_name, requirement)
+        ]
+        if missing_dependencies:
+            slicer.util.pip_install(missing_dependencies)
 
     def check_dependency_installed(self, import_name, module_name_and_version):
         """
@@ -301,38 +299,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 debug_print(f"Could not determine version for {module_name}.")
 
         return True
-
-    def pip_install_wrapper(self, command, event):
-        """
-        Installs pip packages.
-        """
-        slicer.util.pip_install(command)
-        event.set()
-
-    def run_with_progress_bar(self, target, args, title):
-        """
-        Runs a function in a background thread, while showing a progress bar in the UI
-        as a pop up window.
-        """
-        self.progressbar = slicer.util.createProgressDialog(autoClose=False)
-        self.progressbar.minimum = 0
-        self.progressbar.maximum = 100
-        self.progressbar.setLabelText(title)
-
-        parallel_event = threading.Event()
-        dep_thread = threading.Thread(
-            target=target,
-            args=(
-                *args,
-                parallel_event,
-            ),
-        )
-        dep_thread.start()
-        while not parallel_event.is_set():
-            slicer.app.processEvents()
-        dep_thread.join()
-
-        self.progressbar.close()
 
     def cleanup(self):
         """
