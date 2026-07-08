@@ -12,8 +12,6 @@ import qt
 import vtk
 from qt import QApplication, QPalette
 
-from vtkmodules.util.numpy_support import vtk_to_numpy
-
 from slicer.i18n import tr as _
 from slicer.i18n import translate
 from slicer.ScriptedLoadableModule import *
@@ -43,6 +41,23 @@ NNINTERACTIVE_CLIENT_PKG = f"nninteractive-client<{NNINTERACTIVE_VERSION_CEILING
 # an older GPU driver, or a pinned torch version), run pip from Slicer's Python Console
 # (see the README).
 DEFAULT_WINDOWS_TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu126"
+
+# The README's "Common issues" section, linked from error messages and warnings.
+README_COMMON_ISSUES_URL = (
+    "https://git.dkfz.de/mic/personal/group2/isensee/slicernninteractive#common-issues"
+)
+
+# The single authoritative default for every QSettings-backed setting. The config UI
+# and the session constructors both read through get_setting_bool/get_setting_str, so
+# a checkbox can never initialize differently from what the session actually uses.
+SETTING_DEFAULTS = {
+    "autozoom": True,
+    "use_torch_compile": False,
+    "interactions_storage": "auto",
+    "device": "cuda:0",
+    "checkpoint_path": "",
+    "model_id": "",
+}
 
 
 def debug_print(*args):
@@ -151,9 +166,7 @@ class _LassoFreehandFilter(qt.QObject):
 
     def eventFilter(self, obj, event):
         mw = self._module_widget
-        if getattr(mw, "_cleanup_in_progress", False) or getattr(
-            mw, "_application_quitting", False
-        ):
+        if mw._is_tearing_down():
             return False
         if event.type() in self._cursor_event_types:
             mw._reassert_cursor_on_view(self._slice_widget)
@@ -235,7 +248,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # lazily and cached. Recoloured whenever the active tool or prompt polarity
         # changes; see _update_prompt_cursor().
         self._prompt_cursor_cache = {}
-        self._active_cursor_tool = None
         self._cursor_reassert_timer_queued = False
         self._pending_cursor_reassert_widgets = []
         self._cleanup_in_progress = False
@@ -291,9 +303,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "node": None,
                 "name": "PointPrompt",
                 "display_node_markup_function": self.display_node_markup_point,
-                "on_placed_function": self.on_point_placed,
                 "button": self.ui.pbInteractionPoint,
-                "button_text": self.ui.pbInteractionPoint.text,
                 "button_icon_filename": "point_icon.svg",
             },
             "bbox": {
@@ -301,9 +311,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "node": None,
                 "name": "BBoxPrompt",
                 "display_node_markup_function": self.display_node_markup_bbox,
-                "on_placed_function": self.on_bbox_placed,
                 "button": self.ui.pbInteractionBBox,
-                "button_text": self.ui.pbInteractionBBox.text,
                 "button_icon_filename": "bbox_icon.svg",
             },
             "lasso": {
@@ -311,11 +319,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "node": None,
                 "name": "LassoPrompt",
                 "display_node_markup_function": self.display_node_markup_lasso,
-                # The lasso is captured as a freehand drag (not markups Place mode),
-                # so it has no PointPositionDefinedEvent handler.
-                "on_placed_function": None,
                 "button": self.ui.pbInteractionLasso,
-                "button_text": self.ui.pbInteractionLasso.text,
                 "button_icon_filename": "lasso_icon.svg",
             },
         }
@@ -332,8 +336,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self.init_ui_functionality()
 
-        _ = self.get_current_segment_id()
-        self.previous_states = {}
         self._active_source_volume_id = self._volume_node_id(self.get_volume_node())
 
     def init_ui_functionality(self):
@@ -350,7 +352,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.setup_prompts_tab_extras()
 
         # Set initial prompt type
-        self.current_prompt_type_positive = True
         self.ui.pbPromptTypePositive.setStyleSheet(self.selected_style)
         self.ui.pbPromptTypeNegative.setStyleSheet(self.unselected_style)
 
@@ -366,7 +367,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.on_prompt_type_negative_clicked
         )
 
-        self.ui.pbInteractionLassoCancel.setVisible(False)  # obsolete with freehand lasso
         self.ui.pbInteractionScribble.clicked.connect(self.on_scribble_clicked)
 
         self.addObserver(slicer.app.applicationLogic().GetInteractionNode(),
@@ -401,10 +401,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         import ctk
 
         layout = self.ui.tabConfig.layout()
-
-        # The old .ui server widgets are replaced by the model-selection group below.
-        self.ui.serverGroup.setVisible(False)
-        self.ui.pbTestServer.setVisible(False)
 
         # ===== Installation group (pinned to the bottom of the Configuration tab;
         # placed into the layout after the Model Selection group below) =====
@@ -487,7 +483,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         ckpt_row = qt.QHBoxLayout()
         self.ui.checkpointEdit = qt.QLineEdit()
-        self.ui.checkpointEdit.setText(self.get_setting_str("checkpoint_path", ""))
+        self.ui.checkpointEdit.setText(self.get_setting_str("checkpoint_path"))
         self.ui.checkpointEdit.setPlaceholderText("Use local checkpoint... (blank = official weights)")
         self.ui.checkpointEdit.editingFinished.connect(
             lambda: self._save_setting("checkpoint_path", self.ui.checkpointEdit.text, reinit=True)
@@ -520,7 +516,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         advanced_form.addRow("Device:", self.ui.deviceCombo)
 
         self.ui.compileCheck = qt.QCheckBox()
-        self.ui.compileCheck.setChecked(self.get_setting_bool("use_torch_compile", False))
+        self.ui.compileCheck.setChecked(self.get_setting_bool("use_torch_compile"))
         self.ui.compileCheck.toggled.connect(
             lambda v: self._save_setting_bool("use_torch_compile", v, reinit=True)
         )
@@ -536,7 +532,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self.ui.storageCombo = qt.QComboBox()
         self.ui.storageCombo.addItems(["auto", "blosc2", "tensor"])
-        self.ui.storageCombo.setCurrentText(self.get_setting_str("interactions_storage", "auto"))
+        self.ui.storageCombo.setCurrentText(self.get_setting_str("interactions_storage"))
         self.ui.storageCombo.currentTextChanged.connect(
             lambda v: self._save_setting("interactions_storage", v, reinit=True)
         )
@@ -563,13 +559,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.apiKeyEdit.editingFinished.connect(self._on_api_key_changed)
         remote_layout.addWidget(self.ui.apiKeyEdit)
 
-        # --- Auto-zoom (common to both modes) ---
-        # Both backends honour auto-zoom: the local session takes it at construction and
-        # the remote client forwards it to the server (set_do_autozoom). Toggling it
-        # applies to the live session immediately -- no re-initialization needed.
+        # --- Auto-zoom (common to both modes; see _apply_autozoom_to_session) ---
         autozoom_row = qt.QHBoxLayout()
         self.ui.autozoomCheck = qt.QCheckBox("Auto-zoom")
-        self.ui.autozoomCheck.setChecked(self.get_setting_bool("autozoom", True))
+        self.ui.autozoomCheck.setChecked(self.get_setting_bool("autozoom"))
         self.ui.autozoomCheck.setToolTip(
             "Let nnInteractive zoom out to capture context around larger objects.\n"
             "Applies to both Local and Remote sessions and takes effect immediately."
@@ -820,25 +813,21 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         return f"Model license: {license_str}"
 
     def on_autozoom_toggled(self, checked):
-        # Both the local and remote sessions expose set_do_autozoom(), so persist the
-        # choice and push it to the live session immediately (no re-initialize/teardown).
         self._save_setting_bool("autozoom", checked, reinit=False)
-        self._apply_autozoom_to_session()
+        self._apply_autozoom_to_session(checked)
 
-    def _apply_autozoom_to_session(self):
-        """Push the current auto-zoom setting to the live session. Both the local and the
+    def _apply_autozoom_to_session(self, enabled=None):
+        """Push the auto-zoom setting to the live session. Both the local and the
         remote session expose set_do_autozoom() (the remote client forwards it to the
         server), so this works in either mode -- and the setting is honoured regardless of
         the compute device (auto-zoom on CPU is slower but still respected). No-op when
         nothing is initialized."""
-        session = self.session
-        if session is None:
+        if self.session is None:
             return
-        setter = getattr(session, "set_do_autozoom", None)
-        if not callable(setter):
-            return
+        if enabled is None:
+            enabled = self.get_setting_bool("autozoom")
         try:
-            setter(self.get_setting_bool("autozoom", True))
+            self.session.set_do_autozoom(enabled)
         except self.SESSION_LOST_ERRORS as exc:
             self.handle_session_expired(exc)
         except Exception as exc:  # noqa: BLE001 - a failed toggle must not break the UI
@@ -1146,12 +1135,21 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._update_initialize_button_state()
 
     def on_scene_nodes_changed(self, caller, event, calldata=None):
-        """Volumes added/removed: re-evaluate whether Initialize can be used."""
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        """Volumes added/removed: re-evaluate whether Initialize can be used. Coalesced
+        via a queued single-shot: a scene load fires one event per node, and re-scanning
+        the scene for volumes on every one of them made big loads O(n^2)."""
+        if self._is_tearing_down():
             return
-        self._update_initialize_button_state()
+        if getattr(self, "_scene_change_update_queued", False):
+            return
+        self._scene_change_update_queued = True
+
+        def _update_once():
+            self._scene_change_update_queued = False
+            if not self._is_tearing_down():
+                self._update_initialize_button_state()
+
+        qt.QTimer.singleShot(0, _update_once)
 
     def _handle_selected_segment_change(self):
         """When the user picks a different segment to refine, the session re-seeds it
@@ -1161,9 +1159,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Never touch nodes while the module/scene is being torn down: the Segment Editor
         # node fires Modified events during shutdown, and doing heavy work (reset_all_prompts,
         # node access) on a dying scene crashes the app on exit.
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return
         if getattr(self, "_suppress_segment_switch", False):
             return
@@ -1181,13 +1177,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
         active_tool = self._active_prompt_tool()
         self.reset_all_prompts()  # clears markups + overlays + interactions, like Next/Reset
-        if active_tool is not None:
-            qt.QTimer.singleShot(0, lambda tool=active_tool: self._activate_prompt_tool(tool))
+        self._rearm_tool_later(active_tool)
 
     def _handle_active_source_volume_change(self, volume_node=None, reupload=False):
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return False
         if getattr(self, "_handling_source_volume_change", False):
             return False
@@ -1231,10 +1224,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 self, "all_prompt_buttons", None
             ):
                 self.setup_prompts()
-                if active_tool is not None:
-                    qt.QTimer.singleShot(
-                        0, lambda tool=active_tool: self._activate_prompt_tool(tool)
-                    )
+                self._rearm_tool_later(active_tool)
 
             # Push the newly selected image to the live session. Deferred to the event
             # loop so we don't run a blocking upload inside this VTK modified-event
@@ -1254,9 +1244,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Initialize progress dialog so a slow (especially remote) upload is visible."""
         if self.session is None:
             return
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return
         try:
             self._preload_image_and_segment()
@@ -1336,14 +1324,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 }}
             """
             )
-
-            self.prev_caller = None
-
-            if prompt_type["on_placed_function"] is not None:
-                node.AddObserver(
-                    slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
-                    prompt_type["on_placed_function"],
-                )
 
             prompt_type["node"] = node
             # Connect each button's `clicked` only once for the widget's lifetime (see
@@ -1511,11 +1491,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # this when it recreates the node.
             prompt_type["node"] = None
 
-        try:
-            self.ui.pbInteractionLassoCancel.setVisible(False)
-        except Exception:  # noqa: BLE001 - UI may be gone during teardown
-            pass
-
         self._remove_scribble_prompt_node()
 
     def on_interaction_node_modified(self, caller, event):
@@ -1526,28 +1501,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         freehand lasso and scribble.
         """
         # Don't touch (possibly half-released) prompt nodes/widgets during teardown.
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return
         interactionNode = slicer.app.applicationLogic().GetInteractionNode()
-        selectionNode = slicer.app.applicationLogic().GetSelectionNode()
         in_place = (
             interactionNode.GetCurrentInteractionMode()
             == slicer.vtkMRMLInteractionNode.Place
         )
-        for prompt_type in self.prompt_types.values():
-            # Lasso, Point and BBox run in ViewTransform mode with their own click
-            # capture, so their button state is NOT driven by markups Place mode here.
-            if prompt_type["name"] in ("LassoPrompt", "PointPrompt", "BBoxPrompt"):
-                continue
-            if not in_place:
-                prompt_type["button"].setChecked(False)
-            else:
-                placingThisNode = (selectionNode.GetActivePlaceNodeID() == prompt_type["node"].GetID())
-                prompt_type["button"].setChecked(placingThisNode)
-
-        # Placing a markup (point/bbox) cancels scribble paint and freehand lasso.
+        # All prompt tools run in ViewTransform mode with their own click capture, so
+        # button state is not driven by markups Place mode here. Place mode can still be
+        # entered from elsewhere in Slicer (e.g. the Markups module) -- cancel our tools.
         if in_place:
             self.ui.pbInteractionScribble.setChecked(False)
             self.set_lasso_active(False)
@@ -1617,37 +1580,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         return _undo
 
-    def _make_overlay_restore(self, label, prev_arr):
-        """Undo closure that restores a scribble/lasso overlay label to its prior state.
-
-        Both scribble paint and finished lassos are stamped into the shared green/red
-        overlay (``scribble_segment_node``, labels ``fg``/``bg``). Restoring the label's
-        labelmap to the snapshot taken before the stroke removes exactly that stroke and
-        rewinds the scribble-diff baseline so later strokes still diff correctly.
-        """
-        prev_copy = None if prev_arr is None else prev_arr.copy()
-
-        def _undo():
-            node = getattr(self, "scribble_segment_node", None)
-            volume = self.get_volume_node()
-            if node is None or volume is None:
-                return
-            restore = prev_copy
-            if restore is None:
-                image = self.get_image_data()
-                if image is None:
-                    return
-                restore = np.zeros(image.shape, dtype=np.uint8)
-            try:
-                slicer.util.updateSegmentBinaryLabelmapFromArray(restore, node, label, volume)
-            except Exception as exc:  # noqa: BLE001
-                debug_print(f"overlay undo could not update labelmap: {exc}")
-                return
-            if isinstance(getattr(self, "_prev_scribble_masks", None), dict):
-                self._prev_scribble_masks[label] = restore.copy()
-
-        return _undo
-
     def on_place_button_clicked(self, checked, prompt_name):
         self.setup_prompts(skip_if_exists=True)
 
@@ -1683,18 +1615,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 self._cancel_bbox_drag()
                 self._update_prompt_cursor()
             return
-
-        # (no other prompt types reach here; scribble has its own handler)
-        if checked:
-            interactionNode.SetCurrentInteractionMode(interactionNode.Place)
-            self._apply_prompt_cursor(prompt_name)
-        else:
-            interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
-            self._update_prompt_cursor()
+        # (no other prompt types exist; scribble has its own handler)
 
     # Prompt colours: positive = green, negative = red.
     COLOR_POSITIVE = (0.20, 0.85, 0.20)
     COLOR_NEGATIVE = (0.90, 0.15, 0.15)
+
+    def _polarity_color(self, positive):
+        """The single positive->green / negative->red mapping used by every prompt visual."""
+        return self.COLOR_POSITIVE if positive else self.COLOR_NEGATIVE
 
     def _set_node_color(self, node, positive):
         """Colour a whole markup node (bbox / lasso) green (pos) or red (neg)."""
@@ -1703,7 +1632,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         display_node = node.GetDisplayNode()
         if display_node is None:
             return
-        color = self.COLOR_POSITIVE if positive else self.COLOR_NEGATIVE
+        color = self._polarity_color(positive)
         display_node.SetColor(*color)
         display_node.SetSelectedColor(*color)
         display_node.SetActiveColor(*color)
@@ -1738,7 +1667,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         pm.fill(qt.QColor(0, 0, 0, 0))  # transparent
         p = qt.QPainter(pm)
         p.setRenderHint(qt.QPainter.Antialiasing, True)
-        color = self._qcolor(self.COLOR_POSITIVE if positive else self.COLOR_NEGATIVE)
+        color = self._qcolor(self._polarity_color(positive))
         halo = qt.QColor(0, 0, 0, 190)
         cx, cy = 16, 16
 
@@ -1769,12 +1698,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 p.drawEllipse(20, 3, 10, 8)
                 p.drawLine(25, 11, 28, 14)  # little tail
             elif tool == "scribble":
-                # A smooth squiggle drawn as a cubic Bezier chain (never a filled shape).
+                # A smooth squiggle drawn as a cubic Bezier chain.
                 path = qt.QPainterPath()
                 path.moveTo(19.5, 9.0)
                 path.cubicTo(21.0, 3.0, 23.0, 3.0, 24.5, 8.0)
                 path.cubicTo(26.0, 13.0, 28.0, 13.0, 29.5, 6.5)
-                p.setBrush(qt.QBrush())
                 p.drawPath(path)
 
         # Halo pass (wide, dark) then colour pass (narrow) so the glyph stays legible
@@ -1786,9 +1714,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         p.end()
         return qt.QCursor(pm, cx, cy)
 
+    def _is_tearing_down(self):
+        """True while the widget is being cleaned up or the application is quitting.
+        Qt/VTK callbacks must bail out instead of touching half-torn-down state.
+        getattr defaults: callbacks can fire before __init__ sets the flags."""
+        return getattr(self, "_cleanup_in_progress", False) or getattr(
+            self, "_application_quitting", False
+        )
+
     def _slice_widgets(self):
         """Slice widgets whose slice views receive prompt interactions."""
-        if getattr(self, "_application_quitting", False):
+        if self._is_tearing_down():
             return []
         widgets = []
         lm = slicer.app.layoutManager()
@@ -1869,7 +1805,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         cursor = self._get_prompt_cursor(tool, self.is_positive)
         for sw in self._slice_widgets():
             self._set_cursor_on_slice_widget(sw, cursor)
-        self._active_cursor_tool = tool
 
     def _clear_prompt_cursor(self):
         for sw in self._slice_widgets():
@@ -1881,12 +1816,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                         w.setCursor(qt.QCursor(qt.Qt.ArrowCursor))
                     except Exception:  # noqa: BLE001
                         pass
-        self._active_cursor_tool = None
 
     def _reassert_cursor_on_view(self, slice_widget):
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return
         if not getattr(self, "all_prompt_buttons", None):
             return
@@ -1895,12 +1827,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
         cursor = self._get_prompt_cursor(tool, self.is_positive)
         self._set_cursor_on_slice_widget(slice_widget, cursor)
-        self._active_cursor_tool = tool
 
     def _queue_cursor_reassert(self, slice_widget):
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return
         pending = getattr(self, "_pending_cursor_reassert_widgets", None)
         if pending is None:
@@ -1915,9 +1844,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _flush_cursor_reasserts(self):
         self._cursor_reassert_timer_queued = False
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             self._pending_cursor_reassert_widgets = []
             return
         pending = list(getattr(self, "_pending_cursor_reassert_widgets", []))
@@ -1929,9 +1856,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Single entry point: colour the slice-view cursor for whichever prompt tool
         is active (green/red by polarity), or restore the default cursor when none is.
         Safe to call after any tool- or polarity-state change."""
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return
         if not getattr(self, "all_prompt_buttons", None):
             return
@@ -1969,7 +1894,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Handles the appearance of the point display node. Points use the per-control-
         point "selected" flag to pick a colour: selected -> green (positive),
-        unselected -> red (negative). See on_point_placed().
+        unselected -> red (negative). See _place_point_from_event().
         """
         display_node.SetTextScale(0)  # Hide text labels
         display_node.SetGlyphScale(0.75)  # Make the points larger
@@ -2014,31 +1939,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     #
     #  -- Point
     #
-    def on_point_placed(self, caller, event):
-        """
-        Called when a point is placed in the scene. Grabs the point position
-        and sends it to the server.
-        """
-        # Point placement now runs through click capture (_place_point_from_event) in
-        # ViewTransform mode; ignore any stray markups place callback while it is active.
-        if getattr(self, "_place_tool", None) == "point":
-            return
-        xyz = self.xyz_from_caller(caller)
-
-        # Colour this point by polarity: positive -> "selected" (green), negative ->
-        # "unselected" (red). This is per-control-point, so a node can hold both.
-        n = caller.GetNumberOfControlPoints()
-        if n > 0:
-            caller.SetNthControlPointSelected(n - 1, self.is_positive)
-
-        volume_node = self.get_volume_node()
-        if volume_node:
-            self.point_prompt(xyz=xyz, positive_click=self.is_positive)
-            # Record how to undo this point's marker (the control point just placed).
-            self._push_prompt_undo(
-                self._make_control_point_undo(caller.GetID(), caller.GetNumberOfControlPoints() - 1)
-            )
-
     @ensure_synched
     def point_prompt(self, xyz=None, positive_click=False):
         """
@@ -2051,7 +1951,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         changed_bbox = self.session.add_point_interaction(
             xyz[::-1],
             include_interaction=bool(positive_click),
-            run_prediction=self.auto_run,
+            run_prediction=True,
         )
         t1 = time.time()
         self.apply_result(changed_bbox)
@@ -2120,7 +2020,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         xy = self._event_xy_in_slice_view(slice_view, event, event_widget)
         disp = self._event_display_xy(slice_view, xy)
         ras = slice_node.GetXYToRAS().MultiplyPoint([disp[0], disp[1], 0.0, 1.0])
-        color = self.COLOR_POSITIVE if self.is_positive else self.COLOR_NEGATIVE
+        color = self._polarity_color(self.is_positive)
         self._bbox_preview_create(slice_view, color)
         self._bbox_drag = {
             "slice_widget": slice_widget,
@@ -2197,16 +2097,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._bbox_drag = None
         self._bbox_preview_remove()
 
-    def _bbox_preview_create(self, slice_view, color):
-        """Live rectangle outline drawn with a VTK 2D actor in display coords (same
-        proven technique as the lasso outline)."""
-        self._bbox_preview_remove()
+    def _create_display_outline_actor(self, slice_view, color):
+        """Build a live outline overlay (VTK 2D actor in display coordinates) on a
+        slice view -- the shared technique behind the bbox preview and the lasso
+        stroke. Returns a state dict (points/pd/actor/renderer/view) or None when the
+        view has no renderer."""
         renderer = self._lasso_renderer_for(slice_view)
         if renderer is None:
-            return False
+            return None
         points = vtk.vtkPoints()
         pd = vtk.vtkPolyData()
         pd.SetPoints(points)
+        pd.SetLines(vtk.vtkCellArray())
         coordinate = vtk.vtkCoordinate()
         coordinate.SetCoordinateSystemToDisplay()
         mapper = vtk.vtkPolyDataMapper2D()
@@ -2217,14 +2119,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         actor.GetProperty().SetColor(*color)
         actor.GetProperty().SetLineWidth(2.5)
         renderer.AddActor2D(actor)
-        self._bbox_preview = {
+        return {
             "points": points,
             "pd": pd,
             "actor": actor,
             "renderer": renderer,
             "view": slice_view,
         }
-        return True
+
+    def _bbox_preview_create(self, slice_view, color):
+        """Live rectangle outline that follows the drag (see _create_display_outline_actor)."""
+        self._bbox_preview_remove()
+        self._bbox_preview = self._create_display_outline_actor(slice_view, color)
+        return self._bbox_preview is not None
 
     def _bbox_preview_update(self, disp0, disp1):
         prev = getattr(self, "_bbox_preview", None)
@@ -2258,58 +2165,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     #
     #  -- Bounding Box
     #
-    def on_bbox_placed(self, caller, event):
-        """
-        Every time a control point is placed/moved for the bounding box ROI node.
-        Once two corners are placed, we send the bounding box to the server.
-        """
-        # BBox placement now runs through drag capture (_handle_bbox_drag_event) in
-        # ViewTransform mode; ignore any stray markups place callback while it is active.
-        if getattr(self, "_place_tool", None) == "bbox":
-            return
-        self._set_node_color(caller, self.is_positive)
-        xyz = self.xyz_from_caller(caller)
-
-        if self.prev_caller is not None and caller.GetID() == self.prev_caller.GetID():
-            roi_node = slicer.mrmlScene.GetNodeByID(caller.GetID())
-            current_size = list(roi_node.GetSize())
-            drawn_in_axis = np.argwhere(np.array(xyz) == self.prev_bbox_xyz).squeeze()
-            current_size[drawn_in_axis] = 0
-            roi_node.SetSize(current_size)
-
-            volume_node = self.get_volume_node()
-            if volume_node:
-                outer_point_two = self.prev_bbox_xyz
-
-                outer_point_one = [
-                    xyz[0] * 2 - outer_point_two[0],
-                    xyz[1] * 2 - outer_point_two[1],
-                    xyz[2] * 2 - outer_point_two[2],
-                ]
-
-                self.bbox_prompt(
-                    outer_point_one=outer_point_one,
-                    outer_point_two=outer_point_two,
-                    positive_click=self.is_positive,
-                )
-
-                def _next():
-                    if getattr(self, "_cleanup_in_progress", False) or getattr(
-                        self, "_application_quitting", False
-                    ):
-                        return
-                    self.setup_prompts()
-                    # Start placing a new box
-                    self.ui.pbInteractionBBox.click()
-
-                qt.QTimer.singleShot(0, _next)
-
-            self.prev_caller = None
-        else:
-            self.prev_bbox_xyz = xyz
-
-        self.prev_caller = caller
-
     @ensure_synched
     def bbox_prompt(self, outer_point_one, outer_point_two, positive_click=False):
         """
@@ -2324,7 +2179,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         changed_bbox = self.session.add_bbox_interaction(
             bbox,
             include_interaction=bool(positive_click),
-            run_prediction=self.auto_run,
+            run_prediction=True,
         )
         # The box markup is cleared right after it is sent (a fresh box placement is
         # started), so there is no lingering marker to remove; push a no-op to keep the
@@ -2355,7 +2210,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # Toggling the tool off mid-stroke discards the in-progress contour, but a
             # completed lasso stays visible as the active prompt.
             self._cancel_lasso_stroke()
-        self.ui.pbInteractionLassoCancel.setVisible(False)
         self._update_prompt_cursor()
 
     def _install_lasso_filters(self):
@@ -2429,7 +2283,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _begin_lasso_stroke(self, slice_widget, event, event_widget=None):
         """Start a freehand contour on the slice the user pressed in."""
         slice_view = slice_widget.sliceView()
-        color = self.COLOR_POSITIVE if self.is_positive else self.COLOR_NEGATIVE
+        color = self._polarity_color(self.is_positive)
         self._lasso_slice_widget = slice_widget
         self._lasso_display_pts = []
         self._lasso_last_xy = None
@@ -2509,48 +2363,34 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _lasso_overlay_create(self, slice_view, color):
         """Build the live outline actor for a fresh stroke (display coords, follows the
-        cursor). The persistent filled prompt is its own overlay segment added on release
-        (see _add_prompt_overlay_segment), so the outline actor is transient."""
+        cursor; see _create_display_outline_actor). The persistent filled prompt is its
+        own overlay segment added on release (_add_prompt_overlay_segment), so the
+        outline actor is transient. The outline grows one 2-point line segment per
+        mouse move (_lasso_overlay_add) instead of rebuilding a polyline cell each
+        time, which was O(stroke length) per move and lagged on long strokes."""
         self._lasso_overlay_remove()
-        renderer = self._lasso_renderer_for(slice_view)
-        if renderer is None:
+        state = self._create_display_outline_actor(slice_view, color)
+        if state is None:
             return False
-
-        points = vtk.vtkPoints()
-        outline_pd = vtk.vtkPolyData()
-        outline_pd.SetPoints(points)
-
-        coordinate = vtk.vtkCoordinate()
-        coordinate.SetCoordinateSystemToDisplay()
-
-        outline_mapper = vtk.vtkPolyDataMapper2D()
-        outline_mapper.SetTransformCoordinate(coordinate)
-        outline_mapper.SetInputData(outline_pd)
-        outline_actor = vtk.vtkActor2D()
-        outline_actor.SetMapper(outline_mapper)
-        outline_actor.GetProperty().SetColor(*color)
-        outline_actor.GetProperty().SetLineWidth(2.5)
-
-        renderer.AddActor2D(outline_actor)
-
-        self._lasso_points = points
-        self._lasso_outline_pd = outline_pd
-        self._lasso_outline_actor = outline_actor
-        self._lasso_renderer = renderer
-        self._lasso_render_view = slice_view
+        self._lasso_points = state["points"]
+        self._lasso_outline_pd = state["pd"]
+        self._lasso_outline_actor = state["actor"]
+        self._lasso_renderer = state["renderer"]
+        self._lasso_render_view = state["view"]
         return True
 
     def _lasso_overlay_add(self, disp):
-        """Append a point and redraw the open polyline that follows the cursor."""
+        """Append a point and extend the outline by one segment (O(1) per move)."""
         if self._lasso_points is None:
             return
         self._lasso_points.InsertNextPoint(disp[0], disp[1], 0.0)
         n = self._lasso_points.GetNumberOfPoints()
-        lines = vtk.vtkCellArray()
-        lines.InsertNextCell(n)
-        for i in range(n):
-            lines.InsertCellPoint(i)
-        self._lasso_outline_pd.SetLines(lines)
+        if n >= 2:
+            lines = self._lasso_outline_pd.GetLines()
+            lines.InsertNextCell(2)
+            lines.InsertCellPoint(n - 2)
+            lines.InsertCellPoint(n - 1)
+            lines.Modified()
         self._lasso_outline_pd.Modified()
         self._lasso_render_view.scheduleRender()
 
@@ -2560,12 +2400,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if self._lasso_points is None or self._lasso_points.GetNumberOfPoints() < 3:
             return
         n = self._lasso_points.GetNumberOfPoints()
-        closed = vtk.vtkCellArray()
-        closed.InsertNextCell(n + 1)
-        for i in range(n):
-            closed.InsertCellPoint(i)
-        closed.InsertCellPoint(0)
-        self._lasso_outline_pd.SetLines(closed)
+        lines = self._lasso_outline_pd.GetLines()
+        lines.InsertNextCell(2)
+        lines.InsertCellPoint(n - 1)
+        lines.InsertCellPoint(0)
+        lines.Modified()
         self._lasso_outline_pd.Modified()
         self._lasso_render_view.scheduleRender()
 
@@ -2601,10 +2440,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
 
         xy_to_ras = slice_node.GetXYToRAS()
+        to_ijk = self._ras_to_ijk_converter()  # hoisted: one setup for the whole contour
         xyzs = []
         for (x, y) in pts:
             ras = xy_to_ras.MultiplyPoint([x, y, 0.0, 1.0])
-            xyzs.append(self.ras_to_xyz([ras[0], ras[1], ras[2]]))
+            xyzs.append(to_ijk([ras[0], ras[1], ras[2]]))
 
         try:
             crop, bbox = self.lasso_points_to_crop(xyzs)
@@ -2660,7 +2500,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         sub = (np.asarray(crop) > 0).astype(np.uint8)
         if int(sub.sum()) == 0:
             return None
-        color = self.COLOR_POSITIVE if positive else self.COLOR_NEGATIVE
+        color = self._polarity_color(positive)
         self._prompt_overlay_counter = getattr(self, "_prompt_overlay_counter", 0) + 1
         seg_id = f"prompt_{self._prompt_overlay_counter}"
         segmentation = node.GetSegmentation()
@@ -2879,7 +2719,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         changed_bbox = add_interaction(
             crop,
             include_interaction=bool(positive_click),
-            run_prediction=self.auto_run,
+            run_prediction=True,
             interaction_bbox=interaction_bbox,
         )
         self.apply_result(changed_bbox)
@@ -2953,12 +2793,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         fill the whole volume), then ran a full-volume diff/argwhere/copy; on a large
         image that dominated the perceived latency of a scribble.
 
-        Returns ``(crop, bbox, commit)`` where ``crop``/``bbox`` are the newly painted
-        voxels in ``(k, j, i)`` half-open form and ``commit`` is a callable -- run only
-        AFTER the result is shown -- that folds the stroke into the baseline and returns
-        an undo closure. Returns ``None`` if the labelmap is not ready yet or nothing
-        new was painted. Raises on unexpected API issues so the caller can fall back to
-        the robust full-volume path.
+        Returns ``(crop, bbox)`` -- the newly painted voxels in ``(k, j, i)`` half-open
+        form. Returns ``None`` if the labelmap is not ready yet or nothing new was
+        painted. Raises on unexpected API issues so the caller can fall back to the
+        robust full-volume path.
         """
         segmentation = node.GetSegmentation()
         if segmentation is None or segmentation.GetSegment(label_name) is None:
@@ -3007,19 +2845,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             [ix0 + li0, ix0 + li1],
         ]
 
-        def commit():
-            # Snapshot the pre-stroke baseline (full, but off the latency path) so the
-            # existing overlay-undo path can roll the whole label back, then fold this
-            # stroke into the baseline so the next stroke diffs correctly.
-            prev_full = base.copy()
-            base_region[new] = 1
-            return self._make_overlay_restore(label_name, prev_full)
-
-        return crop, bbox, commit
+        return crop, bbox
 
     def _scribble_new_voxels_full(self, node, label_name, volume_node):
         """Fallback scribble diff over the full reference-volume rasterization, used only
-        if ``_scribble_new_voxels_region`` raises. Same ``(crop, bbox, commit)`` contract.
+        if ``_scribble_new_voxels_region`` raises. Same ``(crop, bbox)`` contract.
         """
         mask = self._scribble_mask_or_none(node, label_name, volume_node)
         if mask is None:
@@ -3039,14 +2869,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         crop, bbox = self._mask_to_crop(new)
         if crop is None:
             return None
-
-        def commit():
-            # mask is a freshly extracted array we own, so store it directly as the new
-            # baseline (no extra full-volume copy), and roll back to the pre-stroke one.
-            self._prev_scribble_masks[label_name] = mask
-            return self._make_overlay_restore(label_name, prev)
-
-        return crop, bbox, commit
+        return crop, bbox
 
     def on_scribble_finished(self, caller, event):
         if getattr(self, "_scribble_callback_in_progress", False):
@@ -3097,7 +2920,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # labelmap is ready, and a stroke that paints nothing new yields no diff.
             # Keep the observer and wait for the real stroke.
             return
-        crop, bbox, commit = diff  # commit (baseline fold) is unused: we move + clear below
+        crop, bbox = diff
 
         self._remove_scribble_labelmap_observer(expected_node=caller)
         sent = self.lasso_or_scribble_prompt(
@@ -3147,17 +2970,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             except Exception:  # noqa: BLE001
                 pass
 
-        # Deselect the active interaction tool so re-selecting works with a single
-        # click. After teardown a tool button -- the scribble button in particular --
-        # could stay "checked" but inactive, forcing the user to click it twice.
-        self._place_tool = None  # also drop point/bbox click-capture
-        self._cancel_bbox_drag()
-        for button in self.all_prompt_buttons.values():
-            button.setChecked(False)
-        # setChecked() above does not fire the click handlers, so normalize the cursor
-        # here: with every tool now off it reverts to the default (on_next_segment
-        # re-activates the tool afterwards, which re-applies the coloured cursor).
-        self._update_prompt_cursor()
+        self._deactivate_all_tools()
 
         # Invalidate the segment baseline so the next prompt re-seeds the session for
         # whatever segment is then selected.
@@ -3187,10 +3000,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.reset_all_prompts()
         result = self.make_new_segment()
 
-        # Keep the same tool active on the new segment. Deferred so the prompt nodes
-        # rebuilt by reset_all_prompts have settled before we re-enter place/paint mode.
-        if active_tool is not None:
-            qt.QTimer.singleShot(0, lambda: self._activate_prompt_tool(active_tool))
+        # Keep the same tool active on the new segment.
+        self._rearm_tool_later(active_tool)
         return result
 
     def _active_prompt_tool(self):
@@ -3202,15 +3013,31 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _activate_prompt_tool(self, name):
         """Re-activate an interaction tool by name (no-op if missing/disabled/active)."""
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return
         button = self.all_prompt_buttons.get(name)
         if button is None or not button.isEnabled():
             return
         if not button.isChecked():
             button.click()
+
+    def _rearm_tool_later(self, tool):
+        """Deferred re-activation of a prompt tool after a reset rebuilt the prompt
+        nodes (next event-loop turn, so the rebuild settles first). None -> no-op."""
+        if tool is not None:
+            qt.QTimer.singleShot(0, lambda: self._activate_prompt_tool(tool))
+
+    def _deactivate_all_tools(self):
+        """Deselect every interaction tool (buttons + point/bbox click capture) and
+        restore the default cursor. After a reset a tool button could stay "checked"
+        but inactive, forcing a second click to re-select it -- deselecting here makes
+        re-selection (or the deferred _rearm_tool_later) work with a single click."""
+        self._place_tool = None  # also drop point/bbox click-capture
+        self._cancel_bbox_drag()
+        for button in self.all_prompt_buttons.values():
+            button.setChecked(False)
+        # setChecked() does not fire the click handlers, so normalize the cursor here.
+        self._update_prompt_cursor()
 
     def make_new_segment(self):
         """
@@ -3272,13 +3099,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # we're automatically switching the prompt type to positive.
         self.ui.pbPromptTypePositive.click()
 
-        _, selected_segment_id = self.get_selected_segmentation_node_and_segment_id()
+        segmentation_node, selected_segment_id = (
+            self.get_selected_segmentation_node_and_segment_id()
+        )
 
         if selected_segment_id:
             debug_print(f"Clearing segment: {selected_segment_id}")
-            self.show_segmentation(
-                np.zeros(self.get_image_data().shape, dtype=np.uint8)
-            )
+            self._clear_segment_labelmap(segmentation_node, selected_segment_id)
             self.setup_prompts()
             self._clear_prompt_undo()
             # Drop the session's interactions for this (now-empty) segment.
@@ -3294,18 +3121,35 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.previous_states["segment_fp"] = self._segment_fingerprint()
 
             # Re-arm the active tool: setup_prompts() rebuilt the prompt nodes, so the
-            # interaction is stale even though the button still looks selected. Deselect
-            # and (deferred) re-select so it works without a manual second click, exactly
-            # like on_next_segment does.
-            self._place_tool = None  # also drop point/bbox click-capture
-            self._cancel_bbox_drag()
-            for button in self.all_prompt_buttons.values():
-                button.setChecked(False)
-            self._update_prompt_cursor()
-            if active_tool is not None:
-                qt.QTimer.singleShot(0, lambda: self._activate_prompt_tool(active_tool))
+            # interaction is stale even though the button still looks selected.
+            self._deactivate_all_tools()
+            self._rearm_tool_later(active_tool)
         else:
             debug_print("No segment selected to clear.")
+
+    def _clear_segment_labelmap(self, segmentation_node, segment_id):
+        """Empty a segment's labelmap. Zeroes only the segment's own values inside its
+        allocated internal-labelmap extent (in place, no full-volume array -- the same
+        technique as _clear_scribble_scratch); falls back to a full-volume zeros write
+        if the internal view is unavailable."""
+        try:
+            segmentation = segmentation_node.GetSegmentation()
+            segment = segmentation.GetSegment(segment_id) if segmentation is not None else None
+            vimage = segmentation_node.GetBinaryLabelmapInternalRepresentation(segment_id)
+            view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(
+                segmentation_node, segment_id
+            )
+            if segment is not None:
+                if view is None or view.size == 0:
+                    return  # nothing allocated -> already empty
+                view[view == segment.GetLabelValue()] = 0  # leave sibling values intact
+                if vimage is not None:
+                    vimage.Modified()  # numpy write bypasses VTK's MTime
+                segment.Modified()
+                return
+        except Exception as exc:  # noqa: BLE001
+            debug_print(f"In-place segment clear failed ({exc}); using full write.")
+        self.show_segmentation(np.zeros(self.get_image_data().shape, dtype=np.uint8))
 
     def on_delete_segment(self):
         """
@@ -3361,10 +3205,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if not remaining_ids:
             self.make_new_segment()
 
-        # Re-arm the active tool on the newly selected / created segment. Deferred so
-        # the prompt nodes rebuilt by reset_all_prompts have settled first.
-        if active_tool is not None:
-            qt.QTimer.singleShot(0, lambda: self._activate_prompt_tool(active_tool))
+        # Re-arm the active tool on the newly selected / created segment.
+        self._rearm_tool_later(active_tool)
 
     def _update_segment_region(self, mask, bbox, segmentationNode, segmentId):
         """Update only the changed sub-extent of the segment instead of rewriting the whole
@@ -3451,24 +3293,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # SET just the bbox region (the rest of THIS segment stays background). This is the
         # fast path for the first prompt on a new segment, with no full-volume write.
         # SetBinaryLabelmapToSegment maps the foreground to this segment's value and leaves
-        # other segments alone; we don't pass an extent, so it replaces using the small
-        # image's own extent (zeroing this segment outside it, which is what we want here).
-        from vtk.util import numpy_support
-
-        sub = np.ascontiguousarray(mask[k0:k1, j0:j1, i0:i1], dtype=np.uint8)
-        oriented = slicer.vtkOrientedImageData()
-        oriented.SetExtent(i0, i1 - 1, j0, j1 - 1, k0, k1 - 1)
-        ijk_to_ras = vtk.vtkMatrix4x4()
-        self.get_volume_node().GetIJKToRASMatrix(ijk_to_ras)
-        oriented.SetImageToWorldMatrix(ijk_to_ras)
-        oriented.GetPointData().SetScalars(
-            numpy_support.numpy_to_vtk(sub.reshape(-1), deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
-        )
-        slicer.vtkSlicerSegmentationsModuleLogic.SetBinaryLabelmapToSegment(
-            oriented,
-            segmentationNode,
-            segmentId,
-            slicer.vtkSlicerSegmentationsModuleLogic.MODE_REPLACE,
+        # other segments alone; the crop's own extent bounds the replace (zeroing this
+        # segment outside it, which is what we want here).
+        self._set_segment_region_from_crop(
+            segmentationNode, segmentId, mask[k0:k1, j0:j1, i0:i1], bbox
         )
         return True
 
@@ -3613,7 +3441,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def get_segment_data(self):
         """
-        Gets the labelmap array (binary) of the currently selected segment.
+        Gets the labelmap array (binary uint8, 0/1) of the currently selected segment.
         """
         segmentation_node, selected_segment_id = (
             self.get_selected_segmentation_node_and_segment_id()
@@ -3622,9 +3450,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         mask = slicer.util.arrayFromSegmentBinaryLabelmap(
             segmentation_node, selected_segment_id, self.get_volume_node()
         )
-        seg_data_bool = mask.astype(bool)
-
-        return seg_data_bool
+        return (mask != 0).astype(np.uint8)
 
     def _segment_fingerprint(self):
         """Cheap O(1) identity for the selected segment's labelmap:
@@ -3736,13 +3562,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return self._local_inference_available()
         return self._detect_install_flavor() != ""
 
-    def get_setting_bool(self, key, default):
+    def get_setting_bool(self, key):
         return slicer.util.settingsValue(
-            f"SlicerNNInteractive/{key}", default, converter=slicer.util.toBool
+            f"SlicerNNInteractive/{key}", SETTING_DEFAULTS[key], converter=slicer.util.toBool
         )
 
-    def get_setting_str(self, key, default):
-        return slicer.util.settingsValue(f"SlicerNNInteractive/{key}", default)
+    def get_setting_str(self, key):
+        return slicer.util.settingsValue(f"SlicerNNInteractive/{key}", SETTING_DEFAULTS[key])
 
     def _save_setting(self, key, value, reinit=False):
         qt.QSettings().setValue(f"SlicerNNInteractive/{key}", value)
@@ -3770,9 +3596,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def update_server(self):
         """Reads the server URL from the UI and persists it. Changing it disconnects the
         current remote session so the next Connect uses the new address."""
-        edit = getattr(self.ui, "serverUrlEdit", None)
-        text = edit.text if edit is not None else self.ui.Server.text
-        new_server = text.rstrip("/")
+        new_server = self.ui.serverUrlEdit.text.rstrip("/")
         changed = new_server != self.server
         self.server = new_server
         qt.QSettings().setValue("SlicerNNInteractive/server", self.server)
@@ -3781,14 +3605,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # Drop the existing session so the new address actually takes effect.
             self._teardown_for_settings_change()
 
-    @property
-    def auto_run(self):
-        # Auto-run is always on (the toggle was removed); a prediction runs as each
-        # prompt is added.
-        return True
-
     def get_local_device(self):
-        return self.get_setting_str("device", "cuda:0") or "cuda:0"
+        return self.get_setting_str("device") or "cuda:0"
 
     def get_image_spacing(self):
         """Image spacing in array (k, j, i) order to match arrayFromVolume()."""
@@ -3871,20 +3689,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         checkpoint_path = self.get_checkpoint_path()  # downloads weights if needed
 
-        custom = self.get_setting_str("checkpoint_path", "").strip()
+        custom = self.get_setting_str("checkpoint_path").strip()
         if custom:
             model_desc = f"custom checkpoint at {checkpoint_path}"
         else:
-            model_id = self.get_setting_str("model_id", "").strip() or "default"
+            model_id = self.get_setting_str("model_id").strip() or "default"
             model_desc = f"'{model_id}' ({checkpoint_path})"
         print(f"[nnInteractive] Local session using model: {model_desc}")
 
         # Settings read on the main thread (QSettings access).
         requested_device = self.get_local_device()
-        want_autozoom = self.get_setting_bool("autozoom", True)
-        want_compile = self.get_setting_bool("use_torch_compile", False)
+        want_autozoom = self.get_setting_bool("autozoom")
+        want_compile = self.get_setting_bool("use_torch_compile")
         compile_reason = self._torch_compile_unsupported_reason()
-        storage = self.get_setting_str("interactions_storage", "auto")
+        storage = self.get_setting_str("interactions_storage")
 
         notes = {}
 
@@ -3902,20 +3720,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     notes["cpu"] = True
                     device = torch.device("cpu")
 
-                # Proactive guard: on Linux a system-wide cuDNN of a different version on
-                # the library path gets mixed into Slicer's bundled cuDNN (cuDNN dlopens
-                # engine sub-libraries by bare soname), which crashes the first
-                # convolution with CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH. Catch it here
-                # and fail with actionable guidance instead of a cryptic crash later.
-                if device.type == "cuda":
-                    conflict = self._detect_cudnn_library_conflict()
-                    if conflict is not None:
-                        raise RuntimeError(conflict)
-
-                # Honour the user's Auto-zoom choice regardless of device -- it is slower
-                # on CPU, but the setting is respected there too (per user request).
-                do_autozoom = want_autozoom
-
                 use_torch_compile = want_compile
                 if use_torch_compile and compile_reason is not None:
                     # torch.compile can't run here (Windows, or no Python.h to build its
@@ -3930,7 +3734,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     use_torch_compile=use_torch_compile,
                     torch_n_threads=os.cpu_count(),
                     verbose=False,
-                    do_autozoom=do_autozoom,
+                    # Honoured regardless of device: auto-zoom on CPU is slower but the
+                    # user's choice is respected there too.
+                    do_autozoom=want_autozoom,
                     interactions_storage=storage,
                 )
                 # Load the weights. initialize_from_trained_model_folder() already runs a
@@ -3992,145 +3798,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         return notes["session"]
 
     @staticmethod
-    def _format_cudnn_version(v):
-        """91002 -> '9.10.2' (cuDNN packs version as major*10000 + minor*100 + patch)."""
-        return f"{v // 10000}.{(v // 100) % 100}.{v % 100}"
-
-    @staticmethod
-    def _find_cudnn_conflict(bundled_ver_int, cudnn_dir, search_dirs):
-        """Pure core of the cuDNN-shadowing check (no torch/Slicer imports, so it is
-        unit-testable). Returns (system_version_int, system_lib_path) when Slicer's
-        bundled cuDNN reaches for an engine sub-library it does NOT ship AND a copy of
-        that sub-library of a DIFFERENT version sits on the loader search path -- the
-        exact condition that yields CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH. Else None.
-
-        ``cudnn_dir`` is the bundled cuDNN lib dir; ``search_dirs`` are the directories
-        the dynamic loader would consult for a bare-soname dlopen (LD_LIBRARY_PATH plus
-        the standard default dirs), excluding the bundle itself.
-        """
-        import os, re, glob
-
-        try:
-            bundled_files = os.listdir(cudnn_dir)
-        except OSError:
-            return None
-
-        # Which engine sub-libraries does the bundled cuDNN dlopen (by bare soname) but
-        # NOT ship? Scan the dispatcher / graph libs for referenced engine sonames.
-        referenced = set()
-        for name in ("libcudnn_graph.so.9", "libcudnn.so.9"):
-            path = os.path.join(cudnn_dir, name)
-            try:
-                with open(path, "rb") as fh:
-                    blob = fh.read()
-            except OSError:
-                continue
-            for match in re.finditer(rb"libcudnn_engines_[a-z_]+\.so", blob):
-                referenced.add(match.group().decode())
-
-        missing = [
-            base
-            for base in {s[: s.index(".so")] for s in referenced}
-            if not any(f.startswith(base + ".so") for f in bundled_files)
-        ]
-        if not missing:
-            return None
-
-        def _parse_ver(path):
-            # .../libcudnn_engines_tensor_ir.so.9.23.2 -> 92302
-            m = re.search(r"\.so\.(\d+)\.(\d+)\.(\d+)", os.path.realpath(path))
-            if not m:
-                return None
-            a, b, c = (int(x) for x in m.groups())
-            return a * 10000 + b * 100 + c
-
-        for base in missing:
-            for d in search_dirs:
-                for cand in sorted(glob.glob(os.path.join(d, base + ".so.9*"))):
-                    sys_ver = _parse_ver(cand)
-                    if sys_ver is not None and sys_ver != bundled_ver_int:
-                        return sys_ver, cand
-        return None
-
-    @classmethod
-    def _detect_cudnn_library_conflict(cls):
-        """Fast, best-effort guard for the cuDNN library conflict that crashes GPU
-        inference on machines with a system-wide cuDNN of a different version than the
-        one Slicer's bundled PyTorch ships.
-
-        The bundled cuDNN dlopens some engine sub-libraries by bare soname at runtime;
-        when the wheel omits such a sub-library (e.g. libcudnn_engines_tensor_ir.so),
-        the loader falls through to the default search path and can pick up a DIFFERENT
-        version from a system cuDNN, mixing e.g. a 9.23 engine into a 9.20 core. That
-        fails the first convolution with CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH.
-
-        Returns an actionable message string when this exact situation is detected, else
-        None. Linux-only (the failure is specific to the ELF loader search). Cheap: a
-        couple of directory listings and one scan of the bundled dispatcher lib.
-        """
-        import sys, os
-
-        if not sys.platform.startswith("linux"):
-            return None
-        try:
-            import torch
-
-            bundled_ver_int = torch.backends.cudnn.version()
-            site_packages = os.path.dirname(os.path.dirname(torch.__file__))
-        except Exception:  # noqa: BLE001 - a detection failure must never block init
-            return None
-        if not bundled_ver_int:
-            return None
-
-        cudnn_dir = os.path.join(site_packages, "nvidia", "cudnn", "lib")
-        search_dirs = [
-            d
-            for d in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
-            if d and os.path.abspath(d) != os.path.abspath(cudnn_dir)
-        ] + [
-            "/usr/lib/x86_64-linux-gnu",
-            "/lib/x86_64-linux-gnu",
-            "/usr/lib64",
-            "/lib64",
-            "/usr/lib",
-            "/lib",
-        ]
-
-        try:
-            hit = cls._find_cudnn_conflict(bundled_ver_int, cudnn_dir, search_dirs)
-        except Exception:  # noqa: BLE001 - never let the guard itself break init
-            return None
-        if hit is None:
-            return None
-
-        sys_ver_int, sys_path = hit
-        bundled = cls._format_cudnn_version(bundled_ver_int)
-        system = cls._format_cudnn_version(sys_ver_int)
-        url = (
-            "https://git.dkfz.de/mic/personal/group2/isensee/slicernninteractive"
-            "#common-issues"
-        )
-        return (
-            f"GPU library conflict. Slicer's bundled PyTorch uses cuDNN {bundled}, but a "
-            f"different system-wide cuDNN {system} is on your library path and gets mixed "
-            f"into it:\n    {sys_path}\nThis crashes local GPU inference "
-            f"(CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH). Your system cuDNN is not broken "
-            f"-- the two versions simply cannot be combined in one process.\n\n"
-            f"Fix -- pick one (options 1 and 2 leave your system CUDA/cuDNN untouched):\n"
-            f"  1. Install a matching PyTorch in Slicer's Python Console, then restart "
-            f"Slicer:\n"
-            f'       slicer.util.pip_install("torch==2.8.0 torchvision==0.23.0 '
-            f'--index-url https://download.pytorch.org/whl/cu129 --force-reinstall")\n'
-            f"  2. Switch to Remote mode (Configuration tab) to run inference on a "
-            f"server -- no local CUDA is loaded.\n"
-            f"  3. If nothing on your system actually needs that system-wide cuDNN, "
-            f"remove it (or drop its directory from LD_LIBRARY_PATH) so only Slicer's "
-            f"bundled cuDNN is found:\n"
-            f"       {sys_path}\n\n"
-            f"See 'Common issues' in the README: {url}"
-        )
-
-    @staticmethod
     def _torch_compile_unsupported_reason():
         """Why torch.compile can't be used here, or None if it can.
 
@@ -4155,11 +3822,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "which are not present in this Python build."
             )
         return None
-
-    @staticmethod
-    def _torch_compile_supported():
-        """True only if torch.compile can actually run in this environment."""
-        return SlicerNNInteractiveWidget._torch_compile_unsupported_reason() is None
 
     def _construct_remote_session(self):
         """Connect to an official nninteractive-server (remote compute).
@@ -4235,7 +3897,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if not models:
             return
 
-        saved_id = self.get_setting_str("model_id", "")
+        saved_id = self.get_setting_str("model_id")
         try:
             default_id = get_default_model_id()
         except Exception:  # noqa: BLE001
@@ -4277,13 +3939,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def get_checkpoint_path(self):
         """Local model folder; downloads the selected official model on first use."""
-        custom = self.get_setting_str("checkpoint_path", "").strip()
+        custom = self.get_setting_str("checkpoint_path").strip()
         if custom:
             return custom
 
         from nnInteractive.model_management import ensure_model_available, get_default_model_id
 
-        model_id = self.get_setting_str("model_id", "").strip() or None
+        model_id = self.get_setting_str("model_id").strip() or None
         self._resolved_model_dir = None
         self._model_prep_error = None
 
@@ -4347,9 +4009,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _deactivate_all_tools(self):
         """Turn off any active interaction tool (used when uninitializing)."""
         self._place_tool = None
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             # During teardown just drop transient state; don't poke views/cursors.
             return
         self._cancel_bbox_drag()
@@ -4404,9 +4064,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _start_heartbeat_timer(self):
         """(Re)start the main-thread heartbeat timer for a remote session."""
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return
         if getattr(self, "_heartbeat_timer", None) is None:
             self._heartbeat_timer = qt.QTimer()
@@ -4450,20 +4108,71 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # missed beats within the liveness window).
             pass
 
-    def sync_image_to_session(self):
-        """Push the current volume into the session and allocate the target buffer."""
+    def _build_image_payload(self):
+        """Main-thread MRML reads for an image upload: ``(image_4d, spacing, buffer)``
+        -- the [C, X, Y, Z] array nnInteractive expects, its spacing, and a fresh uint8
+        target buffer. Returns None when no volume is loaded."""
         image = self.get_image_data()
         if image is None:
+            return None
+        return (
+            np.ascontiguousarray(image[None]),
+            self.get_image_spacing(),
+            np.zeros(image.shape, dtype=np.uint8),
+        )
+
+    def _build_segment_seed(self):
+        """The selected segment's mask for session seeding, or None when seeding is
+        unsupported or pointless. A fresh segment (the common case on the first prompt
+        of a new object) is empty, so detect that cheaply and skip the expensive
+        full-volume extract get_segment_data() would otherwise do. Reads MRML -- main
+        thread only."""
+        if getattr(self.session, "supports_initial_label", True) and not self._selected_segment_is_empty():
+            seg = self.get_segment_data()
+            if seg.sum() > 0:
+                return seg
+        return None
+
+    def _run_session_upload(self, upload_fn):
+        """Run session-only upload work (no Qt/MRML access) on a worker thread behind
+        the modal wait dialog, pumping the event loop so the UI stays painted instead
+        of freezing for the (possibly long, especially remote) blocking call. Worker
+        errors are re-raised here on the calling (main) thread."""
+        error = [None]
+
+        def _worker(done_event):
+            try:
+                upload_fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                error[0] = exc
+            finally:
+                done_event.set()
+
+        message = (
+            "Sending image to the nnInteractive server ..."
+            if self.get_mode() == "remote"
+            else "Preparing image for nnInteractive ..."
+        )
+        self._run_thread_with_message(_worker, (), message)
+        if error[0] is not None:
+            raise error[0]
+
+    def sync_image_to_session(self):
+        """Push the current volume into the session and allocate the target buffer.
+        The blocking upload runs on a worker thread behind the wait dialog (it fires
+        mid-prompt, so a synchronous call would freeze the UI for its duration)."""
+        payload = self._build_image_payload()
+        if payload is None:
             debug_print("No image data available to sync.")
             return False
+        image_4d, spacing, buffer = payload
 
-        # nnInteractive expects a 4D array [C, X, Y, Z]; Slicer arrays are [k, j, i].
-        image_4d = np.ascontiguousarray(image[None])
-        spacing = self.get_image_spacing()
+        def _upload():
+            self.session.set_image(image_4d, {"spacing": spacing})
+            self.session.set_target_buffer(buffer)
 
-        self.target_buffer = np.zeros(image.shape, dtype=np.uint8)
-        self.session.set_image(image_4d, {"spacing": spacing})
-        self.session.set_target_buffer(self.target_buffer)
+        self._run_session_upload(_upload)
+        self.target_buffer = buffer
         # Re-seeding of the active segment is handled by sync_segment_to_session().
         self.previous_states.pop("segment_fp", None)
         return True
@@ -4472,13 +4181,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Seed the session with the currently selected segment (for editing)."""
         self.session.reset_interactions()
         self._clear_prompt_undo()  # interactions reset -> drop their pending undo markers
-        # Seeding only matters when the segment already holds a mask. A fresh segment (the
-        # common case on the first prompt of a new object) is empty, so detect that cheaply
-        # and skip the expensive full-volume extract get_segment_data() would otherwise do.
-        if getattr(self.session, "supports_initial_label", True) and not self._selected_segment_is_empty():
-            seg = self.get_segment_data().astype(np.uint8)
-            if seg.sum() > 0:
-                self.session.add_initial_seg_interaction(seg, run_prediction=False)
+        seed = self._build_segment_seed()
+        if seed is not None:
+            self.session.add_initial_seg_interaction(seed, run_prediction=False)
         self.previous_states["segment_fp"] = self._segment_fingerprint()
 
     def apply_result(self, changed_bbox=None):
@@ -4492,23 +4197,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # VTK, and we no longer keep a reference to the array as a baseline (we use a
             # fingerprint instead), so the session can safely reuse target_buffer.
             self.show_segmentation(self.target_buffer, changed_bbox)
-
-    def run_prediction_now(self):
-        """Manual 'Run' for when auto-run is off (local sessions only)."""
-        if self.session is None:
-            return
-        predict = getattr(self.session, "_predict", None)
-        if predict is None:
-            slicer.util.showStatusMessage(
-                "Manual run is only available in local mode.", 4000
-            )
-            return
-        try:
-            changed_bbox = predict()
-        except self.SESSION_LOST_ERRORS as exc:
-            self.handle_session_expired(exc)
-            return
-        self.apply_result(changed_bbox)
 
     def on_undo(self):
         """Undo the most recent interaction (if the session supports it)."""
@@ -4527,7 +4215,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
         # Remove the marker of the interaction that was just undone.
         self._pop_prompt_undo()
-        self.apply_result()
+        # Both backends record the region the undo changed in _last_paste_bbox (the
+        # local session diffs the target buffer against its snapshot; the remote client
+        # stores the server-clipped patch bbox), so update only that sub-extent instead
+        # of rewriting the whole volume. None means the undo changed no voxels. Fall
+        # back to a full update if the attribute ever disappears from the API.
+        if hasattr(self.session, "_last_paste_bbox"):
+            changed_bbox = self.session._last_paste_bbox
+            if changed_bbox is not None:
+                self.apply_result(changed_bbox)
+        else:
+            self.apply_result()
 
     def handle_session_expired(self, exc=None):
         """A remote lease was lost; drop the session and let the user reconnect."""
@@ -4621,56 +4319,26 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         volume (see _update_initialize_button_state), so an image is normally present;
         the guard below is just defensive.
 
-        The blocking upload runs in a worker thread while the main thread pumps the Qt
-        event loop (_run_thread_with_message, which shows a plain "please wait" message
-        with no progress bar). This is required for the dialog to render: sending the
-        image over the wire blocks the calling thread, so doing it on the main thread
-        leaves the window unpainted (an empty box). All MRML access (image / segment
-        extraction) happens on the main thread first; only the network/compute calls on
-        ``self.session`` run in the worker -- it never touches Qt or MRML.
+        All MRML access (image / segment extraction) happens on the main thread first;
+        only the network/compute calls on ``self.session`` run in the worker behind the
+        wait dialog (_run_session_upload) -- it never touches Qt or MRML.
         """
         if self.session is None:
             return
-        image = self.get_image_data()
-        if image is None:
+        payload = self._build_image_payload()
+        if payload is None:
             return
+        image_4d, spacing, buffer = payload
+        seed = self._build_segment_seed()
 
-        # --- Everything that reads MRML must run on the MAIN thread. ---
-        image_4d = np.ascontiguousarray(image[None])  # nnInteractive wants [C, X, Y, Z]
-        spacing = self.get_image_spacing()
-        buffer = np.zeros(image.shape, dtype=np.uint8)
+        def _upload():
+            self.session.set_image(image_4d, {"spacing": spacing})
+            self.session.set_target_buffer(buffer)
+            self.session.reset_interactions()
+            if seed is not None:
+                self.session.add_initial_seg_interaction(seed, run_prediction=False)
 
-        seed = None
-        if getattr(self.session, "supports_initial_label", True) and not self._selected_segment_is_empty():
-            seg = self.get_segment_data().astype(np.uint8)
-            if seg.sum() > 0:
-                seed = seg
-
-        # --- The blocking upload + seeding run off the main thread. ---
-        self._preload_error = None
-
-        def _worker(image_4d, spacing, buffer, seed, done_event):
-            try:
-                self.session.set_image(image_4d, {"spacing": spacing})
-                self.session.set_target_buffer(buffer)
-                self.session.reset_interactions()
-                if seed is not None:
-                    self.session.add_initial_seg_interaction(seed, run_prediction=False)
-            except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
-                self._preload_error = exc
-            finally:
-                done_event.set()
-
-        message = (
-            "Sending image to the nnInteractive server ..."
-            if self.get_mode() == "remote"
-            else "Preparing image for nnInteractive ..."
-        )
-        self._run_thread_with_message(_worker, (image_4d, spacing, buffer, seed), message)
-
-        if self._preload_error is not None:
-            err, self._preload_error = self._preload_error, None
-            raise err
+        self._run_session_upload(_upload)
 
         # Worker succeeded: publish the shared target buffer and record the image/segment
         # baselines (main thread) so the first prompt skips a redundant re-upload/re-seed.
@@ -4715,15 +4383,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
         show = bool(connected) and getattr(self, "_local_running_on_cpu", False)
         if show:
-            url = (
-                "https://git.dkfz.de/mic/personal/group2/isensee/slicernninteractive"
-                "#common-issues"
-            )
             label.setText(
                 "⚠ No GPU detected — nnInteractive is running on the CPU, which is very "
                 "slow. Likely either no compatible GPU is present, or the installed "
                 "PyTorch build does not match your GPU. "
-                f'See <a href="{url}">Common issues</a> in the README.'
+                f'See <a href="{README_COMMON_ISSUES_URL}">Common issues</a> in the README.'
             )
         label.setVisible(show)
 
@@ -4862,9 +4526,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         the dialog is framed as Reinstall/Update. Cancelling installs nothing, so the
         first-run prompt re-appears on the next launch.
         """
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return
         prev_flavor = self.get_install_flavor()
 
@@ -4942,9 +4604,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         installed, prompt the user to choose what to install. Dismissing the prompt
         leaves nothing installed, so it re-appears on the next launch.
         """
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return
         if self.get_install_flavor():
             self._sync_mode_switch()
@@ -4988,9 +4648,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         Fails silently when offline. No-op until a flavor is installed.
         """
-        if getattr(self, "_cleanup_in_progress", False) or getattr(
-            self, "_application_quitting", False
-        ):
+        if self._is_tearing_down():
             return
         label = getattr(self.ui, "updateStatusLabel", None)
         if label is None:
@@ -5163,7 +4821,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return None
         return (volume_node.GetID(), int(image_data.GetMTime()))
 
-    def image_changed(self, do_prev_image_update=True):
+    def image_changed(self):
         """
         Checks if the active volume's voxel data changed since the last time we
         synced it, using a lightweight fingerprint rather than scanning/copying the
@@ -5177,60 +4835,38 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         old_fingerprint = self.previous_states.get("image_data", None)
         image_changed = old_fingerprint is None or old_fingerprint != fingerprint
 
-        if do_prev_image_update:
-            self.previous_states["image_data"] = fingerprint
+        self.previous_states["image_data"] = fingerprint
 
         return image_changed
 
-    def ras_to_xyz(self, pos):
-        """
-        Converts an RAS position to IJK voxel coords in the current volume node.
-        """
+    def _ras_to_ijk_converter(self):
+        """One-time setup for RAS -> IJK conversion in the current volume node; returns
+        a per-point callable. Hoist this out of loops: building the VTK transform and
+        matrix dominates the cost, so per-point construction made long-contour
+        conversions (lasso submit) needlessly slow."""
         volumeNode = self.get_volume_node()
 
         transformRasToVolumeRas = vtk.vtkGeneralTransform()
         slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(
             None, volumeNode.GetParentTransformNode(), transformRasToVolumeRas
         )
-        point_VolumeRas = transformRasToVolumeRas.TransformPoint(pos)
-
         volumeRasToIjk = vtk.vtkMatrix4x4()
         volumeNode.GetRASToIJKMatrix(volumeRasToIjk)
-        point_Ijk = [0, 0, 0, 1]
-        volumeRasToIjk.MultiplyPoint(list(point_VolumeRas) + [1.0], point_Ijk)
-        xyz = [int(round(c)) for c in point_Ijk[0:3]]
-        return xyz
 
+        def _convert(pos):
+            point_VolumeRas = transformRasToVolumeRas.TransformPoint(pos)
+            point_Ijk = [0, 0, 0, 1]
+            volumeRasToIjk.MultiplyPoint(list(point_VolumeRas) + [1.0], point_Ijk)
+            return [int(round(c)) for c in point_Ijk[0:3]]
 
-    def xyz_from_caller(self, caller, lock_point=True, point_type="control_point"):
+        return _convert
+
+    def ras_to_xyz(self, pos):
         """
-        Extract voxel coordinates from a Markups node.
-        `point_type` can be either "control_point" or "curve_point".
+        Converts an RAS position to IJK voxel coords in the current volume node.
         """
-        if point_type == "control_point":
-            n = caller.GetNumberOfControlPoints()
-            if n < 0:
-                debug_print("No control points found")
-                return
+        return self._ras_to_ijk_converter()(pos)
 
-            pos = [0, 0, 0]
-            caller.GetNthControlPointPosition(n - 1, pos)
-            if lock_point:
-                caller.SetNthControlPointLocked(n - 1, True)
-            xyz = self.ras_to_xyz(pos)
-            return xyz
-        elif point_type == "curve_point":
-            vtk_pts = caller.GetCurvePointsWorld()
-            
-            if vtk_pts is not None:
-                vtk_pts_data = vtk_to_numpy(vtk_pts.GetData())
-                xyz = [self.ras_to_xyz(pos) for pos in vtk_pts_data]
-                debug_print(xyz)
-                return xyz
-
-            return []
-        else:
-            raise ValueError(f'Unknown point_type {point_type}')
 
     def lasso_points_to_crop(self, points):
         """
@@ -5239,8 +4875,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         (k, j, i) = (z, y, x) order. Returns ``(crop, bbox)`` or ``(None, None)``
         if the polygon is empty.
 
-        ``points`` come from ``xyz_from_caller`` in IJK (i, j, k) order; the image
-        array is (k, j, i), so x->axis2, y->axis1, z->axis0.
+        ``points`` are in IJK (i, j, k) order; the image array is (k, j, i), so
+        x->axis2, y->axis1, z->axis0.
         """
         from skimage.draw import polygon
 
@@ -5253,7 +4889,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         const_axis = const_axes[0]
         const_val = int(pts[0, const_axis])
 
-        def _tighten(full2d, axis0_len, axis1_len):
+        def _tighten(full2d):
             a, b = np.nonzero(full2d)
             if len(a) == 0:
                 return None
@@ -5265,7 +4901,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             rr, cc = polygon(pts[:, 1], pts[:, 0], shape=(zyx_shape[1], zyx_shape[2]))
             full = np.zeros((zyx_shape[1], zyx_shape[2]), dtype=np.uint8)
             full[rr, cc] = 1
-            tightened = _tighten(full, zyx_shape[1], zyx_shape[2])
+            tightened = _tighten(full)
             if tightened is None:
                 return None, None
             crop2d, (y0, y1), (x0, x1) = tightened
@@ -5275,7 +4911,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             rr, cc = polygon(pts[:, 2], pts[:, 0], shape=(zyx_shape[0], zyx_shape[2]))
             full = np.zeros((zyx_shape[0], zyx_shape[2]), dtype=np.uint8)
             full[rr, cc] = 1
-            tightened = _tighten(full, zyx_shape[0], zyx_shape[2])
+            tightened = _tighten(full)
             if tightened is None:
                 return None, None
             crop2d, (z0, z1), (x0, x1) = tightened
@@ -5285,7 +4921,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             rr, cc = polygon(pts[:, 2], pts[:, 1], shape=(zyx_shape[0], zyx_shape[1]))
             full = np.zeros((zyx_shape[0], zyx_shape[1]), dtype=np.uint8)
             full[rr, cc] = 1
-            tightened = _tighten(full, zyx_shape[0], zyx_shape[1])
+            tightened = _tighten(full)
             if tightened is None:
                 return None, None
             crop2d, (z0, z1), (y0, y1) = tightened
@@ -5340,34 +4976,26 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         return self.ui.pbPromptTypePositive.isChecked()
 
+    def _set_polarity(self, positive):
+        """Switch the prompt polarity: restyle the toggle buttons and recolour the
+        active tool's cursor / an active scribble's target label."""
+        self.ui.pbPromptTypePositive.setStyleSheet(
+            self.selected_style if positive else self.unselected_style
+        )
+        self.ui.pbPromptTypeNegative.setStyleSheet(
+            self.unselected_style if positive else self.selected_style
+        )
+        self.ui.pbPromptTypePositive.setChecked(positive)
+        self.ui.pbPromptTypeNegative.setChecked(not positive)
+        self._update_prompt_cursor()
+        self._retarget_scribble_if_active()
+        debug_print(f"Prompt type set to {'POSITIVE' if positive else 'NEGATIVE'}")
+
     def on_prompt_type_positive_clicked(self, checked=False):
-        """
-        Called when user presses the "Positive" prompt button.
-        """
-        # Update UI
-        self.current_prompt_type_positive = True
-        self.ui.pbPromptTypePositive.setStyleSheet(self.selected_style)
-        self.ui.pbPromptTypeNegative.setStyleSheet(self.unselected_style)
-        self.ui.pbPromptTypePositive.setChecked(True)
-        self.ui.pbPromptTypeNegative.setChecked(False)
-        self._update_prompt_cursor()  # recolour the active tool's cursor green
-        self._retarget_scribble_if_active()  # re-point an active scribble at fg (green)
-        debug_print("Prompt type set to POSITIVE")
+        self._set_polarity(True)
 
     def on_prompt_type_negative_clicked(self, checked=False):
-        """
-        Called when user presses the "Negative" prompt button.
-        """
-
-        # Update UI
-        self.current_prompt_type_positive = False
-        self.ui.pbPromptTypePositive.setStyleSheet(self.unselected_style)
-        self.ui.pbPromptTypeNegative.setStyleSheet(self.selected_style)
-        self.ui.pbPromptTypePositive.setChecked(False)
-        self.ui.pbPromptTypeNegative.setChecked(True)
-        self._update_prompt_cursor()  # recolour the active tool's cursor red
-        self._retarget_scribble_if_active()  # re-point an active scribble at bg (red)
-        debug_print("Prompt type set to NEGATIVE")
+        self._set_polarity(False)
 
     def toggle_prompt_type(self, checked=False):
         """
@@ -5376,11 +5004,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # The 'T' shortcut bypasses the disabled buttons, so enforce mandatory init here.
         if not self._require_initialized():
             return
-        debug_print("Toggling prompt type (positive <> negative)")
-        if self.current_prompt_type_positive:
-            self.on_prompt_type_negative_clicked()
-        else:
-            self.on_prompt_type_positive_clicked()
+        self._set_polarity(not self.is_positive)
 
 
 ###############################################################################

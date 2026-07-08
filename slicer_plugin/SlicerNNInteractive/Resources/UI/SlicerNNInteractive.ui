@@ -243,28 +243,6 @@
                   </property>
                  </widget>
                 </item>
-                <item>
-                 <widget class="QPushButton" name="pbInteractionLassoCancel">
-                  <property name="enabled">
-                   <bool>true</bool>
-                  </property>
-                  <property name="minimumSize">
-                   <size>
-                    <width>0</width>
-                    <height>30</height>
-                   </size>
-                  </property>
-                  <property name="visible">
-                   <bool>true</bool>
-                  </property>
-                  <property name="toolTip">
-                   <string>Remove all placed points.</string>
-                  </property>
-                  <property name="text">
-                   <string>Clear</string>
-                  </property>
-                 </widget>
-                </item>
                </layout>
               </item>
              </layout>
@@ -295,49 +273,6 @@
          <string>Configuration</string>
         </attribute>
         <layout class="QVBoxLayout" name="verticalLayout_10">
-         <item>
-          <widget class="QGroupBox" name="serverGroup">
-           <property name="title">
-            <string>Server Settings</string>
-           </property>
-           <layout class="QVBoxLayout" name="verticalLayout_5">
-            <item>
-             <layout class="QHBoxLayout" name="horizontalLayout_server">
-              <item>
-               <widget class="QLabel" name="label">
-                <property name="text">
-                 <string>Server URL:</string>
-                </property>
-               </widget>
-              </item>
-              <item>
-               <widget class="QLineEdit" name="Server">
-                <property name="text">
-                 <string>http://localhost:1527</string>
-                </property>
-               </widget>
-              </item>
-             </layout>
-            </item>
-           </layout>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="pbTestServer">
-           <property name="minimumSize">
-            <size>
-             <width>0</width>
-             <height>30</height>
-            </size>
-           </property>
-           <property name="toolTip">
-            <string>Test if the the server is reachable.</string>
-           </property>
-           <property name="text">
-            <string>Test Connection</string>
-           </property>
-          </widget>
-         </item>
          <item>
           <spacer name="verticalSpacer">
            <property name="orientation">

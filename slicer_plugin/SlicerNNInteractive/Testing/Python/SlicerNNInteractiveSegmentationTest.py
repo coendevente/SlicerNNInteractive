@@ -170,10 +170,10 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
                             interaction["point_two"],
                             interaction["positive"],
                         )
-                    elif interaction["kind"] == "scribble":
-                        mask = self._trigger_scribble_prompt(widget, interaction)
-                    elif interaction["kind"] == "lasso":
-                        mask = self._trigger_lasso_prompt(widget, interaction)
+                    elif interaction["kind"] in ("scribble", "lasso"):
+                        mask = self._trigger_mask_prompt(
+                            widget, interaction, interaction["kind"]
+                        )
                     else:
                         self.fail(f"Unsupported interaction kind '{interaction['kind']}'.")
                 if self.generate_mode:
@@ -222,7 +222,6 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             settings.setValue("SlicerNNInteractive/mode", "remote")
             settings.setValue("SlicerNNInteractive/server", server_override.rstrip("/"))
             widget.server = server_override.rstrip("/")
-            widget.ui.Server.setText(widget.server)
         else:
             settings.setValue("SlicerNNInteractive/mode", "local")
 
@@ -239,59 +238,53 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
         if not widget.sync_image_to_session():
             self.fail("Failed to set the test image on the nnInteractive session.")
 
-    def _trigger_point_prompt(self, widget, ijk, positive=True):
-        dims = widget.get_image_data().shape  # (k, j, i)
-        clamped = [
-            int(np.clip(ijk[0], 0, dims[2] - 1)),
-            int(np.clip(ijk[1], 0, dims[1] - 1)),
-            int(np.clip(ijk[2], 0, dims[0] - 1)),
+    @staticmethod
+    def _clamp_ijk(pt, dims):
+        """Clamp an (i, j, k) point to the volume; ``dims`` is the (k, j, i) shape."""
+        return [
+            int(np.clip(pt[0], 0, dims[2] - 1)),
+            int(np.clip(pt[1], 0, dims[1] - 1)),
+            int(np.clip(pt[2], 0, dims[0] - 1)),
         ]
-        widget.point_prompt(xyz=clamped, positive_click=positive)
+
+    @staticmethod
+    def _current_segment_mask(widget):
+        """Read back the selected segment's binary labelmap after a prompt."""
         slicer.app.processEvents()
         segmentation_node, segment_id = widget.get_selected_segmentation_node_and_segment_id()
         labelmap = slicer.util.arrayFromSegmentBinaryLabelmap(
             segmentation_node, segment_id, widget.get_volume_node()
         )
         return labelmap.astype(np.uint8)
+
+    def _trigger_point_prompt(self, widget, ijk, positive=True):
+        dims = widget.get_image_data().shape  # (k, j, i)
+        widget.point_prompt(xyz=self._clamp_ijk(ijk, dims), positive_click=positive)
+        return self._current_segment_mask(widget)
 
     def _trigger_bbox_prompt(self, widget, point_one, point_two, positive=True):
         dims = widget.get_image_data().shape
-
-        def clamp(pt):
-            return [
-                int(np.clip(pt[0], 0, dims[2] - 1)),
-                int(np.clip(pt[1], 0, dims[1] - 1)),
-                int(np.clip(pt[2], 0, dims[0] - 1)),
-            ]
-
         widget.bbox_prompt(
-            outer_point_one=clamp(point_one),
-            outer_point_two=clamp(point_two),
+            outer_point_one=self._clamp_ijk(point_one, dims),
+            outer_point_two=self._clamp_ijk(point_two, dims),
             positive_click=positive,
         )
-        slicer.app.processEvents()
-        segmentation_node, segment_id = widget.get_selected_segmentation_node_and_segment_id()
-        labelmap = slicer.util.arrayFromSegmentBinaryLabelmap(
-            segmentation_node, segment_id, widget.get_volume_node()
-        )
-        return labelmap.astype(np.uint8)
+        return self._current_segment_mask(widget)
 
-    def _trigger_scribble_prompt(self, widget, interaction):
-        mask = self._build_scribble_mask(widget, interaction)
-        self._save_scribble_mask(interaction["mask_name"], mask)
+    def _trigger_mask_prompt(self, widget, interaction, tp):
+        """Send a scribble or lasso ('tp') mask prompt and read back the result."""
+        build = self._build_scribble_mask if tp == "scribble" else self._build_lasso_mask
+        mask = build(widget, interaction)
+        if interaction["mask_name"]:
+            self._write_mask(self._prompt_mask_path(tp, interaction["mask_name"]), mask)
         crop, bbox = widget._mask_to_crop(mask)
         widget.lasso_or_scribble_prompt(
             crop=crop,
             interaction_bbox=bbox,
             positive_click=interaction["positive"],
-            tp="scribble",
+            tp=tp,
         )
-        slicer.app.processEvents()
-        segmentation_node, segment_id = widget.get_selected_segmentation_node_and_segment_id()
-        labelmap = slicer.util.arrayFromSegmentBinaryLabelmap(
-            segmentation_node, segment_id, widget.get_volume_node()
-        )
-        return labelmap.astype(np.uint8)
+        return self._current_segment_mask(widget)
 
     def _build_scribble_mask(self, widget, interaction):
         dims = widget.get_image_data().shape  # (k, j, i)
@@ -345,33 +338,14 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
 
         return mask
 
-    def _scribble_mask_path(self, mask_name):
-        return self.data_dir / f"MRBrainTumor2_scribble_{mask_name}.nii.gz"
+    def _prompt_mask_path(self, tp, mask_name):
+        return self.data_dir / f"MRBrainTumor2_{tp}_{mask_name}.nii.gz"
 
-    def _save_scribble_mask(self, mask_name, mask):
-        if not mask_name:
-            return
-        path = self._scribble_mask_path(mask_name)
+    @staticmethod
+    def _write_mask(path, mask):
         path.parent.mkdir(parents=True, exist_ok=True)
         image = sitk.GetImageFromArray(mask.astype(np.uint8))
         sitk.WriteImage(image, str(path), useCompression=True)
-
-    def _trigger_lasso_prompt(self, widget, interaction):
-        mask = self._build_lasso_mask(widget, interaction)
-        self._save_lasso_mask(interaction["mask_name"], mask)
-        crop, bbox = widget._mask_to_crop(mask)
-        widget.lasso_or_scribble_prompt(
-            crop=crop,
-            interaction_bbox=bbox,
-            positive_click=interaction["positive"],
-            tp="lasso",
-        )
-        slicer.app.processEvents()
-        segmentation_node, segment_id = widget.get_selected_segmentation_node_and_segment_id()
-        labelmap = slicer.util.arrayFromSegmentBinaryLabelmap(
-            segmentation_node, segment_id, widget.get_volume_node()
-        )
-        return labelmap.astype(np.uint8)
 
     def _build_lasso_mask(self, widget, interaction):
         dims = widget.get_image_data().shape
@@ -429,26 +403,13 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
 
         return mask
 
-    def _lasso_mask_path(self, mask_name):
-        return self.data_dir / f"MRBrainTumor2_lasso_{mask_name}.nii.gz"
-
-    def _save_lasso_mask(self, mask_name, mask):
-        if not mask_name:
-            return
-        path = self._lasso_mask_path(mask_name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        image = sitk.GetImageFromArray(mask.astype(np.uint8))
-        sitk.WriteImage(image, str(path), useCompression=True)
-
     def _reference_path(self, prompt_name):
         out = self.data_dir / f"MRBrainTumor2_point_prompt_{prompt_name}.nii.gz"
         return out
 
     def _store_reference_mask(self, prompt_name, mask):
         path = self._reference_path(prompt_name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        image = sitk.GetImageFromArray(mask.astype(np.uint8))
-        sitk.WriteImage(image, str(path), useCompression=True)
+        self._write_mask(path, mask)
         slicer.util.delayDisplay(
             f"Stored new reference mask for '{prompt_name}' at {path}. Inspect visually, then rerun without SLICER_NNI_GENERATE_TEST_MASK."
         )
@@ -465,25 +426,10 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
 
     def _verify_mask(self, reference_mask, result_mask, prompt_name, save_debug=False):
         if save_debug:
-            # Write masks as sitk for debug
-            reference_mask_sitk = sitk.GetImageFromArray(reference_mask.astype(np.uint8))
-            result_mask_sitk = sitk.GetImageFromArray(result_mask.astype(np.uint8))
             debug_dir = self.test_dir / "DebugMasks"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            sitk.WriteImage(
-                reference_mask_sitk,
-                str(debug_dir / f"reference_mask_{prompt_name}.nii.gz"),
-                useCompression=True,
-            )
-            sitk.WriteImage(
-                result_mask_sitk,
-                str(debug_dir / f"result_mask_{prompt_name}.nii.gz"),
-                useCompression=True,
-            )
-        
-        self.assertEqual(reference_mask.shape, result_mask.shape)
-        self.assertGreater(result_mask.sum(), 0)
-        
+            self._write_mask(debug_dir / f"reference_mask_{prompt_name}.nii.gz", reference_mask)
+            self._write_mask(debug_dir / f"result_mask_{prompt_name}.nii.gz", result_mask)
+
         def get_dice():
             reference_mask_bool = reference_mask.astype(bool)
             result_mask_bool = result_mask.astype(bool)
@@ -516,42 +462,6 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             print(f"[FAIL] {prompt_name}")
             raise
         print(f"[PASS] {prompt_name}")
-
-    def _describe_prompt_sequence(self, prompt_sequence):
-        if not prompt_sequence:
-            return "no interactions"
-
-        def as_list(value):
-            if isinstance(value, np.ndarray):
-                return value.astype(float).tolist()
-            if isinstance(value, (list, tuple)):
-                return list(value)
-            return [value]
-
-        descriptions = []
-        for interaction in prompt_sequence:
-            kind = interaction.get("kind", "unknown")
-            positive = interaction.get("positive")
-            sign = ""
-            if positive is not None:
-                sign = "positive" if positive else "negative"
-            extra = ""
-            if kind == "point":
-                coords = as_list(interaction.get("coords", []))
-                extra = f"coords={coords}"
-            elif kind == "bbox":
-                p1 = as_list(interaction.get("point_one", []))
-                p2 = as_list(interaction.get("point_two", []))
-                extra = f"p1={p1}, p2={p2}"
-            elif kind in ("scribble", "lasso"):
-                plane = interaction.get("plane", "?")
-                slice_index = interaction.get("slice", "?")
-                count = len(interaction.get("points", []))
-                extra = f"{plane} slice={slice_index}, points={count}"
-            descriptions.append(
-                f"{kind} {sign}".strip() + (f" ({extra})" if extra else "")
-            )
-        return "; ".join(descriptions)
 
 
 SlicerNNInteractiveTest = SlicerNNInteractiveSegmentationTest
