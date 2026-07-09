@@ -1,3 +1,4 @@
+import contextlib
 import os
 import threading
 import time
@@ -34,6 +35,15 @@ NNINTERACTIVE_VERSION_CEILING = "3.0.0"
 NNINTERACTIVE_PKG = f"nnInteractive<{NNINTERACTIVE_VERSION_CEILING}"
 NNINTERACTIVE_CLIENT_PKG = f"nninteractive-client<{NNINTERACTIVE_VERSION_CEILING}"
 
+# Packages the PLUGIN itself imports directly and therefore must install explicitly
+# with either flavor. Do NOT rely on the backend's dependency tree for these:
+# nnInteractive / nninteractive-client >= 2.5 no longer declare scikit-image, which
+# the freehand lasso needs (skimage.draw.polygon in lasso_points_to_crop). The Full
+# flavor usually still gets it transitively (nnunetv2 keeps scikit-image in its
+# requirements as of 2.8), but the thin client does not, and transitive availability
+# is not a contract we can rely on.
+PLUGIN_DIRECT_DEPS = "scikit-image"
+
 # On Windows, PyPI's default ``pip install torch`` is a CPU-only wheel, so local GPU
 # inference would silently fall back to CPU. Point pip at PyTorch's CUDA wheel index
 # instead. The SlicerPyTorch extension (PyTorchUtils) is still preferred when
@@ -47,12 +57,76 @@ README_COMMON_ISSUES_URL = (
     "https://git.dkfz.de/mic/personal/group2/isensee/slicernninteractive#common-issues"
 )
 
+# Marker for an install interrupted by the restart the PyTorch extension requires.
+# Written BEFORE that extension is installed (accepting the restart offered by
+# Slicer's dialog restarts the app immediately, so there is no later chance), and
+# consumed by _resolve_install_on_startup after the restart to continue the install
+# without re-asking the user.
+PENDING_INSTALL_SETTINGS_KEY = "SlicerNNInteractive/pending_install"
+
+
+def get_pending_install_flavor():
+    """'full' when a Full install was interrupted by the restart the PyTorch
+    extension requires, else ''. Only Full ever sets the marker -- the client
+    flavor never needs that restart."""
+    flavor = slicer.util.settingsValue(PENDING_INSTALL_SETTINGS_KEY, "")
+    return flavor if flavor == "full" else ""
+
+
+def set_pending_install_flavor(flavor):
+    settings = qt.QSettings()
+    settings.setValue(PENDING_INSTALL_SETTINGS_KEY, flavor)
+    settings.sync()  # the PyTorch-extension install may restart Slicer immediately
+
+
+def reopen_module_for_pending_install():
+    """startupCompleted() hook: if an install is waiting on the restart that just
+    happened, reopen the module so its startup resolver continues the install
+    automatically. No-op on every normal launch."""
+    if not get_pending_install_flavor():
+        return
+    if importlib.util.find_spec("PyTorchUtils") is None:
+        # The restart did not activate the PyTorch extension (install failed or is
+        # still pending another restart). Leave the marker for a later restart
+        # rather than continuing with a degraded plain-pip torch.
+        return
+    qt.QTimer.singleShot(0, lambda: slicer.util.selectModule("SlicerNNInteractive"))
+
+
+def torch_compile_unsupported_reason():
+    """Why torch.compile can't be used here, or None if it can.
+
+    Two hard blockers:
+    * Windows -- torch.compile (Triton/inductor) is not supported on Windows at all.
+    * Elsewhere it compiles small C/CUDA helpers at runtime, which need the Python
+      development headers (Python.h). Slicer's bundled Python does not ship them.
+
+    In either case torch.compile would fail on the first prediction, so we detect it
+    up front and run eager instead.
+    """
+    import sys
+    import sysconfig
+
+    if sys.platform.startswith("win"):
+        return "torch.compile is not supported on Windows."
+
+    include_dir = sysconfig.get_paths().get("include")
+    if not (include_dir and os.path.isfile(os.path.join(include_dir, "Python.h"))):
+        return (
+            "torch.compile needs the Python development headers (Python.h), "
+            "which are not present in this Python build."
+        )
+    return None
+
+
 # The single authoritative default for every QSettings-backed setting. The config UI
 # and the session constructors both read through get_setting_bool/get_setting_str, so
 # a checkbox can never initialize differently from what the session actually uses.
 SETTING_DEFAULTS = {
     "autozoom": True,
-    "use_torch_compile": False,
+    # On wherever the automated check says it can work; users who explicitly toggled
+    # the checkbox keep their stored choice.
+    "use_torch_compile": torch_compile_unsupported_reason() is None,
     "interactions_storage": "auto",
     "device": "cuda:0",
     "checkpoint_path": "",
@@ -134,6 +208,11 @@ class SlicerNNInteractive(ScriptedLoadableModule):
             Read more about this plugin here: https://git.dkfz.de/mic/personal/group2/isensee/slicernninteractive.
             """
         self.parent.acknowledgementText = """When using SlicerNNInteractive, please cite as described here: https://github.com/coendevente/SlicerNNInteractive?tab=readme-ov-file#citation."""
+
+        # Resume an install interrupted by the PyTorch-extension restart (see
+        # PENDING_INSTALL_SETTINGS_KEY). Connected on every launch; a no-op unless
+        # the marker is set AND the extension actually activated.
+        slicer.app.connect("startupCompleted()", reopen_module_for_pending_install)
 
 
 ###############################################################################
@@ -301,6 +380,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.segment_editor_node = slicer.mrmlScene.AddNode(self.segment_editor_node)
         self.ui.editor_widget.setMRMLSegmentEditorNode(self.segment_editor_node)
         self.ui.editor_widget.setSegmentationNode(self.get_segmentation_node())
+
+        # Surface the 'E' hotkey on the Segment Editor's own Add button: adding a
+        # segment there auto-selects it, which resets the prompts just like 'Next
+        # segment (E)', so the two are equivalent for the user. AddSegmentButton is
+        # internal to qMRMLSegmentEditorWidget -- if a future Slicer renames it, skip
+        # the label rather than break module setup.
+        try:
+            add_button = slicer.util.findChild(self.ui.editor_widget, "AddSegmentButton")
+            add_button.setText(f"{add_button.text} (E)")
+            add_button.setToolTip(f"{add_button.toolTip}\nKeyboard shortcut: E")
+        except Exception as exc:  # noqa: BLE001 - cosmetic only
+            debug_print(f"Could not add the hotkey label to the Add segment button: {exc}")
 
         # Set up style sheets for selected/unselected buttons
         self.selected_style = "background-color: #3498db; color: white"
@@ -529,7 +620,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.compileCheck.toggled.connect(
             lambda v: self._save_setting_bool("use_torch_compile", v, reinit=True)
         )
-        compile_reason = self._torch_compile_unsupported_reason()
+        compile_reason = torch_compile_unsupported_reason()
         if compile_reason is not None:
             # torch.compile can't work here (Windows, or no Python.h to build its runtime
             # helpers -- typical in Slicer's bundled Python). Disable the option so the
@@ -699,6 +790,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         in Local mode)."""
         return self._local_inference_available() and self._model_management_available()
 
+    def _plugin_direct_deps_available(self):
+        """True if the packages the plugin itself imports (PLUGIN_DIRECT_DEPS --
+        currently scikit-image, needed by the freehand lasso) are importable.
+
+        The installer adds them with both flavors, but environments installed or
+        updated OUTSIDE the plugin can lack them (the backend no longer declares
+        scikit-image). Checked at startup so such an environment gets the update
+        offer instead of reporting healthy and failing on the first lasso stroke.
+        """
+        return importlib.util.find_spec("skimage") is not None
+
     def _apply_local_mode_availability(self):
         """Gate Local mode on whether the full backend is installed.
 
@@ -749,8 +851,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Adds, at the very top of the Prompts tab (the view the user actually works in),
         a mandatory Initialize/Uninitialize control with a combined status + model-license
-        readout. The Helmholtz Imaging + DKFZ acknowledgement logos go at the very bottom
-        of the module panel, below the Segment Editor.
+        readout. The Helmholtz Imaging + DKFZ acknowledgement logos go at the bottom.
 
         Initialization is mandatory before any prompt can be placed: it loads the local
         model (and runs the torch.compile / cuDNN warmup) or connects to the remote
@@ -801,12 +902,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         layout.insertWidget(0, init_group)
 
-        # Acknowledgement logos go at the very bottom of the module panel (below the
-        # Segment Editor), not inside the Prompts tab, so they never push the working
-        # controls around and stay visible in both tabs.
         logos = self._build_logos_widget(height=26)
         if logos is not None:
-            self.ui.segmentationGroup.parentWidget().layout().addWidget(logos)
+            layout.addWidget(logos)
 
         # Reflect the current (idle) session state on the freshly created button.
         self.update_connect_status(connected=self.session is not None)
@@ -899,6 +997,45 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 shortcut.deleteLater()
                 shortcut = None
 
+    @contextlib.contextmanager
+    def _busy_dialog(self, message):
+        """Indeterminate busy dialog for MAIN-thread blocking work (shared by the pip
+        installers and the local model load).
+
+        Showing a window is an asynchronous round trip through the window server, and
+        once the caller blocks the main thread nothing repaints -- whatever was
+        composited last would stay on screen (isVisible() flips true before
+        compositing, so it is NOT a paint signal). So before yielding, pump the event
+        loop until the window reports its real expose (windowHandle().isExposed()),
+        with a hard cap for slow/remote displays and a fixed 200 ms fallback when the
+        binding doesn't offer the signal. The close is pumped out on exit for the
+        same reason.
+        """
+        progress = slicer.util.createProgressDialog(
+            parent=slicer.util.mainWindow(),
+            maximum=0,  # indeterminate / busy
+            labelText=message,
+            windowTitle="nnInteractive",
+        )
+        progress.show()
+        start = time.time()
+        while time.time() - start < 1.0:
+            slicer.app.processEvents()
+            try:
+                handle = progress.windowHandle()
+                exposed = handle is not None and handle.isExposed()
+            except Exception:  # noqa: BLE001 - PythonQt/platform differences
+                exposed = None
+            if exposed or (exposed is None and time.time() - start >= 0.2):
+                break
+            time.sleep(0.02)
+        slicer.app.processEvents()  # one more pass so the label paint lands
+        try:
+            yield progress
+        finally:
+            progress.close()
+            slicer.app.processEvents()
+
     def _pip_install(self, command, message):
         """
         Install pip package(s) on the MAIN thread.
@@ -911,21 +1048,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         (_install_full / _install_client).
         """
         self._last_pip_error = None
-        progress = slicer.util.createProgressDialog(
-            parent=slicer.util.mainWindow(),
-            maximum=0,  # indeterminate / busy
-            labelText=message,
-            windowTitle="nnInteractive",
-        )
-        slicer.app.processEvents()
-        try:
-            slicer.util.pip_install(command)
-        except Exception as exc:  # noqa: BLE001
-            self._last_pip_error = exc
-            debug_print(f"pip install '{command}' failed: {exc}")
-        finally:
-            progress.close()
-            slicer.app.processEvents()
+        with self._busy_dialog(message):
+            try:
+                slicer.util.pip_install(command)
+            except Exception as exc:  # noqa: BLE001
+                self._last_pip_error = exc
+                debug_print(f"pip install '{command}' failed: {exc}")
 
     def _pip_uninstall(self, command, message):
         """pip-uninstall package(s) on the MAIN thread, with a busy dialog (mirrors
@@ -933,21 +1061,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         dependencies. Failures are recorded in ``self._last_pip_error``; the subsequent
         install (which resets that flag) is the source of truth for success."""
         self._last_pip_error = None
-        progress = slicer.util.createProgressDialog(
-            parent=slicer.util.mainWindow(),
-            maximum=0,  # indeterminate / busy
-            labelText=message,
-            windowTitle="nnInteractive",
-        )
-        slicer.app.processEvents()
-        try:
-            slicer.util.pip_uninstall(command)
-        except Exception as exc:  # noqa: BLE001
-            self._last_pip_error = exc
-            debug_print(f"pip uninstall '{command}' failed: {exc}")
-        finally:
-            progress.close()
-            slicer.app.processEvents()
+        with self._busy_dialog(message):
+            try:
+                slicer.util.pip_uninstall(command)
+            except Exception as exc:  # noqa: BLE001
+                self._last_pip_error = exc
+                debug_print(f"pip uninstall '{command}' failed: {exc}")
 
     def run_with_progress_bar(self, target, args, title):
         """
@@ -976,6 +1095,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         dep_thread.join()
 
         self.progressbar.close()
+        # Make sure the close is actually rendered before the caller potentially
+        # blocks the main thread (e.g. the model load right after the weights
+        # download) -- otherwise this dialog lingers frozen on screen.
+        slicer.app.processEvents()
 
     def _run_thread_with_message(self, target, args, message):
         """Run ``target(*args, done_event)`` in a worker thread while showing a simple
@@ -2469,14 +2592,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._lasso_overlay_remove()
             return
 
-        xy_to_ras = slice_node.GetXYToRAS()
-        to_ijk = self._ras_to_ijk_converter()  # hoisted: one setup for the whole contour
-        xyzs = []
-        for (x, y) in pts:
-            ras = xy_to_ras.MultiplyPoint([x, y, 0.0, 1.0])
-            xyzs.append(to_ijk([ras[0], ras[1], ras[2]]))
-
         try:
+            xy_to_ras = slice_node.GetXYToRAS()
+            to_ijk = self._ras_to_ijk_converter()  # hoisted: one setup for the contour
+            xyzs = []
+            for (x, y) in pts:
+                ras = xy_to_ras.MultiplyPoint([x, y, 0.0, 1.0])
+                xyzs.append(to_ijk([ras[0], ras[1], ras[2]]))
             crop, bbox = self.lasso_points_to_crop(xyzs)
         except ValueError:
             # No single constant slice axis (e.g. an oblique reformat); ignore.
@@ -2484,6 +2606,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             slicer.util.showStatusMessage(
                 "Lasso must be drawn on an axial, sagittal or coronal slice.", 3000
             )
+            return
+        except Exception as exc:  # noqa: BLE001
+            # Any other failure must still drop the display-space outline (it does not
+            # track pan/zoom, so a stranded one sticks to the view) and must be shown
+            # to the user -- e.g. a missing scikit-image after a backend update used to
+            # leave a stuck lasso with only a Python-console traceback.
+            self._lasso_overlay_remove()
+            slicer.util.errorDisplay(f"Lasso prompt failed: {exc}")
             return
 
         if crop is None or self.get_volume_node() is None:
@@ -3706,16 +3836,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         The slow, torch-heavy work -- importing torch, initializing the device,
         constructing the session, loading the weights and the warmup forward pass --
-        runs in ONE worker thread behind a single rendered "Loading ..." dialog. This
-        is the bulk of the wait; doing it off the main thread lets the dialog appear
-        immediately and stay painted, and -- with the GIL released during the heavy
-        CUDA/torch work -- keeps loading fast. The worker never touches Qt/MRML; status
-        notes are collected and shown on the main thread afterwards.
+        runs ON THE MAIN THREAD behind a busy dialog (painted once, then frozen while
+        torch works). Main thread ON PURPOSE: prompts run on the main thread and
+        PyTorch's cuDNN benchmark/plan cache is THREAD-LOCAL, so a worker-thread
+        warmup leaves the first main-thread prediction ~1.1 s slower while cuDNN
+        re-benchmarks every conv (measured on an RTX 4090: 1.28 s vs 0.14 s steady
+        state). Loading here keeps every cache on the thread that predicts. The wait
+        is bounded: ~4.6 s with a warm torch.compile cache, ~15 s on the first-ever
+        run (cold inductor cache), less with compile off.
 
-        The main-thread-only step runs first: downloading the weights (its own progress
-        dialog). Dependencies are NOT installed here -- ensure_session() has already
-        verified the full backend is installed (installs happen only from the explicit
-        install popup / the Configuration tab's Reinstall button).
+        The weights download runs first (its own progress dialog). Dependencies are
+        NOT installed here -- ensure_session() has already verified the full backend
+        is installed (installs happen only from the explicit install popup / the
+        Configuration tab's Reinstall button).
         """
         checkpoint_path = self.get_checkpoint_path()  # downloads weights if needed
 
@@ -3731,61 +3864,82 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         requested_device = self.get_local_device()
         want_autozoom = self.get_setting_bool("autozoom")
         want_compile = self.get_setting_bool("use_torch_compile")
-        compile_reason = self._torch_compile_unsupported_reason()
+        compile_reason = torch_compile_unsupported_reason()
         storage = self.get_setting_str("interactions_storage")
 
-        notes = {}
+        use_compile = want_compile
+        no_compile_reason = None
+        if use_compile and compile_reason is not None:
+            # torch.compile can't run here (Windows, or no Python.h to build its
+            # runtime helpers); it would fail on the first prediction. Fall back
+            # to eager execution and report why below.
+            use_compile = False
+            no_compile_reason = compile_reason
+            print(f"[nnInteractive] {compile_reason} Running without torch.compile.")
 
-        def _load_worker(done_event):
+        def _build_session(with_compile):
+            import torch
+            from nnInteractive.inference.inference_session import (
+                nnInteractiveInferenceSession,
+            )
+
+            if torch.cuda.is_available():
+                device = torch.device(requested_device)
+                on_cpu = False
+            else:
+                print("[nnInteractive] No CUDA GPU detected - running on CPU (slow).")
+                device = torch.device("cpu")
+                on_cpu = True
+
+            session = nnInteractiveInferenceSession(
+                device=device,
+                use_torch_compile=with_compile,
+                torch_n_threads=os.cpu_count(),
+                verbose=False,
+                # Honoured regardless of device: auto-zoom on CPU is slower but the
+                # user's choice is respected there too.
+                do_autozoom=want_autozoom,
+                interactions_storage=storage,
+            )
+            # Load the weights. initialize_from_trained_model_folder() runs the warmup
+            # forward pass internally (torch.compile compilation + cuDNN autotuning);
+            # because this is the main thread, the thread-local cuDNN plan cache is
+            # warmed for the very thread prompts run on (see the docstring above).
+            # Do NOT call warmup() again -- it would run twice.
+            session.initialize_from_trained_model_folder(
+                checkpoint_path, 0, "checkpoint_final.pth"
+            )
+            return session, on_cpu
+
+        session = None
+        on_cpu = False
+        load_error = None
+        with self._busy_dialog(
+            "Initializing nnInteractive: loading the model and warming it up.\n"
+            "This takes a few seconds -- or a few minutes on first use."
+        ):
             try:
-                import torch
-                from nnInteractive.inference.inference_session import (
-                    nnInteractiveInferenceSession,
-                )
-
-                if torch.cuda.is_available():
-                    device = torch.device(requested_device)
+                session, on_cpu = _build_session(use_compile)
+            except ImportError as exc:
+                load_error = exc
+            except Exception as exc:  # noqa: BLE001
+                if use_compile:
+                    # torch_compile_unsupported_reason() only proves the headers
+                    # exist, not that the inductor/triton toolchain actually works.
+                    # Never leave the user blocked by a broken compile stack: retry
+                    # once in eager mode (also reloads the weights; acceptable for
+                    # this failure path).
+                    print(
+                        f"[nnInteractive] torch.compile initialization failed ({exc}); "
+                        "retrying without torch.compile."
+                    )
+                    no_compile_reason = "torch.compile failed at initialization."
+                    try:
+                        session, on_cpu = _build_session(False)
+                    except Exception as exc2:  # noqa: BLE001
+                        load_error = exc2
                 else:
-                    print("[nnInteractive] No CUDA GPU detected - running on CPU (slow).")
-                    notes["cpu"] = True
-                    device = torch.device("cpu")
-
-                use_torch_compile = want_compile
-                if use_torch_compile and compile_reason is not None:
-                    # torch.compile can't run here (Windows, or no Python.h to build its
-                    # runtime helpers); it would fail on the first prediction. Fall back
-                    # to eager execution and report why on the main thread.
-                    use_torch_compile = False
-                    print(f"[nnInteractive] {compile_reason} Running without torch.compile.")
-                    notes["no_compile"] = compile_reason
-
-                session = nnInteractiveInferenceSession(
-                    device=device,
-                    use_torch_compile=use_torch_compile,
-                    torch_n_threads=os.cpu_count(),
-                    verbose=False,
-                    # Honoured regardless of device: auto-zoom on CPU is slower but the
-                    # user's choice is respected there too.
-                    do_autozoom=want_autozoom,
-                    interactions_storage=storage,
-                )
-                # Load the weights. initialize_from_trained_model_folder() already runs a
-                # warmup forward pass internally, so Initialize gets the model fully ready
-                # (cuDNN autotuning, CUDA kernel init, torch.compile compilation) instead
-                # of paying that first-forward cost on the user's first prompt -- we must
-                # NOT call warmup() again here or it runs twice.
-                session.initialize_from_trained_model_folder(
-                    checkpoint_path, 0, "checkpoint_final.pth"
-                )
-                notes["session"] = session
-            except BaseException as exc:  # noqa: BLE001 - surfaced on the main thread
-                self._local_load_error = exc
-            finally:
-                done_event.set()
-
-        message = "Loading the nnInteractive model ..."
-        self._local_load_error = None
-        self._run_thread_with_message(_load_worker, (), message)
+                    load_error = exc
 
         # No lazy repair: if the import failed, surface a clear message rather than
         # silently reinstalling. ALWAYS include the underlying error -- an ImportError
@@ -3793,12 +3947,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # the package is on disk) but a torch/torchvision/numpy the user changed
         # themselves that now fails to import. Hiding the reason sends them uselessly to
         # Reinstall, which does not touch torch and cannot fix it.
-        if isinstance(self._local_load_error, ImportError):
-            cause = self._local_load_error
+        if isinstance(load_error, ImportError):
             raise RuntimeError(
                 "The local nnInteractive backend could not be imported. The underlying "
                 "error was:\n\n"
-                f"    {type(cause).__name__}: {cause}\n\n"
+                f"    {type(load_error).__name__}: {load_error}\n\n"
                 "If this mentions torch, torchvision or numpy, a Python package in "
                 "Slicer's environment (often one you installed manually) is broken or "
                 "mismatched -- fix or uninstall that package. Note that 'Reinstall / "
@@ -3806,52 +3959,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "Otherwise the nnInteractive install may be incomplete: open the "
                 "Configuration tab, click 'Reinstall / Update nnInteractive' (choose "
                 "Full), then restart Slicer."
-            ) from cause
+            ) from load_error
+        if load_error is not None:
+            raise load_error
 
-        if self._local_load_error is not None:
-            err, self._local_load_error = self._local_load_error, None
-            raise err
-
-        # Surface notes collected in the worker, now back on the main thread. The CPU
-        # fallback also drives a persistent red warning below Initialize (the transient
-        # status message alone is easy to miss); see _update_device_warning().
-        self._local_running_on_cpu = bool(notes.get("cpu"))
-        if notes.get("cpu"):
+        # The CPU fallback also drives a persistent red warning below Initialize (the
+        # transient status message alone is easy to miss); see _update_device_warning().
+        self._local_running_on_cpu = on_cpu
+        if on_cpu:
             slicer.util.showStatusMessage(
                 "No CUDA GPU detected - running nnInteractive on CPU (slow).", 5000
             )
-        elif notes.get("no_compile"):
+        elif no_compile_reason:
             slicer.util.showStatusMessage(
-                f"{notes['no_compile']} Running without torch.compile.", 6000
+                f"{no_compile_reason} Running without torch.compile.", 6000
             )
         slicer.util.showStatusMessage(f"nnInteractive model: {model_desc}", 5000)
-        return notes["session"]
-
-    @staticmethod
-    def _torch_compile_unsupported_reason():
-        """Why torch.compile can't be used here, or None if it can.
-
-        Two hard blockers:
-        * Windows -- torch.compile (Triton/inductor) is not supported on Windows at all.
-        * Elsewhere it compiles small C/CUDA helpers at runtime, which need the Python
-          development headers (Python.h). Slicer's bundled Python does not ship them.
-
-        In either case torch.compile would fail on the first prediction, so we detect it
-        up front and run eager instead.
-        """
-        import sys
-        import sysconfig
-
-        if sys.platform.startswith("win"):
-            return "torch.compile is not supported on Windows."
-
-        include_dir = sysconfig.get_paths().get("include")
-        if not (include_dir and os.path.isfile(os.path.join(include_dir, "Python.h"))):
-            return (
-                "torch.compile needs the Python development headers (Python.h), "
-                "which are not present in this Python build."
-            )
-        return None
+        return session
 
     def _construct_remote_session(self):
         """Connect to an official nninteractive-server (remote compute).
@@ -4356,7 +4480,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         All MRML access (image / segment extraction) happens on the main thread first;
         only the network/compute calls on ``self.session`` run in the worker behind the
-        wait dialog (_run_session_upload) -- it never touches Qt or MRML.
+        wait dialog (_run_session_upload) -- it never touches Qt or MRML. (Safe for the
+        thread-local cuDNN caches: nothing in the worker runs a network forward pass.)
         """
         if self.session is None:
             return
@@ -4470,12 +4595,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Prefer Slicer's PyTorch extension (PyTorchUtils): it installs a build matched
         # to the GPU driver via light-the-torch on every platform (including the correct
         # CUDA wheel on Windows). _ensure_pytorch_extension (run at install-choice time)
-        # installs the extension when missing; askConfirmation=False because the user
-        # already confirmed the Full install in our own dialog.
+        # installs the extension when missing. NOT via PyTorchUtilsLogic.installTorch:
+        # that blocks Slicer's main thread through the multi-GB torch download with no
+        # output (pip disables progress bars without a tty), freezing the whole UI --
+        # _install_torch_with_pytorch_utils runs the same command responsively.
         try:
-            import PyTorchUtils
+            import PyTorchUtils  # noqa: F401
 
-            PyTorchUtils.PyTorchUtilsLogic().installTorch(askConfirmation=False)
+            if self._install_torch_with_pytorch_utils():
+                return
             if importlib.util.find_spec("torch") is not None:
                 return
         except Exception:  # noqa: BLE001
@@ -4489,7 +4617,104 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             command = f"torch --index-url {DEFAULT_WINDOWS_TORCH_INDEX_URL}"
         else:
             command = "torch"
-        self._pip_install(command, "Installing PyTorch (this can take a while)...")
+        self._pip_install(
+            command,
+            "Installing PyTorch (several GB; Slicer may be unresponsive while the "
+            "wheel downloads)...",
+        )
+
+    def _install_torch_with_pytorch_utils(self):
+        """Install a GPU-matched torch via the PyTorch extension's light-the-torch,
+        keeping the UI alive. Returns True when torch is importable afterwards.
+
+        PyTorchUtilsLogic.installTorch runs light-the-torch as a blocking subprocess
+        on Slicer's main thread, and pip prints nothing while it downloads the
+        multi-GB torch wheel (progress bars are disabled without a tty) -- so Slicer
+        freezes for minutes with no feedback. Instead, resolve the install command
+        through PyTorchUtils (same Slicer light-the-torch fork, same platform pins),
+        then run it in a plain subprocess from a worker thread while a pumped
+        please-wait dialog keeps the UI responsive (_run_thread_with_message).
+        """
+        import shutil
+        import subprocess
+
+        import PyTorchUtils
+
+        logic_cls = PyTorchUtils.PyTorchUtilsLogic
+        # light-the-torch itself is a tiny package: installing it through the regular
+        # main-thread pip path is quick, and reusing the extension's helper keeps its
+        # choice of the Slicer fork (maintained for newer CUDA versions).
+        try:
+            import light_the_torch._patch  # noqa: F401
+        except Exception:  # noqa: BLE001
+            logic_cls._installLightTheTorch()
+        try:
+            # Private but stable helper; carries the macOS torch/torchvision/numpy pins.
+            args = logic_cls._getPipInstallArguments()
+        except Exception:  # noqa: BLE001
+            # Private API drifted (extension update). Mirror PyTorchUtils' macOS pins
+            # so the fallback doesn't silently install an incompatible combination
+            # (Rosetta needs torch>=2.1.2; PyPI's macOS torch requires numpy<2), and
+            # say so in the console rather than only in debug output.
+            import sys
+
+            print(
+                "[nnInteractive] PyTorchUtils' install-arguments helper is "
+                "unavailable (extension API changed?); using generic light-the-torch "
+                "arguments."
+            )
+            if sys.platform == "darwin":
+                args = ["install", "torch>=2.1.2", "torchvision>=0.16.2", "numpy<2"]
+            else:
+                args = ["install", "torch", "torchvision"]
+
+        python = shutil.which("PythonSlicer")
+        if python is None:
+            # Same lookup slicer.util._executePythonModule performs; without it the
+            # blocking route would fail too. Let the caller use the plain-pip fallback.
+            return False
+
+        result = {}
+
+        def _worker(done_event):
+            # Worker thread: plain subprocess only, NO Qt. Output is collected here
+            # and printed from the main thread afterwards.
+            try:
+                kwargs = {}
+                if os.name == "nt":
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                proc = subprocess.run(
+                    [python, "-m", "light_the_torch", *args],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    **kwargs,
+                )
+                result["returncode"] = proc.returncode
+                result["output"] = proc.stdout or ""
+            except Exception as exc:  # noqa: BLE001
+                result["returncode"] = -1
+                result["output"] = str(exc)
+            finally:
+                done_event.set()
+
+        self._run_thread_with_message(
+            _worker,
+            (),
+            "Downloading and installing PyTorch (several GB).\n"
+            "This can take several minutes depending on your connection...",
+        )
+
+        output = result.get("output", "")
+        if output:
+            print(output)  # same Python-console visibility as slicer.util.pip_install
+        importlib.invalidate_caches()
+        if result.get("returncode") != 0:
+            debug_print(
+                f"light-the-torch install failed (rc={result.get('returncode')})."
+            )
+            return False
+        return importlib.util.find_spec("torch") is not None
 
     def _ensure_pytorch_extension(self):
         """Make PyTorchUtils (Slicer's PyTorch extension) available for a Full install.
@@ -4513,15 +4738,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             if em is None:
                 return True
             if not em.isExtensionInstalled("PyTorch"):
-                # Slicer's own dialog confirms the download and offers the restart;
-                # accepting that restart aborts this flow safely (nothing changed yet).
+                # Record the user's choice BEFORE the extension install: accepting the
+                # restart that Slicer's dialog offers restarts the app immediately, and
+                # the marker is what lets startup resume the install automatically.
+                set_pending_install_flavor("full")
                 if not em.installExtensionFromServer("PyTorch"):
+                    set_pending_install_flavor("")
                     debug_print(
                         "PyTorch extension install failed or was declined; "
                         "falling back to plain-pip torch."
                     )
                     return True
         except Exception as exc:  # noqa: BLE001
+            set_pending_install_flavor("")
             debug_print(f"PyTorch extension unavailable ({exc}); plain-pip torch fallback.")
             return True
         # Extension installed (just now, or earlier without a restart) but PyTorchUtils
@@ -4534,15 +4763,22 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         msg.setText(
             "The PyTorch extension is installed but not active in this Slicer "
             "session yet.\n\n"
-            "Restart Slicer and choose 'Full (local + remote)' again to get a "
-            "PyTorch build matched to your GPU (recommended).\n\n"
+            "Restart Slicer to activate it -- the nnInteractive installation then "
+            "continues automatically, with a PyTorch build matched to your GPU "
+            "(recommended).\n\n"
             "Alternatively, continue now with a generic PyTorch build."
         )
         restart_btn = msg.addButton("I'll restart Slicer", qt.QMessageBox.AcceptRole)
         continue_btn = msg.addButton("Continue anyway", qt.QMessageBox.AcceptRole)
         msg.setDefaultButton(restart_btn)
         msg.exec_()
-        return msg.clickedButton() == continue_btn
+        if msg.clickedButton() == continue_btn:
+            set_pending_install_flavor("")
+            return True
+        # Covers the path where the extension was already installed on entry (marker
+        # not set above) and the user opted to restart.
+        set_pending_install_flavor("full")
+        return False
 
     # ------------------------------------------------------------------ #
     # Explicit install API. These run ONLY from the first-run popup / the
@@ -4558,13 +4794,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         SlicerPyTorch for a CUDA-matched build) so the nnInteractive install finds it
         satisfied and doesn't pull a mismatched wheel. nnInteractive declares its own
         up-to-date requirements, so the single install pulls nnU-Net, huggingface_hub,
-        scikit-image, blosc2, httpx, etc. To install a specific PyTorch build (older CUDA
-        for an old GPU driver, or a pinned version), run pip from Slicer's Python Console
-        -- see the README. Returns True if pip reported success.
+        blosc2, httpx, etc.; PLUGIN_DIRECT_DEPS covers what the plugin imports itself.
+        To install a specific PyTorch build (older CUDA for an old GPU driver, or a
+        pinned version), run pip from Slicer's Python Console -- see the README.
+        Returns True if pip reported success.
         """
         self.ensure_torch_installed()
         self._pip_install(
-            NNINTERACTIVE_PKG,
+            f"{NNINTERACTIVE_PKG} {PLUGIN_DIRECT_DEPS}",
             "Installing nnInteractive (full: local + remote)...",
         )
         if self._last_pip_error is not None:
@@ -4576,10 +4813,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _install_client(self):
         """Install the lightweight, torch-free remote client (capped). The
         'nninteractive-client' distribution declares its own wire-stack requirements
-        (numpy/httpx/blosc2/scikit-image), so the single install pulls everything the
-        remote path needs. Returns True if pip reported success."""
+        (numpy/httpx/blosc2); PLUGIN_DIRECT_DEPS covers what the plugin imports itself.
+        Returns True if pip reported success."""
         self._pip_install(
-            NNINTERACTIVE_CLIENT_PKG,
+            f"{NNINTERACTIVE_CLIENT_PKG} {PLUGIN_DIRECT_DEPS}",
             "Installing nnInteractive client (remote only, no PyTorch)...",
         )
         if self._last_pip_error is not None:
@@ -4623,7 +4860,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         A Full choice first ensures the PyTorch extension is available (its install may
         require a Slicer restart, in which case the flow stops before touching the
-        existing packages -- the user re-picks Full after restarting).
+        existing packages and a pending-install marker makes startup resume the install
+        automatically after the restart -- see _resolve_install_on_startup).
         """
         if self._is_tearing_down() or self._install_prompt_active:
             return
@@ -4658,6 +4896,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         clicked = msg.clickedButton()
         if clicked is None or clicked == cancel_btn:
             return
+        # Any explicit choice supersedes a pending (restart-interrupted) install:
+        # without this, an abandoned Full choice would auto-resume on a later restart
+        # and silently override e.g. an explicitly chosen Client-only install.
+        # _ensure_pytorch_extension re-arms the marker when Full still needs a restart.
+        set_pending_install_flavor("")
         if clicked == full_btn and not self._ensure_pytorch_extension():
             # Restart required to activate the PyTorch extension. Nothing has been
             # uninstalled or installed yet, so the current state is untouched.
@@ -4679,6 +4922,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         session, refresh the toggle / dropdown / install + update readouts, and warn if
         the freshly installed backend isn't importable in this session (restart needed).
         """
+        if ok:
+            # A completed install supersedes any pending restart-interrupted one
+            # (belt to _prompt_install_choice_impl's braces; see
+            # PENDING_INSTALL_SETTINGS_KEY).
+            set_pending_install_flavor("")
         if not ok:
             slicer.util.errorDisplay(
                 "nnInteractive installation failed. See the Python Console for the pip "
@@ -4706,23 +4954,49 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 parent=slicer.util.mainWindow(),
             )
 
+        if ok and new_flavor == "client" and not slicer.util.settingsValue(
+            "SlicerNNInteractive/server", ""
+        ):
+            # A Client-only install can't do anything until a server address is
+            # entered; don't leave the user to discover that on the first prompt.
+            self._show_config_tab_for_server_entry()
+
+    def _show_config_tab_for_server_entry(self):
+        """Open the Configuration tab, explain that a server address is required
+        (a Client-only install is unusable without one), and focus the URL field."""
+        tab_widget = getattr(self.ui, "tabWidget", None)
+        if tab_widget is not None and hasattr(self.ui, "tabConfig"):
+            tab_widget.setCurrentWidget(self.ui.tabConfig)
+        slicer.util.infoDisplay(
+            "The remote client is installed, but no nnInteractive server address is "
+            "configured yet.\n\n"
+            "Enter your server's address (e.g. http://gpu-box:1527) in the Server "
+            "field of the Configuration tab -- plus the API key if the server "
+            "requires one -- then click Initialize in the nnInteractive Prompts tab.",
+            parent=slicer.util.mainWindow(),
+        )
+        edit = getattr(self.ui, "serverUrlEdit", None)
+        if edit is not None:
+            edit.setFocus()
+
     def _offer_backend_update(self):
         """Explain that the installed nnInteractive backend is missing or outdated and
         offer the install/update dialog.
 
-        Fired when the Local workflow needs ``nnInteractive.model_management`` but it
-        isn't importable: the backend predates the module, was lost to a new Slicer
-        Python environment (settings persist across Slicer versions, site-packages
-        don't), or only the client is present while the recorded flavor says Full.
+        Fired when the environment is incomplete for this plugin: the Local workflow
+        needs ``nnInteractive.model_management`` but it isn't importable (backend
+        predates the module, was lost to a new Slicer Python environment, or only the
+        client is present while the recorded flavor says Full), or a plugin-direct
+        dependency is missing (``scikit-image``, see _plugin_direct_deps_available).
         Shown at most once per session, and never on top of an open install dialog.
         """
         if self._offered_backend_update or self._install_prompt_active:
             return
         self._offered_backend_update = True
         if slicer.util.confirmYesNoDisplay(
-            "Local mode needs a newer nnInteractive backend than what is currently "
-            "installed in Slicer's Python (the nnInteractive.model_management module "
-            "is missing).\n\n"
+            "The nnInteractive backend installed in Slicer's Python is missing or "
+            "incomplete for this plugin (a required module such as "
+            "nnInteractive.model_management or scikit-image is not importable).\n\n"
             "Install / update nnInteractive now?",
             windowTitle="nnInteractive backend outdated",
             parent=slicer.util.mainWindow(),
@@ -4742,17 +5016,44 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         if self._is_tearing_down():
             return
+        if (
+            get_pending_install_flavor()
+            and importlib.util.find_spec("PyTorchUtils") is not None
+        ):
+            # Continue the Full install that the PyTorch-extension restart
+            # interrupted (only Full ever sets the marker). The user already chose
+            # it, so run dialog-free -- the same steps as _prompt_install_choice
+            # after the button click, including its re-entrancy guard so a click on
+            # Reinstall can't start a second install mid-flight. If PyTorchUtils is
+            # STILL not importable, the marker stays for the restart that actually
+            # activates it -- never silently degrade to a generic torch.
+            set_pending_install_flavor("")
+            self._install_prompt_active = True
+            try:
+                prev_flavor = self.get_install_flavor()
+                self._uninstall_nninteractive_packages()
+                ok = self._install_full()
+                self._post_install(prev_flavor, "full", ok)
+            finally:
+                self._install_prompt_active = False
+            return
         flavor = self.get_install_flavor()
         if flavor:
-            if flavor == "full" and not self._full_backend_ready():
+            if (
+                flavor == "full" and not self._full_backend_ready()
+            ) or not self._plugin_direct_deps_available():
                 self._offer_backend_update()
             self._sync_mode_switch()
             return
         detected = self._detect_install_flavor()
-        if detected == "full" and not self._model_management_available():
-            # A pre-existing full backend that predates model_management is too old
-            # for this plugin: don't adopt it silently (that would suppress the
-            # install popup and leave Local broken) -- explain and offer the installer.
+        if detected and (
+            (detected == "full" and not self._model_management_available())
+            or not self._plugin_direct_deps_available()
+        ):
+            # A pre-existing backend that predates model_management, or one missing a
+            # plugin-direct dependency (scikit-image), is incomplete for this plugin:
+            # don't adopt it silently (that would suppress the install popup and leave
+            # Local / the lasso broken) -- explain and offer the installer.
             self._offer_backend_update()
             return
         if detected:

@@ -79,9 +79,10 @@ background:
   tab — the dropdown is populated from the available-models manifest — and on the first local
   segmentation its weights are downloaded automatically from
   [Hugging Face](https://huggingface.co/MIC-DKFZ/nnInteractive).
-- **Client only (remote)** → installs just the torch-free **`nninteractive-client`** package (plus
-  the `httpx` / `blosc2` / `scikit-image` wire stack). **No PyTorch.** Local mode stays disabled;
-  enter your server URL (and API key, if any) in the `Configuration` tab.
+- **Client only (remote)** → installs just the torch-free **`nninteractive-client`** package (its
+  `httpx` / `blosc2` / `numpy` wire stack, plus `scikit-image`, which the installer adds explicitly
+  for the lasso tool). **No PyTorch.** Local mode stays disabled; enter your server URL (and API
+  key, if any) in the `Configuration` tab.
 
 After installing, click `Initialize` at the top of the `nnInteractive Prompts` tab — this loads the
 model (Full/Local) or connects to the server (Remote). If you dismiss the dialog without choosing,
@@ -96,8 +97,8 @@ to install first.
 preferring Slicer's **PyTorch extension** (`PyTorchUtils`): it selects a torch build matched to your
 GPU driver via [light-the-torch](https://github.com/Slicer/light-the-torch) on every platform. The
 PyTorch extension is installed automatically when missing, which may require **one Slicer restart** —
-afterwards, choose `Full (local + remote)` again to finish. Without the PyTorch extension (e.g.,
-offline), the install falls back to plain pip: on **Windows** it pulls from PyTorch's CUDA wheel
+after the restart, the nnInteractive installation continues automatically. Without the PyTorch
+extension (e.g., offline), the install falls back to plain pip: on **Windows** it pulls from PyTorch's CUDA wheel
 index (`https://download.pytorch.org/whl/cu126`) because the default PyPI wheel is **CPU-only**; on
 **Linux** the default wheel already bundles CUDA.
 If you need a **different** PyTorch build — a CUDA version matching an older GPU driver, or a pinned
@@ -218,6 +219,12 @@ Most buttons in the `nnInteractive Prompts` tab have a keyboard shortcut, shown 
 ## Common issues
 
 - When the remote server restarts or a session times out, the extension surfaces a "session expired" message — click `Initialize` at the top of the `nnInteractive Prompts` tab to reconnect; your current segmentation is preserved and re-seeded automatically.
+
+- **Lasso fails with `No module named 'skimage'`.** nnInteractive / `nninteractive-client`
+  2.5+ no longer pull in `scikit-image`, which the lasso tool needs, so an environment
+  installed or updated outside the plugin can lack it. Fix: click
+  `Reinstall / Update nnInteractive` in the `Configuration` tab (installs it explicitly), or run
+  `slicer.util.pip_install("scikit-image")` in Slicer's Python Console.
 
 - **No GPU detected / running on CPU (Local mode).** If, after `Initialize`, a red warning appears below the button saying nnInteractive is running on the CPU, PyTorch could not find a usable CUDA GPU. Local inference then falls back to the CPU, which is **very slow**. This usually means either no compatible GPU is present, or the installed PyTorch build does not match your GPU (a common case is the **CPU-only** PyTorch wheel getting installed). Install a matching CUDA build of PyTorch as described under [PyTorch (Full installs)](#first-run-choose-what-to-install), then restart Slicer and click `Initialize` again. To confirm what PyTorch sees, run this in Slicer's Python Console (`View ▸ Python Console`): `import torch; print(torch.cuda.is_available(), torch.version.cuda)`.
 
