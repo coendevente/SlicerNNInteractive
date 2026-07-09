@@ -200,6 +200,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.target_buffer = None
         self.api_key = ""
         self.server = ""
+        # License of the most recently initialized model; merged into the Prompts-tab
+        # status line (update_connect_status). Kept after uninitialize.
+        self._model_license_text = "Model license: —"
         # Exceptions that mean a remote lease is gone; populated when the remote
         # client is imported. Empty by default so local mode catches nothing here.
         self.SESSION_LOST_ERRORS = tuple()
@@ -267,6 +270,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # thread). See _check_for_updates_async / _poll_update_check.
         self._update_poll_timer = None
         self._update_check_result = None
+
+        # Guards for the install dialogs: never stack a second install prompt on top
+        # of an open one, and offer the "backend missing/outdated" update at most
+        # once per session (see _offer_backend_update / _prompt_install_choice).
+        self._install_prompt_active = False
+        self._offered_backend_update = False
 
         # DON'T install packages here, and never install lazily. Installation happens
         # only from the explicit first-run popup or the Configuration tab's
@@ -564,7 +573,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.autozoomCheck = qt.QCheckBox("Auto-zoom")
         self.ui.autozoomCheck.setChecked(self.get_setting_bool("autozoom"))
         self.ui.autozoomCheck.setToolTip(
-            "Let nnInteractive zoom out to capture context around larger objects.\n"
+            "Allows nnInteractive to zoom out so that large objects fit into its field "
+            "of view and are segmented completely.\n"
+            "Segmentation can take longer, and in rare situations it may segment more "
+            "than intended (oversegmentation).\n"
             "Applies to both Local and Remote sessions and takes effect immediately."
         )
         self.ui.autozoomCheck.toggled.connect(self.on_autozoom_toggled)
@@ -589,8 +601,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         configure_hint.setStyleSheet("color: gray;")
         model_layout.addWidget(configure_hint)
 
-        # The model license is shown only in the Prompts tab (promptsLicenseLabel), where
-        # the user actually works -- not duplicated here in the Configuration tab.
+        # The model license is shown only in the Prompts tab (merged into the status
+        # line there), where the user actually works -- not duplicated here in the
+        # Configuration tab.
 
         # Insert the model-selection group just above the trailing vertical spacer.
         idx = max(layout.count() - 1, 0)
@@ -669,6 +682,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # ModuleNotFoundError for full-only modules; treat that as "not available".
             return False
 
+    def _model_management_available(self):
+        """True if ``nnInteractive.model_management`` (model list + weight downloads)
+        is importable. Old full installs that predate it and the lightweight client
+        both lack it, and the Local workflow cannot run without it."""
+        try:
+            return (
+                importlib.util.find_spec("nnInteractive.model_management") is not None
+            )
+        except ImportError:
+            return False
+
+    def _full_backend_ready(self):
+        """True if the full backend is importable AND recent enough for this plugin,
+        i.e. it includes model_management (required to list models and fetch weights
+        in Local mode)."""
+        return self._local_inference_available() and self._model_management_available()
+
     def _apply_local_mode_availability(self):
         """Gate Local mode on whether the full backend is installed.
 
@@ -718,8 +748,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def setup_prompts_tab_extras(self):
         """
         Adds, at the very top of the Prompts tab (the view the user actually works in),
-        a mandatory Initialize/Uninitialize control, then a prominent model-license
-        banner. The Helmholtz Imaging + DKFZ acknowledgement logos go at the bottom.
+        a mandatory Initialize/Uninitialize control with a combined status + model-license
+        readout. The Helmholtz Imaging + DKFZ acknowledgement logos go at the very bottom
+        of the module panel, below the Segment Editor.
 
         Initialization is mandatory before any prompt can be placed: it loads the local
         model (and runs the torch.compile / cuDNN warmup) or connects to the remote
@@ -746,6 +777,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.initializeButton.clicked.connect(self.connect_clicked)
         init_layout.addWidget(self.ui.initializeButton)
 
+        # Single line combining the session status and the model license (the license
+        # used to be its own banner; merged to save vertical space).
         self.ui.promptsStatusLabel = qt.QLabel("Status: not initialized")
         self.ui.promptsStatusLabel.setWordWrap(True)
         self.ui.promptsStatusLabel.setAlignment(qt.Qt.AlignCenter)
@@ -768,15 +801,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         layout.insertWidget(0, init_group)
 
-        self.ui.promptsLicenseLabel = qt.QLabel("Model license: —")
-        self.ui.promptsLicenseLabel.setWordWrap(True)
-        self.ui.promptsLicenseLabel.setAlignment(qt.Qt.AlignCenter)
-        self.ui.promptsLicenseLabel.setStyleSheet("font-weight: bold; padding: 4px;")
-        layout.insertWidget(1, self.ui.promptsLicenseLabel)
-
+        # Acknowledgement logos go at the very bottom of the module panel (below the
+        # Segment Editor), not inside the Prompts tab, so they never push the working
+        # controls around and stay visible in both tabs.
         logos = self._build_logos_widget(height=26)
         if logos is not None:
-            layout.addWidget(logos)
+            self.ui.segmentationGroup.parentWidget().layout().addWidget(logos)
 
         # Reflect the current (idle) session state on the freshly created button.
         self.update_connect_status(connected=self.session is not None)
@@ -3886,13 +3916,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             models = list_models()
         except Exception as exc:  # noqa: BLE001 - never block the UI on model discovery
             # Printed unconditionally (not debug_print) so an empty dropdown is never
-            # silent. The usual cause during development is a Slicer-bundled
-            # nnInteractive that predates the model_management module — install the
-            # updated backend into Slicer's Python (see README / status message below).
+            # silent.
             print(f"[nnInteractive] Could not load model list: {exc!r}")
             slicer.util.showStatusMessage(
                 "nnInteractive: could not load the model list (see Python Console).", 5000
             )
+            if isinstance(exc, ModuleNotFoundError):
+                # Not a transient failure (offline etc.) but a missing/outdated
+                # backend -- e.g. an nnInteractive that predates model_management, or
+                # a recorded Full install whose packages are gone. The fix is an
+                # install/update, so offer it instead of leaving only a console note.
+                self._offer_backend_update()
             return
         if not models:
             return
@@ -4028,9 +4062,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _on_session_ready(self):
         """Reflect a freshly created session in the UI (license, capability gating)."""
         session = self.session
-        license_text = self._license_display_text(getattr(session, "license", None))
-        if hasattr(self.ui, "promptsLicenseLabel"):
-            self.ui.promptsLicenseLabel.setText(license_text)
+        # Shown as part of the status line (see update_connect_status).
+        self._model_license_text = self._license_display_text(
+            getattr(session, "license", None)
+        )
 
         # Initialized: unlock the interaction UI, then gate the individual tools by
         # what this particular model actually supports (point/bbox/lasso/scribble).
@@ -4363,10 +4398,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.ui.initializeButton.setStyleSheet(
                 self.selected_style if connected else self.unselected_style
             )
-        for label_name in ("connectStatusLabel", "promptsStatusLabel"):
-            label = getattr(self.ui, label_name, None)
-            if label is not None:
-                label.setText(f"Status: {status}")
+        label = getattr(self.ui, "connectStatusLabel", None)
+        if label is not None:
+            label.setText(f"Status: {status}")
+        # The Prompts tab combines status and model license in one line to save space.
+        label = getattr(self.ui, "promptsStatusLabel", None)
+        if label is not None:
+            license_text = getattr(self, "_model_license_text", "Model license: —")
+            label.setText(f"Status: {status}  |  {license_text}")
         # After a successful local Initialize the full backend is present; fill the
         # dropdown if it was still empty when the user opened the tab.
         if connected and mode == "local":
@@ -4586,8 +4625,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         require a Slicer restart, in which case the flow stops before touching the
         existing packages -- the user re-picks Full after restarting).
         """
-        if self._is_tearing_down():
+        if self._is_tearing_down() or self._install_prompt_active:
             return
+        self._install_prompt_active = True
+        try:
+            self._prompt_install_choice_impl(reinstall)
+        finally:
+            self._install_prompt_active = False
+
+    def _prompt_install_choice_impl(self, reinstall):
         prev_flavor = self.get_install_flavor()
 
         msg = qt.QMessageBox(slicer.util.mainWindow())
@@ -4660,25 +4706,73 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 parent=slicer.util.mainWindow(),
             )
 
+    def _offer_backend_update(self):
+        """Explain that the installed nnInteractive backend is missing or outdated and
+        offer the install/update dialog.
+
+        Fired when the Local workflow needs ``nnInteractive.model_management`` but it
+        isn't importable: the backend predates the module, was lost to a new Slicer
+        Python environment (settings persist across Slicer versions, site-packages
+        don't), or only the client is present while the recorded flavor says Full.
+        Shown at most once per session, and never on top of an open install dialog.
+        """
+        if self._offered_backend_update or self._install_prompt_active:
+            return
+        self._offered_backend_update = True
+        if slicer.util.confirmYesNoDisplay(
+            "Local mode needs a newer nnInteractive backend than what is currently "
+            "installed in Slicer's Python (the nnInteractive.model_management module "
+            "is missing).\n\n"
+            "Install / update nnInteractive now?",
+            windowTitle="nnInteractive backend outdated",
+            parent=slicer.util.mainWindow(),
+        ):
+            self._prompt_install_choice(reinstall=True)
+
     def _resolve_install_on_startup(self):
         """First-run install resolver, deferred from setup() to the event loop.
 
-        If a flavor is already recorded, do nothing. Otherwise adopt a pre-existing
-        install (e.g. a Slicer-bundled backend) if one is importable; if nothing is
-        installed, prompt the user to choose what to install. Dismissing the prompt
-        leaves nothing installed, so it re-appears on the next launch.
+        If a flavor is already recorded, verify it still holds (a recorded Full whose
+        backend can no longer serve Local mode gets an update offer instead of a bare
+        console error on the first Local action). Otherwise adopt a pre-existing
+        install (e.g. a Slicer-bundled backend) if one is importable and current; if
+        nothing usable is installed, prompt the user to choose what to install.
+        Dismissing the prompt leaves nothing installed, so it re-appears on the next
+        launch.
         """
         if self._is_tearing_down():
             return
-        if self.get_install_flavor():
+        flavor = self.get_install_flavor()
+        if flavor:
+            if flavor == "full" and not self._full_backend_ready():
+                self._offer_backend_update()
             self._sync_mode_switch()
             return
         detected = self._detect_install_flavor()
+        if detected == "full" and not self._model_management_available():
+            # A pre-existing full backend that predates model_management is too old
+            # for this plugin: don't adopt it silently (that would suppress the
+            # install popup and leave Local broken) -- explain and offer the installer.
+            self._offer_backend_update()
+            return
         if detected:
             self.set_install_flavor(detected)
+            # Match the mode to the adopted flavor, like _post_install does for an
+            # explicit install: Full means in-process compute is available, so default
+            # to Local -- but only if the user never explicitly picked a mode
+            # (get_mode() would otherwise report its "remote" fallback and strand a
+            # Full install in Remote mode). Client lands on Remote via the
+            # availability fallback below.
+            if detected == "full" and not qt.QSettings().contains(
+                "SlicerNNInteractive/mode"
+            ):
+                self.set_mode("local")
             self._apply_local_mode_availability()
             self._refresh_install_status_ui()
             self._sync_mode_switch()
+            # In Local mode the dropdown would otherwise stay empty until the first
+            # mode toggle (the backend was verified current above, so this is safe).
+            self._ensure_model_combo_populated()
             self._check_for_updates_async()
             return
         self._prompt_install_choice(reinstall=False)
