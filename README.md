@@ -92,9 +92,14 @@ to install first.
 > The extension only ever installs `nnInteractive` / `nninteractive-client` **below v3.0.0**, to
 > guard against future API changes.
 
-**PyTorch (Full installs).** A Full install pulls in PyTorch (and `torchvision`) automatically. On
-**Windows** it pulls from PyTorch's CUDA wheel index (`https://download.pytorch.org/whl/cu126`)
-because the default PyPI wheel is **CPU-only**; on **Linux** the default wheel already bundles CUDA.
+**PyTorch (Full installs).** A Full install pulls in PyTorch (and `torchvision`) automatically,
+preferring Slicer's **PyTorch extension** (`PyTorchUtils`): it selects a torch build matched to your
+GPU driver via [light-the-torch](https://github.com/Slicer/light-the-torch) on every platform. The
+PyTorch extension is installed automatically when missing, which may require **one Slicer restart** —
+afterwards, choose `Full (local + remote)` again to finish. Without the PyTorch extension (e.g.,
+offline), the install falls back to plain pip: on **Windows** it pulls from PyTorch's CUDA wheel
+index (`https://download.pytorch.org/whl/cu126`) because the default PyPI wheel is **CPU-only**; on
+**Linux** the default wheel already bundles CUDA.
 If you need a **different** PyTorch build — a CUDA version matching an older GPU driver, or a pinned
 torch version — install it yourself from Slicer's **Python Console** (`View ▸ Python Console`), then
 restart Slicer and click `Initialize` again. **`torchvision` is version-locked to `torch`, so always

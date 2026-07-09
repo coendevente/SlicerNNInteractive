@@ -4428,12 +4428,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def ensure_torch_installed(self):
         if importlib.util.find_spec("torch") is not None:
             return
-        # Prefer Slicer's PyTorch extension (PyTorchUtils): it installs a CUDA-matched
-        # build for the current platform (including the correct CUDA wheel on Windows).
+        # Prefer Slicer's PyTorch extension (PyTorchUtils): it installs a build matched
+        # to the GPU driver via light-the-torch on every platform (including the correct
+        # CUDA wheel on Windows). _ensure_pytorch_extension (run at install-choice time)
+        # installs the extension when missing; askConfirmation=False because the user
+        # already confirmed the Full install in our own dialog.
         try:
             import PyTorchUtils
 
-            PyTorchUtils.PyTorchUtilsLogic().installTorch(askConfirmation=True)
+            PyTorchUtils.PyTorchUtilsLogic().installTorch(askConfirmation=False)
             if importlib.util.find_spec("torch") is not None:
                 return
         except Exception:  # noqa: BLE001
@@ -4448,6 +4451,59 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             command = "torch"
         self._pip_install(command, "Installing PyTorch (this can take a while)...")
+
+    def _ensure_pytorch_extension(self):
+        """Make PyTorchUtils (Slicer's PyTorch extension) available for a Full install.
+
+        PyTorchUtils picks a torch build matched to the machine's GPU driver via
+        light-the-torch on every platform -- far more robust than the plain-pip
+        fallback in ensure_torch_installed. Runs BEFORE anything is uninstalled, so
+        stopping for a restart leaves the current install fully intact.
+
+        Returns True to proceed with the install now (PyTorchUtils importable, torch
+        already present, or the extension genuinely unavailable -- the plain-pip
+        fallback then covers torch), False to stop so the user can restart Slicer
+        first.
+        """
+        if importlib.util.find_spec("PyTorchUtils") is not None:
+            return True
+        if importlib.util.find_spec("torch") is not None:
+            return True  # torch already present; ensure_torch_installed will no-op
+        try:
+            em = slicer.app.extensionsManagerModel()
+            if em is None:
+                return True
+            if not em.isExtensionInstalled("PyTorch"):
+                # Slicer's own dialog confirms the download and offers the restart;
+                # accepting that restart aborts this flow safely (nothing changed yet).
+                if not em.installExtensionFromServer("PyTorch"):
+                    debug_print(
+                        "PyTorch extension install failed or was declined; "
+                        "falling back to plain-pip torch."
+                    )
+                    return True
+        except Exception as exc:  # noqa: BLE001
+            debug_print(f"PyTorch extension unavailable ({exc}); plain-pip torch fallback.")
+            return True
+        # Extension installed (just now, or earlier without a restart) but PyTorchUtils
+        # is not importable in this session: a restart is needed before installTorch can
+        # run. Offer plain pip as an escape hatch so a broken extension install can
+        # never wedge the Full flavor behind a restart loop.
+        msg = qt.QMessageBox(slicer.util.mainWindow())
+        msg.setWindowTitle("Restart Slicer to finish installation")
+        msg.setIcon(qt.QMessageBox.Information)
+        msg.setText(
+            "The PyTorch extension is installed but not active in this Slicer "
+            "session yet.\n\n"
+            "Restart Slicer and choose 'Full (local + remote)' again to get a "
+            "PyTorch build matched to your GPU (recommended).\n\n"
+            "Alternatively, continue now with a generic PyTorch build."
+        )
+        restart_btn = msg.addButton("I'll restart Slicer", qt.QMessageBox.AcceptRole)
+        continue_btn = msg.addButton("Continue anyway", qt.QMessageBox.AcceptRole)
+        msg.setDefaultButton(restart_btn)
+        msg.exec_()
+        return msg.clickedButton() == continue_btn
 
     # ------------------------------------------------------------------ #
     # Explicit install API. These run ONLY from the first-run popup / the
@@ -4525,6 +4581,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         present afterwards, and the latest capped version is installed. With ``reinstall``
         the dialog is framed as Reinstall/Update. Cancelling installs nothing, so the
         first-run prompt re-appears on the next launch.
+
+        A Full choice first ensures the PyTorch extension is available (its install may
+        require a Slicer restart, in which case the flow stops before touching the
+        existing packages -- the user re-picks Full after restarting).
         """
         if self._is_tearing_down():
             return
@@ -4551,6 +4611,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         clicked = msg.clickedButton()
         if clicked is None or clicked == cancel_btn:
+            return
+        if clicked == full_btn and not self._ensure_pytorch_extension():
+            # Restart required to activate the PyTorch extension. Nothing has been
+            # uninstalled or installed yet, so the current state is untouched.
             return
         # Clean slate first: remove any installed nnInteractive packages (deps left in
         # place) so the chosen flavor is the only one present -- this is what makes a
