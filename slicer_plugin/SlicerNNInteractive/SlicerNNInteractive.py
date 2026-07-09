@@ -5414,9 +5414,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         thickness = getattr(self.session, "preferred_scribble_thickness", None) if self.session else None
         if thickness:
             spacing = self.get_image_spacing()  # (z, y, x) mm/voxel
-            diameters_mm = [t * s for t, s in zip(thickness, spacing)]
-            # Use the smallest in-plane extent as the brush diameter.
-            diameter_mm = max(min(diameters_mm), 0.1)
+            # Half-voxel pad: Paint stencils in voxels whose centers lie strictly
+            # inside the brush, so at exactly `thickness` voxels the neighbouring
+            # centers sit on the boundary and strokes rasterize one voxel too thin.
+            # Padded, a stroke spans `thickness` (occasionally +1) voxels, never fewer.
+            diameters_mm = [(t + 0.5) * s for t, s in zip(thickness, spacing)]
+            # Use the median extent: the odd-one-out spacing (largest or smallest) is
+            # the through-plane axis of the acquisition, so the median is the in-plane
+            # voxel size of the plane users typically paint in. min() would undersize
+            # the brush whenever slices are thinner than in-plane voxels.
+            diameters_mm.sort()
+            diameter_mm = max(diameters_mm[len(diameters_mm) // 2], 0.1)
             paint_effect.setParameter("BrushUseAbsoluteSize", "1")
             paint_effect.setParameter("BrushAbsoluteDiameter", str(diameter_mm))
         else:
