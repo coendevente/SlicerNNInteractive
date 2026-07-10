@@ -90,8 +90,9 @@ nothing is installed, the dialog reappears next time you open Slicer, and `Initi
 to install first.
 
 > [!NOTE]
-> The extension only ever installs `nnInteractive` / `nninteractive-client` **below v3.0.0**, to
-> guard against future API changes.
+> The extension only ever installs `nnInteractive` / `nninteractive-client` **at or above v2.5.1 and
+> below v3.0.0** — the lower bound is the oldest version whose API this plugin targets, and the upper
+> bound guards against future API changes.
 
 **PyTorch (Full installs).** A Full install pulls in PyTorch (and `torchvision`) automatically,
 preferring Slicer's **PyTorch extension** (`PyTorchUtils`): it selects a torch build matched to your
@@ -130,8 +131,10 @@ looks present. If `slicer.util` isn't defined in the console, run `import slicer
 ### Updating or changing the installed backend
 
 The `Configuration` tab shows what is installed and whether it is current — **"✓ nnInteractive is
-up to date"** (green) or **"⟳ nnInteractive update available"** (orange), checked automatically
-against PyPI on startup. To update to the latest version (still capped below v3.0.0), or to switch
+up to date"** (green), **"⟳ nnInteractive update available"** (orange), or **"⚠ nnInteractive is
+outdated"** (red) when the installed backend is below the minimum supported version (`2.5.1`; older
+releases lack APIs this plugin relies on, so an update is offered automatically on startup), checked
+automatically against PyPI on startup. To update to the latest version (still capped below v3.0.0), or to switch
 between **Full** and **Client only**, click **`Reinstall / Update nnInteractive`** and pick a
 flavor. This — and the first-run dialog — are the only actions that install or update packages.
 Reinstalling first uninstalls the existing `nnInteractive` / `nninteractive-client` packages (their

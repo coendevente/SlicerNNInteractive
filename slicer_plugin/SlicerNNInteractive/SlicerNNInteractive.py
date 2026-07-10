@@ -32,8 +32,17 @@ DEBUG_MODE = False
 # future release can't silently break this plugin. The "up to date" indicator and every
 # install command honour this ceiling. Bump deliberately once 3.x is supported.
 NNINTERACTIVE_VERSION_CEILING = "3.0.0"
-NNINTERACTIVE_PKG = f"nnInteractive<{NNINTERACTIVE_VERSION_CEILING}"
-NNINTERACTIVE_CLIENT_PKG = f"nninteractive-client<{NNINTERACTIVE_VERSION_CEILING}"
+# Hard lower bound: the oldest backend this plugin supports. Earlier releases lack APIs
+# the plugin relies on, so both flavors pin at or above it, and a runtime check offers the
+# Reinstall / Update flow when an older backend is detected in Slicer's Python (e.g. one
+# installed outside the plugin). Applies to BOTH distributions. Bump deliberately.
+NNINTERACTIVE_VERSION_FLOOR = "2.5.1"
+NNINTERACTIVE_PKG = (
+    f"nnInteractive>={NNINTERACTIVE_VERSION_FLOOR},<{NNINTERACTIVE_VERSION_CEILING}"
+)
+NNINTERACTIVE_CLIENT_PKG = (
+    f"nninteractive-client>={NNINTERACTIVE_VERSION_FLOOR},<{NNINTERACTIVE_VERSION_CEILING}"
+)
 
 # Packages the PLUGIN itself imports directly and therefore must install explicitly
 # with either flavor. Do NOT rely on the backend's dependency tree for these:
@@ -93,16 +102,58 @@ def reopen_module_for_pending_install():
     qt.QTimer.singleShot(0, lambda: slicer.util.selectModule("SlicerNNInteractive"))
 
 
-def torch_compile_unsupported_reason():
+def cuda_gpu_available():
+    """Best-effort check for a usable NVIDIA/CUDA GPU, cheaply and WITHOUT importing torch.
+
+    torch.compile in this plugin only makes sense on an NVIDIA GPU, and this gates the
+    config-tab toggle, so the check must stay light: importing torch just to build the
+    UI would add seconds for remote-only users and fail outright on client-only installs.
+    We therefore probe the NVIDIA driver at the OS level. The authoritative
+    ``torch.cuda.is_available()`` check still runs when a local session is built (see
+    _construct_local_session), which covers the corner case of an NVIDIA driver present
+    but a CPU-only torch wheel installed.
+
+    When torch is already imported, defer to ``torch.cuda.is_available()`` -- it is free
+    then and matches exactly what a session will see.
+    """
+    import glob
+    import shutil
+    import sys
+
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        try:
+            return bool(torch.cuda.is_available())
+        except Exception:  # noqa: BLE001
+            return False
+    if sys.platform == "darwin":
+        return False  # Apple platforms have no CUDA
+    # Linux: the NVIDIA kernel driver exposes these when a GPU + driver are present.
+    if os.path.isdir("/proc/driver/nvidia/gpus") and os.listdir(
+        "/proc/driver/nvidia/gpus"
+    ):
+        return True
+    if glob.glob("/dev/nvidia[0-9]*"):
+        return True
+    return shutil.which("nvidia-smi") is not None
+
+
+def torch_compile_unsupported_reason(check_gpu=False):
     """Why torch.compile can't be used here, or None if it can.
 
-    Two hard blockers:
+    Hard blockers:
     * Windows -- torch.compile (Triton/inductor) is not supported on Windows at all.
+    * No NVIDIA/CUDA GPU -- torch.compile here targets CUDA; without a GPU the model runs
+      on CPU, where compiling is pointless (and slow to build). Only checked when
+      ``check_gpu`` is set, via the torch-free cuda_gpu_available() probe -- the
+      module-level default and the session path leave it off so nothing imports torch
+      prematurely (the session path enforces the GPU requirement authoritatively via
+      torch.cuda.is_available() instead).
     * Elsewhere it compiles small C/CUDA helpers at runtime, which need the Python
       development headers (Python.h). Slicer's bundled Python does not ship them.
 
-    In either case torch.compile would fail on the first prediction, so we detect it
-    up front and run eager instead.
+    In each case torch.compile would fail or be pointless, so we detect it up front and
+    run eager instead.
     """
     import sys
     import sysconfig
@@ -116,6 +167,8 @@ def torch_compile_unsupported_reason():
             "torch.compile needs the Python development headers (Python.h), "
             "which are not present in this Python build."
         )
+    if check_gpu and not cuda_gpu_available():
+        return "torch.compile needs an NVIDIA GPU; none was detected."
     return None
 
 
@@ -616,18 +669,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         advanced_form.addRow("Device:", self.ui.deviceCombo)
 
         self.ui.compileCheck = qt.QCheckBox()
-        self.ui.compileCheck.setChecked(self.get_setting_bool("use_torch_compile"))
+        compile_reason = torch_compile_unsupported_reason(check_gpu=True)
+        if compile_reason is not None:
+            # torch.compile can't work / is pointless here (Windows, no NVIDIA GPU, or no
+            # Python.h to build its runtime helpers -- the last is typical in Slicer's
+            # bundled Python). Force it OFF and disabled so the user can't turn on
+            # something that would fail on the first prediction, and isn't left staring at
+            # a stale stored "on" showing as checked. Explain why in the tooltip.
+            self.ui.compileCheck.setChecked(False)
+            self.ui.compileCheck.setEnabled(False)
+            self.ui.compileCheck.setToolTip(f"Unavailable: {compile_reason}")
+        else:
+            self.ui.compileCheck.setChecked(self.get_setting_bool("use_torch_compile"))
+        # Connect AFTER setting the initial check state so the seeding above never fires
+        # the save handler (which would reinit the session mid-setup).
         self.ui.compileCheck.toggled.connect(
             lambda v: self._save_setting_bool("use_torch_compile", v, reinit=True)
         )
-        compile_reason = torch_compile_unsupported_reason()
-        if compile_reason is not None:
-            # torch.compile can't work here (Windows, or no Python.h to build its runtime
-            # helpers -- typical in Slicer's bundled Python). Disable the option so the
-            # user can't turn on something that would fail on the first prediction, and
-            # explain why in the tooltip.
-            self.ui.compileCheck.setEnabled(False)
-            self.ui.compileCheck.setToolTip(f"Unavailable: {compile_reason}")
         advanced_form.addRow("Use torch.compile:", self.ui.compileCheck)
 
         self.ui.storageCombo = qt.QComboBox()
@@ -800,6 +858,51 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         offer instead of reporting healthy and failing on the first lasso stroke.
         """
         return importlib.util.find_spec("skimage") is not None
+
+    def _installed_backend_versions(self):
+        """Map of installed nnInteractive distribution -> version string, for whichever
+        of ('nnInteractive', 'nninteractive-client') are present. Empty when neither is."""
+        import importlib.metadata as metadata
+
+        versions = {}
+        for dist in ("nnInteractive", "nninteractive-client"):
+            try:
+                versions[dist] = metadata.version(dist)
+            except metadata.PackageNotFoundError:
+                continue
+        return versions
+
+    def _backend_below_min_version(self):
+        """List of "``<dist> <version>``" strings for installed nnInteractive
+        distributions older than NNINTERACTIVE_VERSION_FLOOR.
+
+        Empty when everything installed meets the floor, nothing is installed, or a
+        version can't be parsed (never nag on an unparseable version). Purely local --
+        no network -- so it works offline and is safe to call on the main thread.
+        """
+        try:
+            from packaging.version import Version
+        except Exception:  # noqa: BLE001
+            return []
+        floor = Version(NNINTERACTIVE_VERSION_FLOOR)
+        outdated = []
+        for dist, ver in self._installed_backend_versions().items():
+            try:
+                if Version(ver) < floor:
+                    outdated.append(f"{dist} {ver}")
+            except Exception:  # noqa: BLE001
+                continue
+        return outdated
+
+    def _min_version_reason(self, outdated):
+        """Explanation shown in the update prompt / status label when the installed
+        backend is below the supported floor. ``outdated`` is _backend_below_min_version()."""
+        return (
+            "The nnInteractive backend installed in Slicer's Python is older than the "
+            f"minimum version this plugin supports ({NNINTERACTIVE_VERSION_FLOOR}): "
+            + "; ".join(outdated)
+            + "."
+        )
 
     def _apply_local_mode_availability(self):
         """Gate Local mode on whether the full backend is installed.
@@ -3890,6 +3993,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 print("[nnInteractive] No CUDA GPU detected - running on CPU (slow).")
                 device = torch.device("cpu")
                 on_cpu = True
+                # Authoritative GPU gate: torch.compile here targets CUDA, so on CPU it
+                # is pointless (and slow to build). Never compile, regardless of the
+                # stored setting -- this also catches an NVIDIA driver present but a
+                # CPU-only torch wheel, which the config-tab probe can't see.
+                with_compile = False
 
             session = nnInteractiveInferenceSession(
                 device=device,
@@ -4979,25 +5087,29 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if edit is not None:
             edit.setFocus()
 
-    def _offer_backend_update(self):
-        """Explain that the installed nnInteractive backend is missing or outdated and
-        offer the install/update dialog.
+    def _offer_backend_update(self, reason=None):
+        """Explain that the installed nnInteractive backend is missing, outdated, or
+        incomplete and offer the install/update dialog.
 
-        Fired when the environment is incomplete for this plugin: the Local workflow
-        needs ``nnInteractive.model_management`` but it isn't importable (backend
-        predates the module, was lost to a new Slicer Python environment, or only the
-        client is present while the recorded flavor says Full), or a plugin-direct
-        dependency is missing (``scikit-image``, see _plugin_direct_deps_available).
-        Shown at most once per session, and never on top of an open install dialog.
+        Fired when the environment is unusable for this plugin: the Local workflow needs
+        ``nnInteractive.model_management`` but it isn't importable (backend predates the
+        module, was lost to a new Slicer Python environment, or only the client is
+        present while the recorded flavor says Full), a plugin-direct dependency is
+        missing (``scikit-image``, see _plugin_direct_deps_available), or the installed
+        backend is older than NNINTERACTIVE_VERSION_FLOOR. ``reason`` overrides the
+        default explanation (used for the below-minimum case). Shown at most once per
+        session, and never on top of an open install dialog.
         """
         if self._offered_backend_update or self._install_prompt_active:
             return
         self._offered_backend_update = True
-        if slicer.util.confirmYesNoDisplay(
+        default_reason = (
             "The nnInteractive backend installed in Slicer's Python is missing or "
             "incomplete for this plugin (a required module such as "
-            "nnInteractive.model_management or scikit-image is not importable).\n\n"
-            "Install / update nnInteractive now?",
+            "nnInteractive.model_management or scikit-image is not importable)."
+        )
+        if slicer.util.confirmYesNoDisplay(
+            (reason or default_reason) + "\n\nInstall / update nnInteractive now?",
             windowTitle="nnInteractive backend outdated",
             parent=slicer.util.mainWindow(),
         ):
@@ -5039,10 +5151,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
         flavor = self.get_install_flavor()
         if flavor:
+            outdated = self._backend_below_min_version()
             if (
                 flavor == "full" and not self._full_backend_ready()
             ) or not self._plugin_direct_deps_available():
                 self._offer_backend_update()
+            elif outdated:
+                # Installed but older than the supported floor: offer the update flow so
+                # the user lands on a version whose API this plugin actually targets.
+                self._offer_backend_update(self._min_version_reason(outdated))
             self._sync_mode_switch()
             return
         detected = self._detect_install_flavor()
@@ -5057,6 +5174,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._offer_backend_update()
             return
         if detected:
+            outdated = self._backend_below_min_version()
+            if outdated:
+                # A pre-existing backend older than the supported floor: don't adopt it
+                # silently (that would record the flavor and suppress future prompts) --
+                # offer the update so the user lands on a supported version.
+                self._offer_backend_update(self._min_version_reason(outdated))
+                return
             self.set_install_flavor(detected)
             # Match the mode to the adopted flavor, like _post_install does for an
             # explicit install: Full means in-process compute is available, so default
@@ -5115,6 +5239,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         flavor = self.get_install_flavor()
         if not flavor:
             label.setText("")
+            return
+        # A backend below the hard minimum is a purely local fact: surface it right away
+        # (no network) and skip the "newer on PyPI?" probe, which is moot below the floor.
+        # The startup resolver also raises a modal update prompt for this same case.
+        outdated = self._backend_below_min_version()
+        if outdated:
+            label.setText(
+                "⚠ nnInteractive is outdated ("
+                + "; ".join(outdated)
+                + f"; minimum supported is {NNINTERACTIVE_VERSION_FLOOR}). "
+                "Click 'Reinstall / Update nnInteractive'."
+            )
+            label.setStyleSheet("color: #c0392b; font-weight: bold;")
             return
         label.setText("Checking for nnInteractive updates ...")
         label.setStyleSheet("color: gray;")
