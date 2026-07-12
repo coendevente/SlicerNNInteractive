@@ -50,6 +50,17 @@ docker pull coendevente/nninteractive-slicer-server:latest
 docker run --gpus all --rm -it -p 1527:1527 coendevente/nninteractive-slicer-server:latest
 ```
 
+###### ARM64 (e.g., NVIDIA DGX Spark)
+
+For ARM64 systems like NVIDIA DGX Spark, build the image locally:
+
+```bash
+git clone https://github.com/coendevente/SlicerNNInteractive.git
+cd SlicerNNInteractive/server
+docker build -f Dockerfile.arm64 -t nninteractive-slicer-server:arm64 .
+docker run --gpus all --rm -it -p 1527:1527 --ipc=host nninteractive-slicer-server:arm64
+```
+
 This will make the server available under port `1527` on your machine. If you would like to use a different port, say `1627`, replace `-p 1527:1527` with `-p 1627:1527`.
 
 ##### Option 2: Using `uv`

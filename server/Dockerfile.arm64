@@ -1,0 +1,42 @@
+# Dockerfile for ARM64 systems (e.g., NVIDIA DGX Spark with Grace CPU)
+# Uses NVIDIA NGC PyTorch container for proper CUDA support on ARM64
+FROM nvcr.io/nvidia/pytorch:25.01-py3
+
+# Disable GPU compatibility check (GB10 shows warning but works)
+ENV NVIDIA_DISABLE_REQUIRE=1
+
+RUN apt-get update && apt-get install -y wget && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m user 
+RUN chown -R user:user /home/user
+RUN mkdir -p /home/user/.config/matplotlib && \
+    mkdir -p /home/user/.cache && \
+    chown -R user:user /home/user/.config /home/user/.cache
+
+# Backup NGC PyTorch (compiled for ARM64 with CUDA) before pip overwrites it
+RUN cp -r /usr/local/lib/python3.12/dist-packages/torch /tmp/torch_backup && \
+    cp -r /usr/local/lib/python3.12/dist-packages/torchvision /tmp/torchvision_backup
+
+WORKDIR /opt/server
+
+COPY nninteractive_slicer_server/main.py main.py
+COPY requirements.txt requirements.txt
+
+# Pin numpy<2 for compatibility with NGC PyTorch (compiled against NumPy 1.x)
+RUN sed "s/numpy>=.*/numpy>=1.26.0,<2.0.0/" requirements.txt > requirements_fixed.txt
+
+# Install dependencies (this will install CPU-only torch, which we will replace)
+RUN pip install --no-cache-dir -r requirements_fixed.txt
+
+# Restore NGC PyTorch with ARM64 CUDA support
+RUN rm -rf /usr/local/lib/python3.12/dist-packages/torch && \
+    rm -rf /usr/local/lib/python3.12/dist-packages/torchvision && \
+    mv /tmp/torch_backup /usr/local/lib/python3.12/dist-packages/torch && \
+    mv /tmp/torchvision_backup /usr/local/lib/python3.12/dist-packages/torchvision
+
+RUN chown -R user:user /opt/server
+
+USER user
+
+CMD ["python3", "main.py"]
