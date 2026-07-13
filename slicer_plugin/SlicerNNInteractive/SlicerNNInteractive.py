@@ -1447,7 +1447,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         def _update_once():
             self._scene_change_update_queued = False
             if not self._is_tearing_down():
-                self._update_initialize_button_state()
+                # Full status sync (not just the button): the status line's "load an
+                # image..." hint must clear the moment a volume is loaded, and reappear
+                # if all volumes are removed. update_connect_status re-runs
+                # _update_initialize_button_state itself.
+                self.update_connect_status(connected=self.session is not None)
 
         qt.QTimer.singleShot(0, _update_once)
 
@@ -4669,7 +4673,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             # Show which mode a press will start, so the user sees it before clicking.
             action = "Initialize (Local)" if mode == "local" else "Initialize (Remote)"
-            status = "not initialized"
+            # Initialize is disabled until an image is loaded (see
+            # _update_initialize_button_state). Say so in the status line rather than
+            # only in the button tooltip, so a greyed-out button doesn't look broken.
+            if self._has_volume_loaded():
+                status = "not initialized"
+            else:
+                status = "not initialized — load an image to enable Initialize"
         if hasattr(self.ui, "initializeButton"):
             self.ui.initializeButton.setText(action)
             self.ui.initializeButton.setStyleSheet(
