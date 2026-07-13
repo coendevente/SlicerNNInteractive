@@ -73,6 +73,24 @@ README_COMMON_ISSUES_URL = (
 # without re-asking the user.
 PENDING_INSTALL_SETTINGS_KEY = "SlicerNNInteractive/pending_install"
 
+# Human-readable version of THIS extension. Slicer itself identifies extension builds by
+# git commit (the SCM revision it stamps at build time -- see _check_plugin_update_async),
+# so this string is informational only: it does NOT drive update detection. It is shown in
+# the module help and the Configuration tab so users can tell which release they are on.
+# Bump on each tagged release and keep it in sync with the git tag ("v" + this string).
+PLUGIN_VERSION = "1.0.0"
+
+# The extension's registered name in Slicer's Extensions Manager -- this is the CMake
+# project() name in slicer_plugin/CMakeLists.txt, NOT the module title. Used to ask the
+# Extensions Manager whether a newer build of THIS extension is published on the server.
+PLUGIN_EXTENSION_NAME = "NNInteractive"
+
+# Remembers which installed plugin revision we've already raised the "update available"
+# popup for, so the popup appears once per version instead of on every launch. Keyed on
+# the installed revision, so it resets naturally once the user actually updates. See
+# _maybe_show_plugin_update_popup.
+PLUGIN_UPDATE_NOTIFIED_SETTINGS_KEY = "SlicerNNInteractive/plugin_update_notified_revision"
+
 
 def get_pending_install_flavor():
     """'full' when a Full install was interrupted by the restart the PyTorch
@@ -255,8 +273,14 @@ class SlicerNNInteractive(ScriptedLoadableModule):
         ]
         self.parent.dependencies = []  # List other modules if needed
         self.parent.contributors = ["Coen de Vente", "Kiran Vaidhya Venkadesh", "Bram van Ginneken", "Clara I. Sanchez"]
-        self.parent.helpText = """
-            This is an 3D Slicer extension for using nnInteractive.
+        # Some Slicer builds surface parent.version in the module panel / about box; set it
+        # when supported, but never let an unsupported attribute break module load.
+        try:
+            self.parent.version = PLUGIN_VERSION
+        except Exception:  # noqa: BLE001
+            pass
+        self.parent.helpText = f"""
+            This is an 3D Slicer extension for using nnInteractive (plugin version {PLUGIN_VERSION}).
 
             Read more about this plugin here: https://git.dkfz.de/mic/personal/group2/isensee/slicernninteractive.
             """
@@ -402,6 +426,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # thread). See _check_for_updates_async / _poll_update_check.
         self._update_poll_timer = None
         self._update_check_result = None
+
+        # Plugin (Slicer extension) update check, driven by Slicer's Extensions Manager
+        # (see _check_plugin_update_async). The manager model is Qt/main-thread only, so
+        # the check runs via its async signals rather than a worker thread. Guard flags
+        # keep us from starting it twice or stacking the one-time popup.
+        self._emm = None
+        self._plugin_update_check_started = False
+        self._plugin_update_popup_shown = False
 
         # Guards for the install dialogs: never stack a second install prompt on top
         # of an open one, and offer the "backend missing/outdated" update at most
@@ -578,6 +610,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             lambda: self._prompt_install_choice(reinstall=True)
         )
         install_layout.addWidget(self.ui.reinstallButton)
+
+        # Plugin (the Slicer extension itself) update status. Separate from the backend
+        # update label above: the extension is rebuilt nightly from the repo's main
+        # branch, but Slicer does not notify users, so we surface it here and via a
+        # one-time popup. See _check_plugin_update_async.
+        self.ui.pluginUpdateStatusLabel = qt.QLabel()
+        self.ui.pluginUpdateStatusLabel.setWordWrap(True)
+        install_layout.addWidget(self.ui.pluginUpdateStatusLabel)
         # NOTE: install_group is added to the tab layout at the very bottom, after the
         # Model Selection group is inserted (see end of this method).
 
@@ -779,6 +819,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Reflect what's installed, then kick off the background "update available?" check.
         self._refresh_install_status_ui()
         self._check_for_updates_async()
+        # Also check whether the plugin (extension) itself has a newer build available.
+        self._check_plugin_update_async()
 
     def _on_api_key_changed(self):
         # API keys are intentionally not persisted to QSettings.
@@ -1283,6 +1325,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._destroy_scribble_editor_widget()
 
         self._stop_update_poll_timer()
+        self._disconnect_plugin_update_signals()
 
         if not getattr(self, "_application_quitting", False):
             try:
@@ -1303,6 +1346,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._deactivate_segment_editor_effects()
         self._stop_heartbeat_timer()
         self._stop_update_poll_timer()
+        self._disconnect_plugin_update_signals()
         # aboutToQuit fires while the scene is still valid: remove the prompt/scribble
         # nodes we created (and drop our references) now, so their VTK pipelines are
         # freed before the scene is torn down instead of lingering as reported leaks.
@@ -5370,6 +5414,195 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             label.setText("✓ nnInteractive is up to date")
             label.setStyleSheet("color: #27ae60; font-weight: bold;")
+
+    # ------------------------------------------------------------------ #
+    # Plugin (Slicer extension) "update available?" check. Separate from the
+    # backend check above: this asks Slicer's Extensions Manager whether a newer
+    # build of THIS extension is published on the extensions server for the
+    # running Slicer version. The extension is rebuilt nightly from the repo's
+    # main branch, but users are not notified -- they must open the Extensions
+    # Manager and click Update. We surface that with a Config-tab label and a
+    # one-time popup. The manager model is Qt/main-thread only, so the whole
+    # flow runs on its async signals (no worker thread):
+    #   updateExtensionsMetadataFromServer(force=True, wait=False)
+    #     -> updateExtensionsMetadataFromServerCompleted(bool)   [_on_plugin_metadata_fetched]
+    #        -> checkForExtensionsUpdates()
+    #           -> extensionUpdatesAvailable(bool)               [_on_plugin_updates_available]
+    #              -> isExtensionUpdateAvailable(PLUGIN_EXTENSION_NAME)
+    # ------------------------------------------------------------------ #
+
+    def _extensions_manager_model(self):
+        """Slicer's extensions manager model, or None when unavailable (e.g. the
+        extension is loaded from source via an additional module path, or this build
+        has the extensions manager disabled)."""
+        try:
+            return slicer.app.extensionsManagerModel()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _plugin_is_managed_extension(self, emm):
+        """True only when THIS extension was installed through the Extensions Manager,
+        so an update check is meaningful. False when running from source."""
+        try:
+            return PLUGIN_EXTENSION_NAME in emm.installedExtensions
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _check_plugin_update_async(self):
+        """Ask the Extensions Manager (non-blocking) whether a newer build of this
+        extension is available. Fails silently when offline, when the API differs on
+        this Slicer build, or when the extension is not a managed install (dev mode)."""
+        if self._is_tearing_down() or self._plugin_update_check_started:
+            return
+        emm = self._extensions_manager_model()
+        if emm is None or not self._plugin_is_managed_extension(emm):
+            self._render_plugin_update_label(None)  # dev / source checkout: show nothing
+            return
+        self._plugin_update_check_started = True
+        self._emm = emm
+        self._render_plugin_update_label("checking")
+        try:
+            emm.connect(
+                "updateExtensionsMetadataFromServerCompleted(bool)",
+                self._on_plugin_metadata_fetched,
+            )
+            emm.connect(
+                "extensionUpdatesAvailable(bool)",
+                self._on_plugin_updates_available,
+            )
+            # force=True (ignore the metadata cache TTL), waitForCompletion=False (async).
+            emm.updateExtensionsMetadataFromServer(True, False)
+        except Exception:  # noqa: BLE001
+            self._disconnect_plugin_update_signals()  # drop any partial connection
+            self._plugin_update_check_started = False
+            self._render_plugin_update_label(None)
+
+    def _on_plugin_metadata_fetched(self, success):
+        """Server metadata arrived: run the comparison, which emits
+        extensionUpdatesAvailable. NO Qt heavy lifting here."""
+        emm = self._emm
+        if emm is None or self._is_tearing_down():
+            return
+        if not success:
+            self._render_plugin_update_label("error")
+            return
+        try:
+            emm.checkForExtensionsUpdates()
+        except Exception:  # noqa: BLE001
+            self._render_plugin_update_label("error")
+
+    def _on_plugin_updates_available(self, _any_available):
+        """extensionUpdatesAvailable(bool) fires for the whole catalog; we care only
+        about our extension, so query it specifically."""
+        emm = self._emm
+        if emm is None or self._is_tearing_down():
+            return
+        try:
+            update_available = bool(emm.isExtensionUpdateAvailable(PLUGIN_EXTENSION_NAME))
+        except Exception:  # noqa: BLE001
+            self._render_plugin_update_label("error")
+            return
+        self._render_plugin_update_label("available" if update_available else "current")
+        if update_available:
+            self._maybe_show_plugin_update_popup()
+
+    def _render_plugin_update_label(self, state):
+        """Render the Config-tab plugin-update label. ``state`` is one of None (hide --
+        dev build or manager unavailable), ``"checking"``, ``"error"``, ``"current"``,
+        ``"available"``. Deliberately version-less: builds are pushed to ``main`` without
+        bumping PLUGIN_VERSION, so the update status is commit-based (see
+        _check_plugin_update_async). Naming a version here would read as "1.0.0 → 1.0.0"."""
+        label = getattr(self.ui, "pluginUpdateStatusLabel", None)
+        if label is None:
+            return
+        if state is None:
+            label.setText("")
+        elif state == "checking":
+            label.setText("Checking for nnInteractive plugin updates ...")
+            label.setStyleSheet("color: gray;")
+        elif state == "error":
+            label.setText("Could not check for nnInteractive plugin updates.")
+            label.setStyleSheet("color: gray;")
+        elif state == "current":
+            label.setText("✓ nnInteractive plugin is up to date")
+            label.setStyleSheet("color: #27ae60; font-weight: bold;")
+        elif state == "available":
+            label.setText(
+                "⟳ nnInteractive plugin update available. Update it in the Extensions "
+                "Manager (Manage Extensions → Update), then restart Slicer."
+            )
+            label.setStyleSheet("color: #d35400; font-weight: bold;")
+
+    def _installed_plugin_revision(self):
+        """Revision string of the currently-installed extension, or '' when unknown.
+        Keys the once-per-version popup so it resets after the user updates."""
+        emm = self._emm or self._extensions_manager_model()
+        if emm is None:
+            return ""
+        try:
+            meta = emm.extensionMetadata(PLUGIN_EXTENSION_NAME)
+            return str(meta.get("revision") or meta.get("scm_revision") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _maybe_show_plugin_update_popup(self):
+        """One-time modal telling the user a newer plugin build exists and how to get it.
+        Shown at most once per installed revision (persisted to QSettings), so it never
+        nags on every launch; after the user updates, the installed revision changes and
+        a future update will notify again."""
+        if self._plugin_update_popup_shown or self._is_tearing_down():
+            return
+        # Key on the installed revision so the flag resets after an update. Fall back to
+        # a fixed marker when the revision can't be read (then: at most one popup ever).
+        marker = self._installed_plugin_revision() or "unknown"
+        if slicer.util.settingsValue(PLUGIN_UPDATE_NOTIFIED_SETTINGS_KEY, "") == marker:
+            return
+        self._plugin_update_popup_shown = True
+
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setIcon(qt.QMessageBox.Information)
+        box.setWindowTitle("nnInteractive plugin update available")
+        box.setText("A newer version of the nnInteractive Slicer extension is available.")
+        box.setInformativeText(
+            "To update, open the <b>Extensions Manager</b>, go to <b>Manage "
+            "Extensions</b>, update <b>nnInteractive</b>, then restart Slicer."
+        )
+        open_btn = box.addButton("Open Extensions Manager", qt.QMessageBox.AcceptRole)
+        box.addButton("Later", qt.QMessageBox.RejectRole)
+        box.exec_()
+
+        # Record that we've notified for this installed revision regardless of choice, so
+        # we don't re-prompt on every launch until the user actually updates.
+        settings = qt.QSettings()
+        settings.setValue(PLUGIN_UPDATE_NOTIFIED_SETTINGS_KEY, marker)
+        settings.sync()
+
+        if box.clickedButton() == open_btn:
+            self._open_extensions_manager()
+
+    def _open_extensions_manager(self):
+        """Open Slicer's Extensions Manager dialog. No-op on failure -- the Config-tab
+        label still tells the user how to update manually."""
+        try:
+            slicer.app.openExtensionsManagerDialog()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _disconnect_plugin_update_signals(self):
+        """Drop our connections to the extensions-manager model so its async callbacks
+        can't fire into a torn-down widget. Safe to call when never connected."""
+        emm = getattr(self, "_emm", None)
+        if emm is None:
+            return
+        for signal, slot in (
+            ("updateExtensionsMetadataFromServerCompleted(bool)", self._on_plugin_metadata_fetched),
+            ("extensionUpdatesAvailable(bool)", self._on_plugin_updates_available),
+        ):
+            try:
+                emm.disconnect(signal, slot)
+            except Exception:  # noqa: BLE001
+                pass
+        self._emm = None
 
     ###############################################################################
     # Utility / converters functions

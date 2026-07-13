@@ -141,6 +141,15 @@ Reinstalling first uninstalls the existing `nnInteractive` / `nninteractive-clie
 shared dependencies, e.g. PyTorch, are left in place), so switching to **Client only** cleanly
 removes local support.
 
+### Updating the plugin itself
+
+The extension is rebuilt nightly from `main` and published to the Slicer Extensions Manager, but
+Slicer does not notify users when a new build is available. The plugin therefore checks on startup
+whether a newer build of itself is published for your Slicer version (via Slicer's Extensions
+Manager). When one is, the `Configuration` tab shows **"⟳ nnInteractive plugin update available"**
+and a one-time popup (shown once per version) offers to open the Extensions Manager. To update, open
+the **Extensions Manager → Manage Extensions**, update **nnInteractive**, then restart Slicer.
+
 ### Running the official server (Remote mode)
 
 On the GPU machine, install the full package — the server is part of it, there is no separate
