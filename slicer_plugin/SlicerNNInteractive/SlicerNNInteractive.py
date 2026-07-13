@@ -767,6 +767,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.apiKeyEdit.editingFinished.connect(self._on_api_key_changed)
         remote_layout.addWidget(self.ui.apiKeyEdit)
 
+        # Let the user verify the server URL + API key before they load an image and
+        # press Initialize. Connects, checks credentials, and disconnects again -- no
+        # image required (see on_test_connection_clicked).
+        self.ui.testConnectionButton = qt.QPushButton("Test connection")
+        self.ui.testConnectionButton.setToolTip(
+            "Check that the server URL and API key are correct: connects to the server, "
+            "verifies your credentials, then disconnects. Does not require a loaded image."
+        )
+        self.ui.testConnectionButton.clicked.connect(self.on_test_connection_clicked)
+        remote_layout.addWidget(self.ui.testConnectionButton)
+
         # --- Auto-zoom (common to both modes; see _apply_autozoom_to_session) ---
         autozoom_row = qt.QHBoxLayout()
         self.ui.autozoomCheck = qt.QCheckBox("Auto-zoom")
@@ -843,6 +854,109 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.api_key = new_key
         # The key changed; drop the remote session so the next Connect uses the new key.
         self._teardown_for_settings_change()
+
+    def on_test_connection_clicked(self, checked=False):
+        """Test-connection button (Configuration tab, Remote container): verify the
+        server URL and API key WITHOUT starting a working session. Claims a lease and
+        reads the server capabilities -- exactly what Initialize does -- then releases
+        the lease immediately, so the user gets a clear yes/no (including a wrong API key
+        or a server at capacity) before loading an image and pressing Initialize.
+
+        The blocking connect runs on a worker thread behind the wait dialog, since it
+        touches the network and would otherwise freeze the UI."""
+        # Commit whatever is currently typed: the user may click Test without tabbing out
+        # of a field first, so its editingFinished may not have fired yet.
+        self.update_server()
+        key_edit = getattr(self.ui, "apiKeyEdit", None)
+        if key_edit is not None:
+            self.api_key = key_edit.text
+
+        if not self.server:
+            slicer.util.warningDisplay(
+                "Enter the server URL first (e.g. http://gpu-box:1527).",
+                parent=slicer.util.mainWindow(),
+            )
+            return
+
+        try:
+            from nnInteractive.inference.remote.remote_session import (
+                ServerAtCapacityError,
+                nnInteractiveRemoteInferenceSession,
+            )
+        except ImportError:
+            slicer.util.warningDisplay(
+                "The nnInteractive client is not installed. Open the Installation "
+                "section and click 'Reinstall / Update nnInteractive'.",
+                parent=slicer.util.mainWindow(),
+            )
+            return
+
+        import httpx
+
+        server = self.server
+        api_key = self.api_key or None
+        result = {"ok": False, "message": ""}
+
+        def _worker(done_event):
+            try:
+                session = nnInteractiveRemoteInferenceSession(
+                    server_url=server, api_key=api_key
+                )
+                # Claim succeeded: the server is reachable, the key (if any) was
+                # accepted, and a slot was free. Release it again right away.
+                try:
+                    result["ok"] = True
+                    result["message"] = (
+                        f"Connection OK.\n\nThe server at {server} is reachable and your "
+                        "credentials were accepted. You can load an image and click "
+                        "Initialize."
+                    )
+                finally:
+                    session.close()
+            except ServerAtCapacityError:
+                # 503: reachable + authorised, just no free slot right now.
+                result["message"] = (
+                    f"The server at {server} is reachable and your credentials look "
+                    "fine, but it is currently at capacity (no free session slot). Try "
+                    "again shortly."
+                )
+            except httpx.HTTPStatusError as exc:
+                code = exc.response.status_code
+                if code in (401, 403):
+                    result["message"] = (
+                        "The server is reachable, but it rejected your API key "
+                        f"(HTTP {code}). Check the API key field."
+                    )
+                elif code == 404:
+                    result["message"] = (
+                        "Reached a server at this address, but it does not look like an "
+                        f"nnInteractive server (HTTP {code}). Check the URL and port."
+                    )
+                else:
+                    result["message"] = (
+                        f"The server returned an unexpected error (HTTP {code})."
+                    )
+            except httpx.HTTPError as exc:
+                # Connect/timeout/DNS/proxy errors all land here.
+                result["message"] = (
+                    f"Could not reach a server at {server}.\n\n"
+                    f"{type(exc).__name__}: {exc}\n\n"
+                    "Check the URL and port, and that the server is running and "
+                    "reachable from this machine."
+                )
+            except Exception as exc:  # noqa: BLE001 - report anything else verbatim
+                result["message"] = (
+                    f"Connection test failed:\n\n{type(exc).__name__}: {exc}"
+                )
+            finally:
+                done_event.set()
+
+        self._run_thread_with_message(_worker, (), f"Testing connection to {server} ...")
+
+        if result["ok"]:
+            slicer.util.infoDisplay(result["message"], parent=slicer.util.mainWindow())
+        else:
+            slicer.util.warningDisplay(result["message"], parent=slicer.util.mainWindow())
 
     def on_mode_changed(self, mode):
         if mode == self.get_mode():
