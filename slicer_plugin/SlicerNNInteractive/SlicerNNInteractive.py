@@ -222,6 +222,16 @@ def ensure_synched(func):
         if not self.ensure_session():
             return
 
+        # The user can delete the layers the session is bound to (its source volume or
+        # segmentation) from the Data module while a session is live. The backend keeps
+        # its now-stale image/seed, so the next prompt would either segment against the
+        # wrong node or drop the backend into an invalid state (random log errors). Catch
+        # the deletion here, BEFORE the re-sync below overwrites the recorded identities.
+        missing_layers = self._check_session_layers_present()
+        if missing_layers:
+            self._handle_deleted_session_layers(missing_layers)
+            return
+
         try:
             # Per-step timing (set DEBUG_MODE = True at the top of this file to see it):
             # this is the GUI work that wraps every prompt, so it shows where the
@@ -3299,15 +3309,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
         active_tool = self._active_prompt_tool()
 
-        # Collapse the finished object's labelmaps once here (a storage optimization
-        # kept off the per-prediction hot path in show_segmentation).
-        seg_node = self.get_segmentation_node()
-        if seg_node is not None and seg_node.GetSegmentation().GetNumberOfSegments() > 0:
-            try:
-                seg_node.GetSegmentation().CollapseBinaryLabelmaps()
-            except Exception:  # noqa: BLE001
-                pass
-
+        # DO NOT collapse labelmaps here (or anywhere during editing). Segments may
+        # overlap freely, which requires each to stay on its OWN labelmap layer -- a
+        # single layer stores one value per voxel and physically cannot represent two
+        # segments sharing a voxel. CollapseBinaryLabelmaps(forceToSingleLayer=False)
+        # packs segments that don't *currently* overlap onto one shared layer; if the
+        # user later grows one into another, the shared-layer write silently zeroes the
+        # other in the overlap. That was the sporadic "updates overwrite existing labels"
+        # bug -- it only fired when a collapse packed two non-overlapping segments and a
+        # later edit made them overlap. Collapsing is a storage optimization only; do it
+        # at save/export time if at all, never on the editing path.
         self.reset_all_prompts()
         result = self.make_new_segment()
 
@@ -3664,9 +3675,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Mark the segmentation as modified so the UI updates
         segmentationNode.Modified()
 
-        # NOTE: CollapseBinaryLabelmaps() is NOT called here. It is O(volume x segments)
-        # and ran on every prediction; collapsing is a storage optimization that we now
-        # do once per object (on 'Next segment') instead of on the interactive hot path.
+        # NOTE: CollapseBinaryLabelmaps() is NOT called here -- nor anywhere on the
+        # editing path (see on_next_segment). Besides being O(volume x segments), it
+        # packs non-overlapping segments onto a shared layer, which breaks free overlap:
+        # a later edit that grows one segment into another then zeroes the other. Keep
+        # every segment on its own layer while editing.
         del segmentation_mask
 
         # Record the post-write fingerprint so selected_segment_changed() sees "no change"
@@ -4541,6 +4554,52 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 self.apply_result(changed_bbox)
         else:
             self.apply_result()
+
+    def _check_session_layers_present(self):
+        """Return human-readable names of the scene layers the *live* session is bound to
+        but which no longer exist. Uses the identities recorded at the last image/segment
+        sync (``previous_states``), so it reflects exactly what the backend currently
+        holds: ``image_data`` is ``(volume_node_id, mtime)`` and ``segment_fp`` is
+        ``(segmentation_node_id, segment_id, mtime)``. Returns an empty list when there is
+        no live session or nothing has been synced yet (a missing record is "not yet
+        synced", not "deleted", so it is never flagged)."""
+        if self.session is None:
+            return []
+
+        missing = []
+
+        image_fp = self.previous_states.get("image_data")
+        if image_fp is not None:
+            volume_id = image_fp[0]
+            if volume_id and slicer.mrmlScene.GetNodeByID(volume_id) is None:
+                missing.append("the source volume")
+
+        segment_fp = self.previous_states.get("segment_fp")
+        if segment_fp is not None:
+            seg_node_id, segment_id = segment_fp[0], segment_fp[1]
+            seg_node = slicer.mrmlScene.GetNodeByID(seg_node_id) if seg_node_id else None
+            if seg_node is None:
+                missing.append("the segmentation")
+            elif segment_id and seg_node.GetSegmentation().GetSegment(segment_id) is None:
+                missing.append("the segment being refined")
+
+        return missing
+
+    def _handle_deleted_session_layers(self, missing):
+        """A layer the live session depends on was deleted from the scene (see
+        _check_session_layers_present). Drop the session and tell the user, so the next
+        prompt starts from a clean, consistent state instead of a failed one."""
+        self.release_session()
+        self.update_connect_status(connected=False)
+        layers = " and ".join(missing)
+        slicer.util.warningDisplay(
+            f"nnInteractive was working on {layers}, but it was removed from the scene "
+            "(deleted in the Data module). The session has been reset to avoid an invalid "
+            "state. Click Initialize at the top of the 'nnInteractive Prompts' tab to "
+            "start again; any segmentation still in the scene is preserved and will be "
+            "re-seeded automatically.",
+            parent=slicer.util.mainWindow(),
+        )
 
     def handle_session_expired(self, exc=None):
         """A remote lease was lost; drop the session and let the user reconnect."""
