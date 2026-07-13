@@ -217,6 +217,15 @@ def ensure_synched(func):
     """
 
     def inner(self, *args, **kwargs):
+        # A prediction is already running on the worker thread; the event-loop pump
+        # dispatched this new prompt. Ignore it -- the session is single-threaded and
+        # stateful, so a concurrent interaction would corrupt it. (Once the modal
+        # "Predicting ..." dialog is up it blocks input; this covers the brief window
+        # before it appears.)
+        if getattr(self, "_prediction_in_flight", False):
+            debug_print("Prompt ignored: a prediction is already running.")
+            return
+
         # Make sure we have a live session (constructs a local one or connects
         # to a remote server, depending on the configured mode).
         if not self.ensure_session():
@@ -374,6 +383,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.SESSION_LOST_ERRORS = tuple()
         self.previous_states = {}
         self._heartbeat_timer = None
+        # True while a prediction runs on the worker thread (see _run_prediction). Guards
+        # against re-entrancy: the event-loop pump keeps dispatching input, so a second
+        # prompt / undo fired mid-prediction would call into the single, stateful session
+        # concurrently with the worker. Handlers check this and no-op while it is set.
+        self._prediction_in_flight = False
         # One visual-undo closure per interaction sent to the session, popped on Ctrl+Z
         # so the prompt marker of the undone interaction disappears together with the
         # reverted segmentation. Kept in lockstep with the session's interaction order.
@@ -2049,6 +2063,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     COLOR_POSITIVE = (0.20, 0.85, 0.20)
     COLOR_NEGATIVE = (0.90, 0.15, 0.15)
 
+    # A prediction shows a busy cursor immediately, but only escalates to a modal
+    # "Predicting ..." dialog once it has run this long. Most prompts finish faster
+    # (autozoom-triggering ones are the slow exception) and never flash a dialog.
+    PREDICTION_DIALOG_DELAY_S = 2.0
+
     def _polarity_color(self, positive):
         """The single positive->green / negative->red mapping used by every prompt visual."""
         return self.COLOR_POSITIVE if positive else self.COLOR_NEGATIVE
@@ -2376,10 +2395,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         debug_print(f"{positive_click} point prompt triggered! {xyz}")
         t0 = time.time()
-        changed_bbox = self.session.add_point_interaction(
-            xyz[::-1],
-            include_interaction=bool(positive_click),
-            run_prediction=True,
+        changed_bbox = self._run_prediction(
+            lambda: self.session.add_point_interaction(
+                xyz[::-1],
+                include_interaction=bool(positive_click),
+                run_prediction=True,
+            )
         )
         t1 = time.time()
         self.apply_result(changed_bbox)
@@ -2604,10 +2625,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         p1 = outer_point_one[::-1]
         p2 = outer_point_two[::-1]
         bbox = [[int(min(a, b)), int(max(a, b)) + 1] for a, b in zip(p1, p2)]
-        changed_bbox = self.session.add_bbox_interaction(
-            bbox,
-            include_interaction=bool(positive_click),
-            run_prediction=True,
+        changed_bbox = self._run_prediction(
+            lambda: self.session.add_bbox_interaction(
+                bbox,
+                include_interaction=bool(positive_click),
+                run_prediction=True,
+            )
         )
         # The box markup is cleared right after it is sent (a fresh box placement is
         # started), so there is no lingering marker to remove; push a no-op to keep the
@@ -3151,11 +3174,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             if tp == "lasso"
             else self.session.add_scribble_interaction
         )
-        changed_bbox = add_interaction(
-            crop,
-            include_interaction=bool(positive_click),
-            run_prediction=True,
-            interaction_bbox=interaction_bbox,
+        changed_bbox = self._run_prediction(
+            lambda: add_interaction(
+                crop,
+                include_interaction=bool(positive_click),
+                run_prediction=True,
+                interaction_bbox=interaction_bbox,
+            )
         )
         self.apply_result(changed_bbox)
         return True
@@ -3421,6 +3446,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # The 'e' shortcut bypasses the disabled button, so enforce mandatory init here.
         if not self._require_initialized():
             return
+        # A prediction may be mid-flight (pre-dialog window); reset_interactions() below
+        # would race the worker's session call.
+        if getattr(self, "_prediction_in_flight", False):
+            return
         active_tool = self._active_prompt_tool()
 
         # DO NOT collapse labelmaps here (or anywhere during editing). Segments may
@@ -3527,6 +3556,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         # The 'r' shortcut bypasses the disabled button, so enforce mandatory init here.
         if not self._require_initialized():
+            return
+        # A prediction may be mid-flight (pre-dialog window); reset_interactions() below
+        # would race the worker's session call.
+        if getattr(self, "_prediction_in_flight", False):
             return
         # Remember the active tool so it can be re-armed after the reset (below).
         active_tool = self._active_prompt_tool()
@@ -4599,6 +4632,102 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if error[0] is not None:
             raise error[0]
 
+    def _run_prediction(self, predict_fn):
+        """Run a blocking session prediction (``predict_fn`` -- session-only, NO Qt/MRML
+        access) on a worker thread while pumping the Qt event loop, so a long (e.g. 20s)
+        prediction no longer freezes the GUI or trips the OS "not responding" state.
+
+        A wait cursor appears while it runs (from the first pump tick, so sub-tick prompts
+        never flicker it); a modal "Predicting ..." dialog with an elapsed-seconds counter
+        appears only if the prediction runs past PREDICTION_DIALOG_DELAY_S (fast prompts
+        never flash it). While the dialog is up it is modal, so input to the rest of the
+        GUI is blocked; the brief pre-dialog window is covered by the
+        ``_prediction_in_flight`` guard that handlers check.
+
+        The remote heartbeat timer is paused for the duration: once the predict runs on a
+        worker, a heartbeat firing from the main-thread timer would be a second concurrent
+        call into the same session/lease. ``predict_fn``'s return value is returned here on
+        the main thread; a worker exception is re-raised (so the @ensure_synched wrapper's
+        SESSION_LOST handling still applies)."""
+        result = [None]
+        error = [None]
+
+        def _worker(done_event):
+            try:
+                result[0] = predict_fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread below
+                error[0] = exc
+            finally:
+                done_event.set()
+
+        # Pause the heartbeat so it can't call into the session concurrently with the worker.
+        timer = getattr(self, "_heartbeat_timer", None)
+        heartbeat_was_active = timer is not None and timer.isActive()
+        if heartbeat_was_active:
+            timer.stop()
+
+        self._prediction_in_flight = True
+        qt.QApplication.setOverrideCursor(qt.QCursor(qt.Qt.WaitCursor))
+        dialog = None
+        label = None
+        start = time.time()
+
+        done_event = threading.Event()
+        worker = threading.Thread(target=_worker, args=(done_event,))
+        worker.start()
+        try:
+            # Wait on the event with a short timeout (releases the GIL so the worker runs
+            # at full speed) and pump the event loop between waits. A tight processEvents()
+            # spin would keep re-acquiring the GIL and starve the worker.
+            while not done_event.wait(0.03):
+                elapsed = time.time() - start
+                if dialog is None and elapsed >= self.PREDICTION_DIALOG_DELAY_S:
+                    dialog, label = self._make_prediction_dialog()
+                if label is not None:
+                    label.setText(self._prediction_wait_text(elapsed))
+                slicer.app.processEvents()
+            worker.join()
+        finally:
+            if dialog is not None:
+                dialog.close()
+                dialog.deleteLater()
+            qt.QApplication.restoreOverrideCursor()
+            self._prediction_in_flight = False
+            # Resume the heartbeat if it was running and the session is still alive. If the
+            # prediction lost the lease, ensure_synched -> handle_session_expired tears it
+            # down right after, which stops the timer again.
+            if (heartbeat_was_active and self.session is not None
+                    and hasattr(self.session, "heartbeat")):
+                self._start_heartbeat_timer()
+            slicer.app.processEvents()  # let the dialog-close / cursor-restore paint land
+
+        if error[0] is not None:
+            raise error[0]
+        return result[0]
+
+    def _make_prediction_dialog(self):
+        """Modal, button-less "Predicting ..." dialog (label updated each pump tick).
+        Modeled on _run_thread_with_message's dialog; returns ``(dialog, label)``."""
+        dialog = qt.QDialog(slicer.util.mainWindow())
+        dialog.setWindowTitle("nnInteractive")
+        dialog.setModal(True)
+        dialog.setWindowFlags(
+            qt.Qt.Dialog | qt.Qt.CustomizeWindowHint | qt.Qt.WindowTitleHint
+        )
+        layout = qt.QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 20, 24, 20)
+        label = qt.QLabel(self._prediction_wait_text(self.PREDICTION_DIALOG_DELAY_S))
+        layout.addWidget(label)
+        dialog.show()
+        slicer.app.processEvents()
+        return dialog, label
+
+    def _prediction_wait_text(self, elapsed):
+        return (
+            f"Predicting … ({int(elapsed)}s)\n\n"
+            "This can take longer on large volumes or on CPU."
+        )
+
     def sync_image_to_session(self):
         """Push the current volume into the session and allocate the target buffer.
         The blocking upload runs on a worker thread behind the wait dialog (it fires
@@ -4642,13 +4771,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def on_undo(self):
         """Undo the most recent interaction (if the session supports it)."""
+        # Don't call into the session while a prediction is mid-flight on the worker
+        # thread (see _run_prediction / the ensure_synched guard).
+        if getattr(self, "_prediction_in_flight", False):
+            return
         if self.session is None:
             return
         if not getattr(self.session, "supports_undo", False):
             slicer.util.showStatusMessage("Undo is not supported by this model.", 4000)
             return
         try:
-            undone = self.session.undo()
+            # Undo can re-run the model (it recomputes from the remaining interactions),
+            # so drive it through the same non-blocking worker path as a prompt.
+            undone = self._run_prediction(lambda: self.session.undo())
         except self.SESSION_LOST_ERRORS as exc:
             self.handle_session_expired(exc)
             return
