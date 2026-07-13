@@ -1447,7 +1447,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         def _update_once():
             self._scene_change_update_queued = False
             if not self._is_tearing_down():
-                self._update_initialize_button_state()
+                # Full status sync (not just the button): the status line's "load an
+                # image..." hint must clear the moment a volume is loaded, and reappear
+                # if all volumes are removed. update_connect_status re-runs
+                # _update_initialize_button_state itself.
+                self.update_connect_status(connected=self.session is not None)
 
         qt.QTimer.singleShot(0, _update_once)
 
@@ -4670,6 +4674,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # Show which mode a press will start, so the user sees it before clicking.
             action = "Initialize (Local)" if mode == "local" else "Initialize (Remote)"
             status = "not initialized"
+        # Initialize is disabled until an image is loaded (see
+        # _update_initialize_button_state). Flag that in red so a greyed-out button
+        # doesn't just look broken.
+        no_image = not connected and not self._has_volume_loaded()
+        if no_image:
+            status = "No image loaded"
+        status_style = "color: #d9534f; font-weight: bold;" if no_image else ""
         if hasattr(self.ui, "initializeButton"):
             self.ui.initializeButton.setText(action)
             self.ui.initializeButton.setStyleSheet(
@@ -4678,11 +4689,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         label = getattr(self.ui, "connectStatusLabel", None)
         if label is not None:
             label.setText(f"Status: {status}")
-        # The Prompts tab combines status and model license in one line to save space.
+            label.setStyleSheet(status_style)
+        # The Prompts tab combines status and model license in one line to save space,
+        # but with no image there is no model yet, so show just the (red) status.
         label = getattr(self.ui, "promptsStatusLabel", None)
         if label is not None:
-            license_text = getattr(self, "_model_license_text", "Model license: —")
-            label.setText(f"Status: {status}  |  {license_text}")
+            if no_image:
+                label.setText(f"Status: {status}")
+            else:
+                license_text = getattr(self, "_model_license_text", "Model license: —")
+                label.setText(f"Status: {status}  |  {license_text}")
+            label.setStyleSheet(status_style)
         # After a successful local Initialize the full backend is present; fill the
         # dropdown if it was still empty when the user opened the tab.
         if connected and mode == "local":
