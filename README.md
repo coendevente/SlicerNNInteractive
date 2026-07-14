@@ -186,8 +186,10 @@ the upstream [DOCKER.md](https://github.com/MIC-DKFZ/nnInteractive/blob/master/n
 for both flavours and configuration.
 
 In Slicer's `Configuration` tab, set the server URL — e.g. `http://remote_host_name:1527`, or
-`http://localhost:1527` if the server runs on the same machine — and the API key, then click
-`Initialize` at the top of the `nnInteractive Prompts` tab.
+`http://localhost:1527` if the server runs on the same machine — and the API key. You can click
+`Test connection` to verify the URL and API key before loading an image — it connects, checks your
+credentials, and disconnects again, without requiring a loaded image. Then click `Initialize` at the
+top of the `nnInteractive Prompts` tab.
 
 ## Usage
 
