@@ -1,5 +1,6 @@
 import contextlib
 import os
+import queue
 import threading
 import time
 
@@ -217,7 +218,7 @@ def ensure_synched(func):
     """
 
     def inner(self, *args, **kwargs):
-        # A prediction is already running on the worker thread; the event-loop pump
+        # A prediction is already running on the session-executor thread; the event-loop pump
         # dispatched this new prompt. Ignore it -- the session is single-threaded and
         # stateful, so a concurrent interaction would corrupt it. (Once the modal
         # "Predicting ..." dialog is up it blocks input; this covers the brief window
@@ -350,6 +351,65 @@ class _LassoFreehandFilter(qt.QObject):
 
 
 ###############################################################################
+# _SessionExecutor
+###############################################################################
+
+
+class _SessionExecutor:
+    """Single persistent daemon thread running ALL blocking nnInteractive session
+    work (model load + warmup, predictions, uploads). One thread for the session's
+    whole lifetime because PyTorch's cuDNN benchmark/plan cache is THREAD-LOCAL:
+    the warmup only speeds up predictions that later run on the SAME thread (a
+    fresh thread per prediction re-benchmarks every conv: ~1.2 s vs ~0.11 s per
+    interaction, measured on an RTX 4090)."""
+
+    _SENTINEL = object()
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._loop, name="nnInteractiveSessionExecutor", daemon=True
+        )
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            item = self._queue.get()
+            if item is self._SENTINEL:
+                return
+            fn, result, error, done_event = item
+            try:
+                result[0] = fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised by the caller
+                error[0] = exc
+            finally:
+                done_event.set()
+            # Drop the finished job's references before blocking on the next get(),
+            # so its closure isn't pinned alive across the idle wait. Matters for the
+            # upload closure, which captures the full image volume (the caller holds
+            # its own refs to result/error/done_event, so this is safe).
+            del item, fn, result, error, done_event
+
+    def submit(self, fn):
+        """Queue ``fn`` to run on the executor thread. Returns
+        ``(done_event, result_cell, error_cell)`` -- the caller pumps the Qt event
+        loop until done_event is set, then re-raises error_cell[0] if present."""
+        if not self._thread.is_alive():
+            raise RuntimeError("nnInteractive session executor is not running")
+        result, error = [None], [None]
+        done_event = threading.Event()
+        self._queue.put((fn, result, error, done_event))
+        return done_event, result, error
+
+    def shutdown(self, timeout=5.0):
+        """Stop the thread after any queued work; bounded join (daemon thread, so a
+        worker stuck in a long CUDA call can never block teardown or app exit).
+        Idempotent."""
+        self._queue.put(self._SENTINEL)
+        self._thread.join(timeout)
+
+
+###############################################################################
 # SlicerNNInteractiveWidget
 ###############################################################################
 
@@ -372,6 +432,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         # nnInteractive session state (constructed lazily on first prompt / Connect).
         self.session = None
+        # Persistent worker thread for ALL blocking session work; created/destroyed
+        # together with self.session (see _SessionExecutor's docstring for why one
+        # long-lived thread matters: cuDNN's plan cache is thread-local).
+        self._session_executor = None
         self.target_buffer = None
         self.api_key = ""
         self.server = ""
@@ -383,7 +447,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.SESSION_LOST_ERRORS = tuple()
         self.previous_states = {}
         self._heartbeat_timer = None
-        # True while a prediction runs on the worker thread (see _run_prediction). Guards
+        # True while a prediction runs on the session-executor thread (see
+        # _run_prediction). Guards
         # against re-entrancy: the event-loop pump keeps dispatching input, so a second
         # prompt / undo fired mid-prediction would call into the single, stateful session
         # concurrently with the worker. Handlers check this and no-op while it is set.
@@ -1294,8 +1359,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     @contextlib.contextmanager
     def _busy_dialog(self, message):
-        """Indeterminate busy dialog for MAIN-thread blocking work (shared by the pip
-        installers and the local model load).
+        """Indeterminate busy dialog for MAIN-thread blocking work (the pip
+        installers).
 
         Showing a window is an asynchronous round trip through the window server, and
         once the caller blocks the main thread nothing repaints -- whatever was
@@ -1395,16 +1460,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # download) -- otherwise this dialog lingers frozen on screen.
         slicer.app.processEvents()
 
-    def _run_thread_with_message(self, target, args, message):
-        """Run ``target(*args, done_event)`` in a worker thread while showing a simple
-        modal message dialog -- a label only, NO progress bar -- and pumping the Qt
-        event loop so it stays painted.
-
-        Used for opaque, unmeasurable work like the image upload: the client sends the
-        image in one blocking call with no byte-level progress callback, so a progress
-        bar could only ever jump 0%->done, which is misleading. A plain "please wait"
-        message is the honest UI here.
-        """
+    def _make_wait_dialog(self, message):
+        """Modal, button-less "please wait" dialog -- a label only, NO progress bar --
+        shown and painted immediately. Returns ``(dialog, label)``; the label is kept
+        so callers that update the text per pump tick (_make_prediction_dialog) can
+        reuse it. Shared by _run_thread_with_message, _run_on_executor_with_message
+        and _make_prediction_dialog; the caller closes the dialog."""
         dialog = qt.QDialog(slicer.util.mainWindow())
         dialog.setWindowTitle("nnInteractive")
         dialog.setModal(True)
@@ -1415,9 +1476,24 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         dialog_layout = qt.QVBoxLayout(dialog)
         dialog_layout.setContentsMargins(24, 20, 24, 20)
-        dialog_layout.addWidget(qt.QLabel(message))
+        label = qt.QLabel(message)
+        dialog_layout.addWidget(label)
         dialog.show()
         slicer.app.processEvents()
+        return dialog, label
+
+    def _run_thread_with_message(self, target, args, message):
+        """Run ``target(*args, done_event)`` in a throwaway worker thread while showing
+        a simple modal message dialog and pumping the Qt event loop so it stays painted.
+
+        Used for opaque, unmeasurable NON-session work (connection test, PyTorch
+        install): with no byte-level progress callback, a progress bar could only ever
+        jump 0%->done, so a plain "please wait" message is the honest UI here. Work
+        that calls into ``self.session`` must go through _run_on_executor_with_message
+        instead, so it runs on the persistent session-executor thread (cuDNN cache
+        locality -- see _SessionExecutor).
+        """
+        dialog, _ = self._make_wait_dialog(message)
 
         done_event = threading.Event()
         worker = threading.Thread(target=target, args=(*args, done_event))
@@ -1433,6 +1509,29 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         dialog.close()
         dialog.deleteLater()
         slicer.app.processEvents()
+
+    def _run_on_executor_with_message(self, fn, message):
+        """Run ``fn()`` on the persistent session-executor thread while showing a
+        modal "please wait" dialog and pumping the Qt event loop (same UX as
+        _run_thread_with_message, but no throwaway thread -- session work must all
+        land on the one executor thread so its thread-local cuDNN plan cache stays
+        warm, see _SessionExecutor). The dialog's modality blocks user input while
+        the pumped event loop keeps the UI painted. ``fn``'s return value is
+        returned here on the main thread; a worker exception is re-raised."""
+        dialog, _ = self._make_wait_dialog(message)
+
+        done_event, result, error = self._session_executor.submit(fn)
+        # Same pump-with-timeout pattern as _run_thread_with_message (GIL note there).
+        while not done_event.wait(0.03):
+            slicer.app.processEvents()
+
+        dialog.close()
+        dialog.deleteLater()
+        slicer.app.processEvents()
+
+        if error[0] is not None:
+            raise error[0]
+        return result[0]
 
     def cleanup(self):
         """
@@ -1497,6 +1596,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._stop_heartbeat_timer()
         self._stop_update_poll_timer()
         self._disconnect_plugin_update_signals()
+        # The session-executor thread is torn down by cleanup() -> release_session(),
+        # which Slicer calls right after this; no separate stop is needed here (the
+        # thread is a daemon, so it can never block quit either way).
         # aboutToQuit fires while the scene is still valid: remove the prompt/scribble
         # nodes we created (and drop our references) now, so their VTK pipelines are
         # freed before the scene is torn down instead of lingering as reported leaks.
@@ -4130,6 +4232,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Recomputed by _construct_local_session; a remote session never runs on our CPU.
         # (The early-return reuse path above keeps the previous value untouched.)
         self._local_running_on_cpu = False
+        # Executor and session live/die together: created here, torn down in
+        # release_session. For a local session, the model load + warmup below runs ON
+        # this thread, warming its thread-local cuDNN plan cache for all predictions.
+        self._session_executor = _SessionExecutor()
         try:
             if mode == "local":
                 self.session = self._construct_local_session()
@@ -4139,7 +4245,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.handle_session_expired(exc)
             return False
         except Exception as exc:  # noqa: BLE001 - surface any setup failure
-            self.session = None
+            self.release_session()  # also stops the executor thread
             slicer.util.errorDisplay(
                 f"Could not start nnInteractive ({mode} mode):\n\n{exc}",
                 parent=slicer.util.mainWindow(),
@@ -4159,14 +4265,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         The slow, torch-heavy work -- importing torch, initializing the device,
         constructing the session, loading the weights and the warmup forward pass --
-        runs ON THE MAIN THREAD behind a busy dialog (painted once, then frozen while
-        torch works). Main thread ON PURPOSE: prompts run on the main thread and
-        PyTorch's cuDNN benchmark/plan cache is THREAD-LOCAL, so a worker-thread
-        warmup leaves the first main-thread prediction ~1.1 s slower while cuDNN
-        re-benchmarks every conv (measured on an RTX 4090: 1.28 s vs 0.14 s steady
-        state). Loading here keeps every cache on the thread that predicts. The wait
-        is bounded: ~4.6 s with a warm torch.compile cache, ~15 s on the first-ever
-        run (cold inductor cache), less with compile off.
+        runs ON THE SESSION-EXECUTOR THREAD behind a modal wait dialog while the main
+        thread pumps the event loop (dialog stays painted, input blocked). Executor
+        thread ON PURPOSE: predictions dispatch to that same thread and PyTorch's
+        cuDNN benchmark/plan cache is THREAD-LOCAL, so warming up anywhere else would
+        leave every prediction ~1.1 s slower while cuDNN re-benchmarks every conv
+        (measured on an RTX 4090: 1.28 s vs 0.14 s steady state). Loading here keeps
+        every cache on the one thread that predicts. The wait is bounded: ~4.6 s with
+        a warm torch.compile cache, ~15 s on the first-ever run (cold inductor
+        cache), less with compile off.
 
         The weights download runs first (its own progress dialog). Dependencies are
         NOT installed here -- ensure_session() has already verified the full backend
@@ -4231,8 +4338,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             # Load the weights. initialize_from_trained_model_folder() runs the warmup
             # forward pass internally (torch.compile compilation + cuDNN autotuning);
-            # because this is the main thread, the thread-local cuDNN plan cache is
-            # warmed for the very thread prompts run on (see the docstring above).
+            # because this runs on the session-executor thread -- the same thread every
+            # prediction dispatches to -- the thread-local cuDNN plan cache is warmed
+            # exactly once for the thread that will use it (see the docstring above).
             # Do NOT call warmup() again -- it would run twice.
             session.initialize_from_trained_model_folder(
                 checkpoint_path, 0, "checkpoint_final.pth"
@@ -4242,32 +4350,38 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         session = None
         on_cpu = False
         load_error = None
-        with self._busy_dialog(
+        load_message = (
             "Initializing nnInteractive: loading the model and warming it up.\n"
             "This takes a few seconds -- or a few minutes on first use."
-        ):
-            try:
-                session, on_cpu = _build_session(use_compile)
-            except ImportError as exc:
-                load_error = exc
-            except Exception as exc:  # noqa: BLE001
-                if use_compile:
-                    # torch_compile_unsupported_reason() only proves the headers
-                    # exist, not that the inductor/triton toolchain actually works.
-                    # Never leave the user blocked by a broken compile stack: retry
-                    # once in eager mode (also reloads the weights; acceptable for
-                    # this failure path).
-                    print(
-                        f"[nnInteractive] torch.compile initialization failed ({exc}); "
-                        "retrying without torch.compile."
+        )
+        # Each attempt runs on the session-executor thread (see the docstring above);
+        # the retry orchestration stays here on the main thread.
+        try:
+            session, on_cpu = self._run_on_executor_with_message(
+                lambda: _build_session(use_compile), load_message
+            )
+        except ImportError as exc:
+            load_error = exc
+        except Exception as exc:  # noqa: BLE001
+            if use_compile:
+                # torch_compile_unsupported_reason() only proves the headers
+                # exist, not that the inductor/triton toolchain actually works.
+                # Never leave the user blocked by a broken compile stack: retry
+                # once in eager mode (also reloads the weights; acceptable for
+                # this failure path).
+                print(
+                    f"[nnInteractive] torch.compile initialization failed ({exc}); "
+                    "retrying without torch.compile."
+                )
+                no_compile_reason = "torch.compile failed at initialization."
+                try:
+                    session, on_cpu = self._run_on_executor_with_message(
+                        lambda: _build_session(False), load_message
                     )
-                    no_compile_reason = "torch.compile failed at initialization."
-                    try:
-                        session, on_cpu = _build_session(False)
-                    except Exception as exc2:  # noqa: BLE001
-                        load_error = exc2
-                else:
-                    load_error = exc
+                except Exception as exc2:  # noqa: BLE001
+                    load_error = exc2
+            else:
+                load_error = exc
 
         # No lazy repair: if the import failed, surface a clear message rather than
         # silently reinstalling. ALWAYS include the underlying error -- an ImportError
@@ -4621,33 +4735,27 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         return None
 
     def _run_session_upload(self, upload_fn):
-        """Run session-only upload work (no Qt/MRML access) on a worker thread behind
-        the modal wait dialog, pumping the event loop so the UI stays painted instead
-        of freezing for the (possibly long, especially remote) blocking call. Worker
-        errors are re-raised here on the calling (main) thread."""
-        error = [None]
-
-        def _worker(done_event):
-            try:
-                upload_fn()
-            except BaseException as exc:  # noqa: BLE001 - re-raised below
-                error[0] = exc
-            finally:
-                done_event.set()
-
+        """Run session-only upload work (no Qt/MRML access) on the persistent
+        session-executor thread behind the modal wait dialog, pumping the event loop
+        so the UI stays painted instead of freezing for the (possibly long,
+        especially remote) blocking call. Routing through the executor keeps ALL
+        session calls on one thread (see _SessionExecutor). Worker errors are
+        re-raised here on the calling (main) thread."""
         message = (
             "Sending image to the nnInteractive server ..."
             if self.get_mode() == "remote"
             else "Preparing image for nnInteractive ..."
         )
-        self._run_thread_with_message(_worker, (), message)
-        if error[0] is not None:
-            raise error[0]
+        return self._run_on_executor_with_message(upload_fn, message)
 
     def _run_prediction(self, predict_fn):
         """Run a blocking session prediction (``predict_fn`` -- session-only, NO Qt/MRML
-        access) on a worker thread while pumping the Qt event loop, so a long (e.g. 20s)
-        prediction no longer freezes the GUI or trips the OS "not responding" state.
+        access) on the persistent session-executor thread while pumping the Qt event
+        loop, so a long (e.g. 20s) prediction no longer freezes the GUI or trips the OS
+        "not responding" state. The executor is the SAME thread that loaded and warmed
+        up the model, so cuDNN's thread-local plan cache stays warm across interactions
+        (a fresh thread per prediction would re-benchmark every conv, ~1.2 s vs ~0.11 s
+        -- see _SessionExecutor).
 
         A wait cursor appears while it runs (from the first pump tick, so sub-tick prompts
         never flicker it); a modal "Predicting ..." dialog with an elapsed-seconds counter
@@ -4661,17 +4769,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         call into the same session/lease. ``predict_fn``'s return value is returned here on
         the main thread; a worker exception is re-raised (so the @ensure_synched wrapper's
         SESSION_LOST handling still applies)."""
-        result = [None]
-        error = [None]
-
-        def _worker(done_event):
-            try:
-                result[0] = predict_fn()
-            except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread below
-                error[0] = exc
-            finally:
-                done_event.set()
-
         # Pause the heartbeat so it can't call into the session concurrently with the worker.
         timer = getattr(self, "_heartbeat_timer", None)
         heartbeat_was_active = timer is not None and timer.isActive()
@@ -4684,10 +4781,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         label = None
         start = time.time()
 
-        done_event = threading.Event()
-        worker = threading.Thread(target=_worker, args=(done_event,))
-        worker.start()
         try:
+            done_event, result, error = self._session_executor.submit(predict_fn)
             # Wait on the event with a short timeout (releases the GIL so the worker runs
             # at full speed) and pump the event loop between waits. A tight processEvents()
             # spin would keep re-acquiring the GIL and starve the worker.
@@ -4698,7 +4793,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 if label is not None:
                     label.setText(self._prediction_wait_text(elapsed))
                 slicer.app.processEvents()
-            worker.join()
         finally:
             if dialog is not None:
                 dialog.close()
@@ -4718,21 +4812,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         return result[0]
 
     def _make_prediction_dialog(self):
-        """Modal, button-less "Predicting ..." dialog (label updated each pump tick).
-        Modeled on _run_thread_with_message's dialog; returns ``(dialog, label)``."""
-        dialog = qt.QDialog(slicer.util.mainWindow())
-        dialog.setWindowTitle("nnInteractive")
-        dialog.setModal(True)
-        dialog.setWindowFlags(
-            qt.Qt.Dialog | qt.Qt.CustomizeWindowHint | qt.Qt.WindowTitleHint
+        """Modal, button-less "Predicting ..." dialog (label updated each pump tick);
+        returns ``(dialog, label)``."""
+        return self._make_wait_dialog(
+            self._prediction_wait_text(self.PREDICTION_DIALOG_DELAY_S)
         )
-        layout = qt.QVBoxLayout(dialog)
-        layout.setContentsMargins(24, 20, 24, 20)
-        label = qt.QLabel(self._prediction_wait_text(self.PREDICTION_DIALOG_DELAY_S))
-        layout.addWidget(label)
-        dialog.show()
-        slicer.app.processEvents()
-        return dialog, label
 
     def _prediction_wait_text(self, elapsed):
         return (
@@ -4742,8 +4826,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def sync_image_to_session(self):
         """Push the current volume into the session and allocate the target buffer.
-        The blocking upload runs on a worker thread behind the wait dialog (it fires
-        mid-prompt, so a synchronous call would freeze the UI for its duration)."""
+        The blocking upload runs on the session-executor thread behind the wait dialog
+        (it fires mid-prompt, so a synchronous call would freeze the UI for its
+        duration)."""
         payload = self._build_image_payload()
         if payload is None:
             debug_print("No image data available to sync.")
@@ -4886,6 +4971,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     pass
         self.session = None
         self._session_mode = None
+        # Stop the session-executor thread together with the session (a new session
+        # gets a fresh executor in ensure_session). The queue is empty here -- every
+        # dispatch blocks the main thread until done -- so the join returns at once;
+        # the bound only covers a worker wedged in a CUDA call (daemon thread, so it
+        # can't outlive the process either way).
+        executor = self._session_executor
+        self._session_executor = None
+        if executor is not None:
+            executor.shutdown(timeout=5.0)
         self.target_buffer = None
         self._clear_prompt_undo()
         # Force a re-sync of image/segment on the next prompt.
@@ -4955,9 +5049,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         the guard below is just defensive.
 
         All MRML access (image / segment extraction) happens on the main thread first;
-        only the network/compute calls on ``self.session`` run in the worker behind the
-        wait dialog (_run_session_upload) -- it never touches Qt or MRML. (Safe for the
-        thread-local cuDNN caches: nothing in the worker runs a network forward pass.)
+        only the network/compute calls on ``self.session`` run on the session-executor
+        thread behind the wait dialog (_run_session_upload) -- they never touch Qt or
+        MRML, and they land on the same thread as every other session call.
         """
         if self.session is None:
             return
