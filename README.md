@@ -14,126 +14,182 @@ https://github.com/user-attachments/assets/c9f9ee0a-f74d-4907-aa21-484dcfd10948
 
 ## Table of contents
 
+- [Compute modes](#compute-modes)
 - [Installation](#installation)
-  - [Server side](#server-side)
-  - [Client side: Installation in 3D Slicer](#client-side-installation-in-3d-slicer)
+  - [Install the extension in 3D Slicer](#install-the-extension-in-3d-slicer)
+  - [First run: choose what to install](#first-run-choose-what-to-install)
+  - [Updating or changing the installed backend](#updating-or-changing-the-installed-backend)
+  - [Running the official server (Remote mode)](#running-the-official-server-remote-mode)
 - [Usage](#usage)
-  - [Editing an existing segment
-](#editing-an-existing-segment)
+  - [Editing an existing segment](#editing-an-existing-segment)
   - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Common issues](#common-issues)
 - [Testing](#testing)
 - [Contributing](#contributing)
+- [Development](#development)
 - [Citation](#citation)
 - [License](#license)
+- [Acknowledgements](#acknowledgements)
+
+## Compute modes
+
+This extension targets **nnInteractive v2** and drives the official
+[`nnInteractive`](https://github.com/MIC-DKFZ/nnInteractive) inference code directly — it no
+longer ships its own server. Upstream is now split into two pip packages that share the
+`nnInteractive` namespace:
+
+- **`nninteractive-client`** — a lightweight, **torch-free** remote client (`numpy` / `httpx` /
+  `blosc2` only). This is all Slicer needs in Remote mode.
+- **`nnInteractive`** — the **full** local-inference + server stack (PyTorch, nnU-Net, …). It
+  depends on `nninteractive-client`, so a full install includes the client too.
+
+Accordingly, you can run inference in two ways:
+
+- **Local mode** — inference runs **in-process inside Slicer's Python** via the full
+  `nnInteractive` package. No separate server is needed, but Slicer's Python must have the full
+  nnInteractive + PyTorch stack, so you need a machine with a (preferably NVIDIA) GPU. 10 GB of
+  VRAM is recommended; small objects work with <6 GB. CPU is supported but slow.
+- **Remote mode** — Slicer is a **lightweight client** (just `nninteractive-client`, no PyTorch)
+  that talks to an `nninteractive-server` running on a GPU machine (which may be the same
+  computer).
+
+The first time you open the module, a dialog asks **what to install** (see
+[First run](#first-run-choose-what-to-install)). Installs are always explicit — they happen only
+from that dialog or the `Reinstall / Update nnInteractive` button in the `Configuration` tab, never
+silently in the background. A **Client-only** install keeps Slicer PyTorch-free and leaves Local
+mode disabled; a **Full** install enables both Local and Remote, and you can switch between them at
+any time with the toggle in the `Configuration` tab (toggling never triggers an install).
 
 ## Installation
 
-`SlicerNNInteractive` needs to be set up on the server side and the client side. The server side needs relatively heavy compute, as described here:
+### Install the extension in 3D Slicer
 
-> You need a Linux or Windows computer with a Nvidia GPU. 10GB of VRAM is recommended. Small objects should work with <6GB. nnInteractive supports Python 3.10+
->
-> — [The nnInteractive README](https://github.com/MIC-DKFZ/nnInteractive?tab=readme-ov-file#prerequisites)
+1. [Download and install the latest version of **3D Slicer**](https://slicer.readthedocs.io/en/latest/user_guide/getting_started.html#installing-3d-slicer).
+2. [Install the **nnInteractive** extension](https://slicer.readthedocs.io/en/latest/user_guide/extensions_manager.html#install-extensions) from the Extensions Manager.
+   (For development without the Extensions Manager, see [Development](#development).)
 
-The client machine _can_ be the same as the server machine.
+### First run: choose what to install
 
-### Server side
+The first time you open the `nnInteractive` module, a dialog asks **what to install** into Slicer's
+Python. Nothing is installed until you choose, and nothing is ever installed lazily in the
+background:
 
-#### Server running on Linux
+- **Full (local + remote)** → installs the full **`nnInteractive`** package (nnU-Net + model code)
+  **and PyTorch**. This enables **both** Local and Remote mode. Pick a model in the `Configuration`
+  tab — the dropdown is populated from the available-models manifest — and on the first local
+  segmentation its weights are downloaded automatically from
+  [Hugging Face](https://huggingface.co/MIC-DKFZ/nnInteractive).
+- **Client only (remote)** → installs just the torch-free **`nninteractive-client`** package (its
+  `httpx` / `blosc2` / `numpy` wire stack, plus `scikit-image`, which the installer adds explicitly
+  for the lasso tool). **No PyTorch.** Local mode stays disabled; enter your server URL (and API
+  key, if any) in the `Configuration` tab.
 
-You can install the server side of `SlicerNNInteractive` in three different ways:
+After installing, click `Initialize` at the top of the `nnInteractive Prompts` tab — this loads the
+model (Full/Local) or connects to the server (Remote). If you dismiss the dialog without choosing,
+nothing is installed, the dialog reappears next time you open Slicer, and `Initialize` will ask you
+to install first.
 
-##### Option 1: Using Docker
+> [!NOTE]
+> The extension only ever installs `nnInteractive` / `nninteractive-client` **at or above v2.5.1 and
+> below v3.0.0** — the lower bound is the oldest version whose API this plugin targets, and the upper
+> bound guards against future API changes.
 
+**PyTorch (Full installs).** A Full install pulls in PyTorch (and `torchvision`) automatically,
+preferring Slicer's **PyTorch extension** (`PyTorchUtils`): it selects a torch build matched to your
+GPU driver via [light-the-torch](https://github.com/Slicer/light-the-torch) on every platform. The
+PyTorch extension is installed automatically when missing, which may require **one Slicer restart** —
+after the restart, the nnInteractive installation continues automatically. Without the PyTorch
+extension (e.g., offline), the install falls back to plain pip: on **Windows** it pulls from PyTorch's CUDA wheel
+index (`https://download.pytorch.org/whl/cu126`) because the default PyPI wheel is **CPU-only**; on
+**Linux** the default wheel already bundles CUDA.
+If you need a **different** PyTorch build — a CUDA version matching an older GPU driver, or a pinned
+torch version — install it yourself from Slicer's **Python Console** (`View ▸ Python Console`), then
+restart Slicer and click `Initialize` again. **`torchvision` is version-locked to `torch`, so always
+change the two together in the same command** — a leftover, mismatched `torchvision` fails to load and
+takes the whole backend down with it. Uninstall the existing torch **and** torchvision first so pip
+actually replaces them:
+
+```python
+# Windows — (re)install the default CUDA 12.6 GPU wheels
+slicer.util.pip_uninstall("torch torchvision")
+slicer.util.pip_install("torch torchvision --index-url https://download.pytorch.org/whl/cu126")
 ```
-docker pull coendevente/nninteractive-slicer-server:latest
-docker run --gpus all --rm -it -p 1527:1527 coendevente/nninteractive-slicer-server:latest
+
+```python
+# Older GPU / driver — pin a matching torch + torchvision pair and a CUDA build
+slicer.util.pip_uninstall("torch torchvision")
+slicer.util.pip_install("torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128 --force-reinstall")
 ```
 
-This will make the server available under port `1527` on your machine. If you would like to use a different port, say `1627`, replace `-p 1527:1527` with `-p 1627:1527`.
+Pick the `cuXXX` tag that matches your driver (e.g. `cu121`/`cu118` for older drivers), and a
+`torch`/`torchvision` pair that are released together (e.g. torch `2.8.0` ↔ torchvision `0.23.0`); see
+the [PyTorch install matrix](https://pytorch.org/get-started/locally/) and the
+[torch ↔ torchvision compatibility table](https://github.com/pytorch/vision#installation) for the
+right combination. `--force-reinstall` makes pip replace a stubborn wheel even if a version already
+looks present. If `slicer.util` isn't defined in the console, run `import slicer.util` first.
 
-##### Option 2: Using `uv`
+### Updating or changing the installed backend
 
-Another option is to run the server with [`uv`](https://docs.astral.sh/uv/) (see `uv` installation instructions [here](https://docs.astral.sh/uv/getting-started/installation/)):
+The `Configuration` tab shows what is installed and whether it is current — **"✓ nnInteractive is
+up to date"** (green), **"⟳ nnInteractive update available"** (orange), or **"⚠ nnInteractive is
+outdated"** (red) when the installed backend is below the minimum supported version (`2.5.1`; older
+releases lack APIs this plugin relies on, so an update is offered automatically on startup), checked
+automatically against PyPI on startup. To update to the latest version (still capped below v3.0.0), or to switch
+between **Full** and **Client only**, click **`Reinstall / Update nnInteractive`** and pick a
+flavor. This — and the first-run dialog — are the only actions that install or update packages.
+Reinstalling first uninstalls the existing `nnInteractive` / `nninteractive-client` packages (their
+shared dependencies, e.g. PyTorch, are left in place), so switching to **Client only** cleanly
+removes local support.
+
+### Updating the plugin itself
+
+The extension is rebuilt nightly from `main` and published to the Slicer Extensions Manager, but
+Slicer does not notify users when a new build is available. The plugin therefore checks on startup
+whether a newer build of itself is published for your Slicer version (via Slicer's Extensions
+Manager). When one is, the `Configuration` tab shows **"⟳ nnInteractive plugin update available"**
+and a one-time popup (shown once per version) offers to open the Extensions Manager. To update, open
+the **Extensions Manager → Manage Extensions**, update **nnInteractive**, then restart Slicer.
+
+### Running the official server (Remote mode)
+
+On the GPU machine, install the full package — the server is part of it, there is no separate
+`[server]` extra — and start it. The server downloads the model by name on first use:
 
 ```bash
-uv run --with nninteractive-slicer-server nninteractive-slicer-server --host 0.0.0.0 --port 1527
+pip install nnInteractive
+
+nninteractive-server \
+    --model nnInteractive_v1.0 \
+    --host 0.0.0.0 --port 1527 \
+    --api-key "$(openssl rand -hex 32)"
 ```
 
-##### Option 3: Using `pip`
+List or pre-download models with `nninteractive-available-models` and `nninteractive-download-model`.
+Useful server flags: `--device cuda:0`, `--no-torch-compile`, `--max-sessions N`,
+`--idle-timeout-seconds`. See the official
+[SERVER_CLIENT.md](https://github.com/MIC-DKFZ/nnInteractive/blob/master/SERVER_CLIENT.md) for full
+details (authentication, SSH-tunnel setups, multi-user deployment).
 
-_Step 1. Create a Python virtual environment_
+#### …or run the server in Docker
 
-If setting up the server for the first time, you need to create a Python virtual environment (e.g., using `conda` or `venv`) by specifying a location on your disk and activating that environment. For example, on Linux, using `venv`, you can accomplish this using these commands:
+If you'd rather not install anything on the GPU box, the server is also published as a Docker image
+with the model **baked in** (a GPU host with the NVIDIA Container Toolkit is required):
 
 ```bash
-python3 -m venv path_to_your_virtual_environment 
-source path_to_your_virtual_environment/bin/activate
+docker run --gpus all -p 1527:1527 \
+    -e NN_INTERACTIVE_API_KEY="$(openssl rand -hex 32)" \
+    ghcr.io/mic-dkfz/nninteractive-server:latest
 ```
 
-_Step 2. Install the server_
+A `lite` tag is also available if you'd rather mount your own checkpoint folder at `/model`. See
+the upstream [DOCKER.md](https://github.com/MIC-DKFZ/nnInteractive/blob/master/nnInteractive/inference/server/DOCKER.md)
+for both flavours and configuration.
 
-Next, you can install the server to this environment with these commands:
-
-```bash
-pip install nninteractive-slicer-server
-nninteractive-slicer-server --host 0.0.0.0 --port 1527
-```
-
-If you would like to use a different port, say `1627`, replace `--port 1527` with `--port 1627`.
-
-> [!NOTE]  
-> Remember that you'll have to start the server again if it was stopped for some reason (e.g., after rebooting your machine). To do so, activate your virtual Python environment with the `source` command above and run `nninteractive-slicer-server --host 0.0.0.0 --port 1527` again to start the server.
-
-> [!NOTE]  
-> When starting the server, you can ignore the message `nnUNet_raw is not defined [...] how to set this up.`. Setting up these environment variables is not necessary when using `SlicerNNInteractive`.
-
-#### Server running on Windows
-
-##### One-time setup
-
-Python and a pytorch package with GPU support is required. You can follow the steps below to set these up on your computer for your user:
-
-1. Download pixi package manager by running this command in `Terminal` (to launch terminal, press the Windows button on your keyboard, type `terminal` and hit `Enter` key):
-
-```
-powershell -ExecutionPolicy ByPass -c "irm -useb https://pixi.sh/install.ps1 | iex"
-```
-
-2. Close the terminal and open a new Terminal to run the commands below to install Python and pytorch. The last step may take 10 minutes to complete, with no updates on the output for several minutes.
-
-```
-cd /d %localappdata%
-mkdir nninteractive-server
-cd nninteractive-server
-pixi init .
-pixi add python=3.12 pip
-cd .pixi\envs\default\Scripts
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-```
-
-##### Start the server
-
-To start the server, there is no need to redo the steps above (install pixi and Python), just open `Terminal` and run these commands:
-
-```
-cd /d %localappdata%\nninteractive-server\.pixi\envs\default\Scripts
-pip install nninteractive-slicer-server
-nninteractive-slicer-server --host 0.0.0.0 --port 1527
-```
-
-If the firewall asks permission to access the port then allow it.
-
-If you would like to use a different port, say `1627`, replace `--port 1527` with `--port 1627`.
-
-> [!NOTE]  
-> When starting the server, you can ignore the message `nnUNet_raw is not defined [...] how to set this up.`. Setting up these environment variables is not necessary when using `SlicerNNInteractive`.
-
-### Client side: Installation in 3D Slicer
-
-1. [Download and install latest version of **3D Slicer**](https://slicer.readthedocs.io/en/latest/user_guide/getting_started.html#installing-3d-slicer)
-2. [Install **NNInteractive** extension](https://slicer.readthedocs.io/en/latest/user_guide/extensions_manager.html#install-extensions)
-3. Go to the `nnInteractive` module in Slicer and in the `Configuration` tab type in the URL of the server you set up in the [server side](#server-side) installation procedure. This should look something like `http://remote_host_name:1527` or, if you run the server locally, `http://localhost:1527`. If running the server on the same Windows computer as 3D Slicer, you must use `localhost` (ignore that the server suggests that `0.0.0.0` may be used).
+In Slicer's `Configuration` tab, set the server URL — e.g. `http://remote_host_name:1527`, or
+`http://localhost:1527` if the server runs on the same machine — and the API key. You can click
+`Test connection` to verify the URL and API key before loading an image — it connects, checks your
+credentials, and disconnects again, without requiring a loaded image. Then click `Initialize` at the
+top of the `nnInteractive Prompts` tab.
 
 ## Usage
 
@@ -141,37 +197,66 @@ Once you have completed the installation above, you can use `SlicerNNInteractive
 
 1. If you haven't done so already, load in your image (e.g., through dragging your image file into Slicer).
 
-2. Click one of the Interaction Tool buttons from the Interactive Prompts tab (point, bounding box, scribble, or lasso) and place your prompt in the image. This should result in a segmentation.
+2. Click `Initialize` at the top of the `nnInteractive Prompts` tab. This is mandatory before any prompt can be placed: it loads the model (Local) or connects to the server (Remote) and uploads the current image, so your first prompt is fast. It can take a moment (the local model may run a `torch.compile` warmup; a remote session has to upload the image). The interaction tools stay disabled until initialization finishes, and the button shows `Uninitialize` once a session is live. Clicking it again — or changing the server, API key, model or any local setting — uninitializes, so you'll need to re-initialize. Only the prompt types the loaded model supports are enabled.
 
-3. Click `Show 3D` button in the segment editor section (below the prompts section) to see the segmentation results in 3D.
+3. Click one of the Interaction Tool buttons from the Interactive Prompts tab (point, bounding box, scribble, or lasso) and place your prompt in the image. This should result in a segmentation.
 
-4. If needed, you can correct the generated segmentation with positive and negative prompts (between which you can toggle using the Positive/Negative buttons).
+4. Click `Show 3D` button in the segment editor section (below the prompts section) to see the segmentation results in 3D.
+
+5. If needed, you can correct the generated segmentation with positive and negative prompts (between which you can toggle using the Positive/Negative buttons). You can undo the last interaction with `Ctrl+Z`.
 
 	a) Alternatively, you can reset the current segment using the "Reset segment button".
 
-5. You can add a new segment by clicking the "Next segment" button, or clicking the "+ Add" button in the Segment Editor. You can always go back to previous segments by selecting it in the Segment Editor.
+6. You can add a new segment by clicking the "Next segment" button, or clicking the "+ Add" button in the Segment Editor. You can always go back to previous segments by selecting it in the Segment Editor. To remove the currently selected segment entirely, use the Segment Editor's delete (`Remove`) button, or press `Del`.
 
 ### Editing an existing segment
 You can edit an existing segmentation (generated using this plugin, or obtained otherwise, such as through loading in a segmentation file), by selecting the segment in the Segment Editor. Prompts are always applied to the selected segment.
 
 ### Keyboard shortcuts
-Each button in the Interactive Prompts tab has a keyboard shortcut, indicated by the underlined letter.
+Most buttons in the `nnInteractive Prompts` tab have a keyboard shortcut, shown in brackets in the button label (for example, `Bounding Box (B)`). The full list:
+
+| Shortcut | Action |
+| --- | --- |
+| `P` | Point tool |
+| `B` | Bounding Box tool |
+| `S` | Scribble tool |
+| `L` | Lasso tool |
+| `T` | Toggle prompt type (positive / negative) |
+| `E` | Next segment |
+| `R` | Reset segment (empty the selected segment) |
+| `V` | Toggle visibility of the current segment |
+| `Del` | Delete the selected segment |
+| `Ctrl+Z` | Undo the last interaction |
+
+`V`, `Del` and `Ctrl+Z` have no dedicated button. `V` is advertised by a small hint line at the bottom of the `nnInteractive Prompts` tab; the other two are listed here only.
 
 ## Common issues
 
-- When resetting the server, the Slicer extension sometimes fails silently. Reloading the plugin or restarting Slicer often helps.
+- When the remote server restarts or a session times out, the extension surfaces a "session expired" message — click `Initialize` at the top of the `nnInteractive Prompts` tab to reconnect; your current segmentation is preserved and re-seeded automatically.
+
+- **Lasso fails with `No module named 'skimage'`.** nnInteractive / `nninteractive-client`
+  2.5+ no longer pull in `scikit-image`, which the lasso tool needs, so an environment
+  installed or updated outside the plugin can lack it. Fix: click
+  `Reinstall / Update nnInteractive` in the `Configuration` tab (installs it explicitly), or run
+  `slicer.util.pip_install("scikit-image")` in Slicer's Python Console.
+
+- **No GPU detected / running on CPU (Local mode).** If, after `Initialize`, a red warning appears below the button saying nnInteractive is running on the CPU, PyTorch could not find a usable CUDA GPU. Local inference then falls back to the CPU, which is **very slow**. This usually means either no compatible GPU is present, or the installed PyTorch build does not match your GPU (a common case is the **CPU-only** PyTorch wheel getting installed). Install a matching CUDA build of PyTorch as described under [PyTorch (Full installs)](#first-run-choose-what-to-install), then restart Slicer and click `Initialize` again. To confirm what PyTorch sees, run this in Slicer's Python Console (`View ▸ Python Console`): `import torch; print(torch.cuda.is_available(), torch.version.cuda)`.
+
+- **`CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH` (or a `cublasLt` symbol error) on the first prompt.** This happens on machines that already have a **system-wide cuDNN/CUDA installed** (e.g. the `libcudnn9-*` apt package, or a CUDA toolkit under `/usr/local/cuda*`) of a **different version** than the one Slicer's bundled PyTorch ships. Slicer's cuDNN loads some engine sub-libraries by bare name at runtime; when its bundled wheel omits one (newer PyTorch builds do this), the loader picks up the mismatched system copy and mixes cuDNN versions in one process, which crashes inference. Your system cuDNN is not broken — the two versions simply cannot be combined, and you do **not** need to touch your system CUDA/cuDNN. Pick one:
+    - **Use a matching PyTorch inside Slicer** (recommended). In Slicer's Python Console (`View ▸ Python Console`) run `slicer.util.pip_install("torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu129 --force-reinstall")` (adjust the CUDA suffix to your driver if needed), then restart Slicer. This torch bundles a cuDNN that does not collide.
+    - **Run inference remotely.** Switch to `Remote` mode on the Configuration tab — no local CUDA is loaded at all.
+    - Only if you don't need the system cuDNN for other tools, remove/relocate it (e.g. `sudo apt remove libcudnn9-cuda-12`).
 
 ## Testing
 
-`SlicerNNInteractiveSegmentationTest` is a set of regression tests that verifies the output of `SlicerNNInteractive`. For every interaction type, it processes a set of test cases through the extension – which requires a running server – and compares the resulting segmentations against reference segementations. All tests use the publicly available `MRBrainTumor2` volume from the `Sample Data` extension.
+`SlicerNNInteractiveSegmentationTest` is a set of regression tests that verifies the output of `SlicerNNInteractive`. For every interaction type, it processes a set of test cases through the extension and compares the resulting segmentations against reference segmentations. All tests use the publicly available `MRBrainTumor2` volume from the `Sample Data` extension. The tests run against a **local** nnInteractive session by default (no server required); set `SLICER_NNI_TEST_SERVER_URL` to test against a running server instead.
 
 How to run the test from Slicer:
-1. Start the nnInteractive server and note its URL/port.
-2. Launch Slicer, (optionally) load the `SlicerNNInteractive` module via the Extension Wizard, and configure the module with the server URL (under the `Configuration` tab).
-3. Make sure `Developer Mode` is enabled in Slicer. You can verify this by going to `Edit > Application Settings > Developer`, and making sure `Enable developer mode:` is checked.
-4. Open the `Self Tests` module, pick `SlicerNNInteractive`, and click `Reload and Test` (or use the toolbar’s `Reload and Test` button in the module itself). Slicer will re-import the module, execute the scripted prompts, and a "All SlicerNNInteractive segmentation tests passed" message will be in the Python Console if everything matches the stored references.
+1. Make sure `Developer Mode` is enabled in Slicer (`Edit > Application Settings > Developer`, check `Enable developer mode`).
+2. Launch Slicer and (optionally) load the `SlicerNNInteractive` module via the Extension Wizard. For local testing, make sure the **Full** backend is installed (PyTorch + `nnInteractive`), e.g. via the first-run dialog or the `Reinstall / Update nnInteractive` button.
+3. Open the `Self Tests` module, pick `SlicerNNInteractive`, and click `Reload and Test`. A "All SlicerNNInteractive segmentation tests passed" message will appear in the Python Console if everything matches the stored references.
 
-Reference outputs are stored at `slicer_plugin/SlicerNNInteractive/Testing/Data/` (compressed NIfTI files). When running these tests, you do not have to regenerate these. If, for any reason you would still like to do so, set `SLICER_NNI_GENERATE_TEST_MASK=1` before launching Slicer (or uncomment the line `self.generate_mode = True` in `SlicerNNInteractiveSegmentationTest.setUp`), run the test once, manually review the newly written masks, then rerun without the variable so the test compares against the frozen references.
+Reference outputs are stored at `slicer_plugin/SlicerNNInteractive/Testing/Data/` (compressed NIfTI files). You normally do not need to regenerate these. If you do (e.g. after an intentional behavior change), set `SLICER_NNI_GENERATE_TEST_MASK=1` before launching Slicer, run the test once, manually review the newly written masks, then rerun without the variable so the test compares against the frozen references.
 
 ## Contributing
 Read more on how to contribute to this repository [here](CONTRIBUTING.md), while taking into account the [code of conduct](CODE_OF_CONDUCT.md).
@@ -181,14 +266,15 @@ Read more on how to contribute to this repository [here](CONTRIBUTING.md), while
 For development, `SlicerNNInteractive` can be installed directly from github, without the Extensions Manager of 3D Slicer.
 
 1. `git clone git@github.com:coendevente/SlicerNNInteractive.git` (or download the current project as a `.zip` file from GitHub).
-2. Open 3D Slicer and click the Module dropdown menu in the top left of the 3D Slicer window:
+2. Enable developer mode (the `Extension Wizard` is only available in developer mode): go to `Edit` > `Application Settings` > `Developer`, check `Enable developer mode`, and restart 3D Slicer when prompted.
+3. Open 3D Slicer and click the Module dropdown menu in the top left of the 3D Slicer window:
 	![Slicer dropdown menu](img/dropdown.png)
-3. Go to `Developer Tools` > `Extension Wizard`.
-4. Click `Select Extension`.
-5. Locate the `SlicerNNInteractive` folder you obtained in Step 1, and select the `slicer_plugin` folder.
-6. Go to the Module dropdown menu again and go to `Segmentation` > `SlicerNNInteractive`. This should result in the following view:
+4. Go to `Developer Tools` > `Extension Wizard`.
+5. Click `Select Extension`.
+6. Locate the `SlicerNNInteractive` folder you obtained in Step 1, and select the `slicer_plugin` folder.
+7. Go to the Module dropdown menu again and go to `Segmentation` > `nnInteractive`. This should result in the following view:
   ![First view of the Slicer extension](img/plugin_first_sight.png)
-	a) If you would like to have `SlicerNNInteractive` available in the top menu (as in the image above), go to `Edit` > `Application Settings` > `Modules` and drag `SlicerNNInteractive` from the `Modules:` list to the `Favorite Modules:` list.
+	a) If you would like to have `nnInteractive` available in the top menu (as in the image above), go to `Edit` > `Application Settings` > `Modules` and drag `nnInteractive` from the `Modules:` list to the `Favorite Modules:` list.
 
 ## Citation
 
@@ -207,7 +293,23 @@ When using `SlicerNNInteractive`, please cite:
 	[![arXiv](https://img.shields.io/badge/arXiv-2504.07991-b31b1b.svg)](https://arxiv.org/abs/2504.07991)
 
 ## License
-This repository is available under a Apache-2.0 license (see [here](LICENSE)). 
+This repository is available under a Apache-2.0 license (see [here](LICENSE)).
 
-> [!IMPORTANT]  
-> The weights that are being downloaded when running the `SlicerNNInteractive` server are available under a `Creative Commons Attribution Non Commercial Share Alike 4.0` license, as described in the original nnInteractive respository [here](https://github.com/MIC-DKFZ/nnInteractive/tree/master?tab=readme-ov-file#license).
+> [!IMPORTANT]
+> The model weights that are downloaded when running nnInteractive are available under a `Creative Commons Attribution Non Commercial Share Alike 4.0` license, as described in the original nnInteractive repository [here](https://github.com/MIC-DKFZ/nnInteractive/tree/master?tab=readme-ov-file#license).
+
+## Acknowledgements
+
+This extension brings [nnInteractive](https://github.com/MIC-DKFZ/nnInteractive) into 3D Slicer.
+nnInteractive is developed at the German Cancer Research Center (DKFZ) and
+[Helmholtz Imaging](https://www.helmholtz-imaging.de/), who also contribute to and help maintaining this Slicer extension.
+
+<p align="left">
+  <img src="img/DKFZ_Logo.png" alt="German Cancer Research Center (DKFZ)" height="55">
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="img/HI_Logo.png" alt="Helmholtz Imaging" height="55">
+  <br><br>
+  <img src="img/QurAI_Logo.png" alt="Quantitative Healthcare Analysis (qurAI) Group" height="55">
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="img/UvA_Logo_Wide.png" alt="University of Amsterdam" height="55">
+</p>

@@ -1,8 +1,0 @@
-nninteractive>=1.0.1,<2.0.0
-nnunetv2==2.6.4
-fastapi>=0.111.0,<0.112.0
-numpy>=2.2.3,<3.0.0
-torch>=2.8.0,<2.9.0
-Pillow>=11.1.0,<12.0.0
-transformers>=4.49.0,<4.50.0
-xxhash>=3.5.0,<4.0.0

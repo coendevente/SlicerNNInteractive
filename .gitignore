@@ -82,6 +82,9 @@ temp/
 # vscode
 .vscode
 
+# JetBrains IDEs (PyCharm, IntelliJ, etc.)
+.idea*
+
 *.DS_Store
 *.pth
 
@@ -89,3 +92,6 @@ log.out
 .nninteractive_weights
 
 uv.lock
+
+# Local agent guidelines — kept on disk, not tracked
+AGENTS.md

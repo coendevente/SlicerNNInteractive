@@ -9,7 +9,10 @@ set(EXTENSION_CONTRIBUTORS "Coen de Vente (University of Amsterdam)")
 set(EXTENSION_DESCRIPTION "Deep learning-based framework for interactive segmentation of 3D images. The extension is available under an Apache-2.0 license, but the weights that are being downloaded when running the SlicerNNInteractive server are available under a Creative Commons Attribution Non Commercial Share Alike 4.0 license, as described in the original nnInteractive respository.")
 set(EXTENSION_ICONURL "https://raw.githubusercontent.com/coendevente/SlicerNNInteractive/main/slicer_plugin/SlicerNNInteractive/Resources/Icons/SlicerNNInteractive.png")
 set(EXTENSION_SCREENSHOTURLS "https://raw.githubusercontent.com/coendevente/SlicerNNInteractive/main/img/segmentation_result.jpg https://raw.githubusercontent.com/coendevente/SlicerNNInteractive/main/img/plugin_first_sight.png")
-set(EXTENSION_DEPENDS "NA") # Specified as a list or "NA" if no dependencies
+# PyTorch: provides PyTorchUtils, used by Full installs to pick a torch build matched
+# to the GPU driver. The extension itself is tiny and does not install torch, so
+# Client-only users are unaffected.
+set(EXTENSION_DEPENDS "PyTorch") # Specified as a list or "NA" if no dependencies
 
 #-----------------------------------------------------------------------------
 # Extension dependencies

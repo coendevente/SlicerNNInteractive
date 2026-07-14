@@ -53,7 +53,7 @@
                </size>
               </property>
               <property name="text">
-               <string>&amp;Reset segment</string>
+               <string>Reset segment (R)</string>
               </property>
              </widget>
             </item>
@@ -66,7 +66,7 @@
                </size>
               </property>
               <property name="text">
-               <string>N&amp;ext segment</string>
+               <string>Next segment (E)</string>
               </property>
              </widget>
             </item>
@@ -76,7 +76,7 @@
          <item>
           <widget class="QGroupBox" name="promptTypeGroup">
            <property name="title">
-            <string>Prompt &amp;Type:</string>
+            <string>Prompt Type (T to toggle):</string>
            </property>
            <layout class="QVBoxLayout" name="verticalLayout_14">
             <item>
@@ -153,7 +153,7 @@
                  <string>Place point prompt</string>
                 </property>
                 <property name="text">
-                 <string> P&amp;oint</string>
+                 <string> Point (P)</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -178,7 +178,7 @@
                  <string>Place BBox prompt</string>
                 </property>
                 <property name="text">
-                 <string> &amp;Bounding Box</string>
+                 <string> Bounding Box (B)</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -203,7 +203,7 @@
                  <string>Place a scribble prompt</string>
                 </property>
                 <property name="text">
-                 <string> &amp;Scribble</string>
+                 <string> Scribble (S)</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -233,35 +233,13 @@
                    <bool>true</bool>
                   </property>
                   <property name="toolTip">
-                   <string>Place lasso prompt. Double-click to finish.</string>
+                   <string>Draw a freehand contour with the left mouse button held down. Release to close and fill it, and submit it as a 2D prompt.</string>
                   </property>
                   <property name="text">
-                   <string> &amp;Lasso</string>
+                   <string> Lasso (L)</string>
                   </property>
                   <property name="checkable">
                    <bool>true</bool>
-                  </property>
-                 </widget>
-                </item>
-                <item>
-                 <widget class="QPushButton" name="pbInteractionLassoCancel">
-                  <property name="enabled">
-                   <bool>true</bool>
-                  </property>
-                  <property name="minimumSize">
-                   <size>
-                    <width>0</width>
-                    <height>30</height>
-                   </size>
-                  </property>
-                  <property name="visible">
-                   <bool>true</bool>
-                  </property>
-                  <property name="toolTip">
-                   <string>Remove all placed points.</string>
-                  </property>
-                  <property name="text">
-                   <string>Clear</string>
                   </property>
                  </widget>
                 </item>
@@ -273,26 +251,19 @@
           </widget>
          </item>
          <item>
-          <widget class="QGroupBox" name="uploadProgressGroup">
-           <property name="title">
-            <string>Upload progress:</string>
+          <widget class="QLabel" name="hotkeyLegendLabel">
+           <property name="toolTip">
+            <string>Press E to finish the current segment and start a new one. Press V to show/hide the segment you are currently working on.</string>
            </property>
-           <layout class="QVBoxLayout" name="verticalLayout_12b">
-            <item>
-             <layout class="QVBoxLayout" name="verticalLayout_tools">
-              <item>
-               <widget class="QProgressBar" name="uploadProgressBar">
-                <property name="visible">
-                 <bool>true</bool>
-                </property>
-                <property name="value">
-                 <number>0</number>
-                </property>
-               </widget>
-              </item>
-             </layout>
-            </item>
-           </layout>
+           <property name="text">
+            <string>V — toggle segment visibility</string>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">color: gray;</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
           </widget>
          </item>
         </layout>
@@ -302,49 +273,6 @@
          <string>Configuration</string>
         </attribute>
         <layout class="QVBoxLayout" name="verticalLayout_10">
-         <item>
-          <widget class="QGroupBox" name="serverGroup">
-           <property name="title">
-            <string>Server Settings</string>
-           </property>
-           <layout class="QVBoxLayout" name="verticalLayout_5">
-            <item>
-             <layout class="QHBoxLayout" name="horizontalLayout_server">
-              <item>
-               <widget class="QLabel" name="label">
-                <property name="text">
-                 <string>Server URL:</string>
-                </property>
-               </widget>
-              </item>
-              <item>
-               <widget class="QLineEdit" name="Server">
-                <property name="text">
-                 <string>http://localhost:1527</string>
-                </property>
-               </widget>
-              </item>
-             </layout>
-            </item>
-           </layout>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="pbTestServer">
-           <property name="minimumSize">
-            <size>
-             <width>0</width>
-             <height>30</height>
-            </size>
-           </property>
-           <property name="toolTip">
-            <string>Test if the the server is reachable.</string>
-           </property>
-           <property name="text">
-            <string>Test Connection</string>
-           </property>
-          </widget>
-         </item>
          <item>
           <spacer name="verticalSpacer">
            <property name="orientation">
