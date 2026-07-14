@@ -306,7 +306,7 @@ nnInteractive is developed at the German Cancer Research Center (DKFZ) and
   <img src="img/DKFZ_Logo.png" alt="German Cancer Research Center (DKFZ)" height="55">
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <img src="img/HI_Logo.png" alt="Helmholtz Imaging" height="55">
-  <br>
+  <br><br>
   <img src="img/QurAI_Logo.png" alt="Quantitative Healthcare Analysis (qurAI) Group" height="55">
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <img src="img/UvA_Logo_Wide.png" alt="University of Amsterdam" height="55">
