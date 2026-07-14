@@ -291,7 +291,7 @@ class SlicerNNInteractive(ScriptedLoadableModule):
             translate("qSlicerAbstractCoreModule", "Segmentation")
         ]
         self.parent.dependencies = []  # List other modules if needed
-        self.parent.contributors = ["Coen de Vente", "Kiran Vaidhya Venkadesh", "Bram van Ginneken", "Clara I. Sanchez"]
+        self.parent.contributors = ["Coen de Vente", "Kiran Vaidhya Venkadesh", "Andras Lasso", "Bram van Ginneken", "Fabian Isensee", "Clara I. Sanchez"]
         # Some Slicer builds surface parent.version in the module panel / about box; set it
         # when supported, but never let an unsupported attribute break module load.
         try:
@@ -1185,33 +1185,45 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         layout.insertWidget(0, init_group)
 
-        logos = self._build_logos_widget(height=26)
+        logos = self._build_logos_widget()
         if logos is not None:
             layout.addWidget(logos)
 
         # Reflect the current (idle) session state on the freshly created button.
         self.update_connect_status(connected=self.session is not None)
 
-    def _build_logos_widget(self, height=26):
-        """Returns a small white box with the HI and DKFZ logos side by side (or None)."""
+    def _build_logos_widget(self, height=24):
+        """Returns a small white box with acknowledgement logos in two rows."""
         box = qt.QGroupBox("")
         box.setStyleSheet("QGroupBox { background-color: white; }")
-        box_layout = qt.QHBoxLayout(box)
+        box_layout = qt.QVBoxLayout(box)
         box_layout.setContentsMargins(8, 6, 8, 6)
-        box_layout.setSpacing(14)
-        box_layout.addStretch(1)
+        box_layout.setSpacing(6)
         any_logo = False
-        for filename in ("HI_Logo.png", "DKFZ_Logo.png"):
-            pixmap = qt.QPixmap(self.resourcePath(f"Logos/{filename}"))
-            if pixmap.isNull():
-                continue
-            pixmap = pixmap.scaledToHeight(height, qt.Qt.SmoothTransformation)
-            logo_label = qt.QLabel()
-            logo_label.setPixmap(pixmap)
-            logo_label.setAlignment(qt.Qt.AlignCenter)
-            box_layout.addWidget(logo_label)
-            any_logo = True
-        box_layout.addStretch(1)
+
+        for row_filenames in (
+            ("HI_Logo.png", "DKFZ_Logo.png"),
+            ("QurAI_Logo.png", "UvA_Logo_Wide.png"),
+        ):
+            row_layout = qt.QHBoxLayout()
+            row_layout.setSpacing(14)
+            row_layout.addStretch(1)
+            row_has_logo = False
+            for filename in row_filenames:
+                pixmap = qt.QPixmap(self.resourcePath(f"Logos/{filename}"))
+                if pixmap.isNull():
+                    continue
+                pixmap = pixmap.scaledToHeight(height, qt.Qt.SmoothTransformation)
+                logo_label = qt.QLabel()
+                logo_label.setPixmap(pixmap)
+                logo_label.setAlignment(qt.Qt.AlignCenter)
+                row_layout.addWidget(logo_label)
+                row_has_logo = True
+                any_logo = True
+            row_layout.addStretch(1)
+            if row_has_logo:
+                box_layout.addLayout(row_layout)
+
         return box if any_logo else None
 
     def _license_display_text(self, license_str):

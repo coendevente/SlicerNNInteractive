@@ -17,6 +17,8 @@ set(MODULE_PYTHON_RESOURCES
   Resources/Icons/prompts/light/scribble_icon.svg
   Resources/Logos/HI_Logo.png
   Resources/Logos/DKFZ_Logo.png
+  Resources/Logos/QurAI_Logo.png
+  Resources/Logos/UvA_Logo_Wide.png
   Resources/UI/${MODULE_NAME}.ui
   Testing/Python/SlicerNNInteractiveSegmentationTest.py
   Testing/Data/MRBrainTumor2_lasso_lasso_tumor.nii.gz
