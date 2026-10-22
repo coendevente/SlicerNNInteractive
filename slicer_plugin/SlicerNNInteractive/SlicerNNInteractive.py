@@ -220,6 +220,13 @@ SETTING_DEFAULTS = {
     # the checkbox keep their stored choice.
     "use_torch_compile": torch_compile_unsupported_reason() is None,
     "interactions_storage": "auto",
+    # Local sessions: keep the preprocessed image + interactions on the GPU when they fit
+    # (see nnInteractiveInferenceSession gpu_resident). "auto" / "on" / "off".
+    "gpu_resident": "auto",
+    # Local sessions: cap of the auto-zoom field of view, as a multiple of the 192^3 patch.
+    # 4 is nnInteractive's default; larger lets one prompt cover longer structures on
+    # large volumes. The session caps it at ~6.7 (CUDA 32-bit indexing limit).
+    "max_autozoom": "4",
     "device": "cuda:0",
     "checkpoint_path": "",
     "model_id": "",
@@ -845,6 +852,33 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         advanced_form.addRow("Interaction storage:", self.ui.storageCombo)
 
+        self.ui.gpuResidentCombo = qt.QComboBox()
+        self.ui.gpuResidentCombo.addItems(["auto", "on", "off"])
+        self.ui.gpuResidentCombo.setCurrentText(self.get_setting_str("gpu_resident"))
+        self.ui.gpuResidentCombo.setToolTip(
+            "Keep the image and all prompt channels in GPU memory for the whole session "
+            "(needs ~18 bytes/voxel of VRAM plus headroom). Removes the CPU decompression and "
+            "PCIe transfers that dominate auto-zoom and refinement on large volumes. "
+            "'auto' enables it when the volume fits; it overrides Interaction storage."
+        )
+        self.ui.gpuResidentCombo.currentTextChanged.connect(
+            lambda v: self._save_setting("gpu_resident", v, reinit=True)
+        )
+        advanced_form.addRow("GPU-resident data:", self.ui.gpuResidentCombo)
+
+        self.ui.maxAutozoomSpin = qt.QDoubleSpinBox()
+        self.ui.maxAutozoomSpin.setRange(1.0, 6.6)
+        self.ui.maxAutozoomSpin.setSingleStep(0.5)
+        self.ui.maxAutozoomSpin.setDecimals(1)
+        self.ui.maxAutozoomSpin.setValue(self._get_max_autozoom())
+        self.ui.maxAutozoomSpin.setToolTip(
+            "Largest auto-zoom field of view, in multiples of the 192-voxel patch "
+            "(4 = nnInteractive default). Higher values let one prompt capture longer/larger "
+            "structures on big volumes, at the cost of a slower prompt."
+        )
+        self.ui.maxAutozoomSpin.valueChanged.connect(self._on_max_autozoom_changed)
+        advanced_form.addRow("Max auto-zoom:", self.ui.maxAutozoomSpin)
+
         # --- Remote container ---
         self.ui.remoteContainer = qt.QWidget()
         remote_layout = qt.QVBoxLayout(self.ui.remoteContainer)
@@ -1319,6 +1353,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if license_str == "!!MISSING!!":
             return "Model license: UNKNOWN (warning!)"
         return f"Model license: {license_str}"
+
+    def _get_max_autozoom(self):
+        try:
+            return float(self.get_setting_str("max_autozoom"))
+        except (TypeError, ValueError):
+            return float(SETTING_DEFAULTS["max_autozoom"])
+
+    def _on_max_autozoom_changed(self, value):
+        self._save_setting("max_autozoom", str(value), reinit=False)
+        # Takes effect on the next prompt: a per-session override of the class constant.
+        if self.session is not None and getattr(self, "_session_mode", None) == "local":
+            self.session.MAX_AUTOZOOM_FACTOR = float(value)
 
     def on_autozoom_toggled(self, checked):
         self._save_setting_bool("autozoom", checked, reinit=False)
@@ -4338,6 +4384,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         want_compile = self.get_setting_bool("use_torch_compile")
         compile_reason = torch_compile_unsupported_reason()
         storage = self.get_setting_str("interactions_storage")
+        gpu_resident = {"on": True, "off": False}.get(self.get_setting_str("gpu_resident"), "auto")
+        max_autozoom = self._get_max_autozoom()
 
         use_compile = want_compile
         no_compile_reason = None
@@ -4368,6 +4416,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 # CPU-only torch wheel, which the config-tab probe can't see.
                 with_compile = False
 
+            import inspect
+
+            # gpu_resident is a local patch of nnInteractive; a reinstalled stock package
+            # lacks it, so only pass it when supported.
+            extra = {}
+            if "gpu_resident" in inspect.signature(nnInteractiveInferenceSession.__init__).parameters:
+                extra["gpu_resident"] = gpu_resident
             session = nnInteractiveInferenceSession(
                 device=device,
                 use_torch_compile=with_compile,
@@ -4377,7 +4432,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 # user's choice is respected there too.
                 do_autozoom=want_autozoom,
                 interactions_storage=storage,
+                **extra,
             )
+            session.MAX_AUTOZOOM_FACTOR = max_autozoom
             # Load the weights. initialize_from_trained_model_folder() runs the warmup
             # forward pass internally (torch.compile compilation + cuDNN autotuning);
             # because this runs on the session-executor thread -- the same thread every
