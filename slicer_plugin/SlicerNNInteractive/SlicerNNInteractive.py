@@ -157,6 +157,26 @@ def cuda_gpu_available():
     return shutil.which("nvidia-smi") is not None
 
 
+def _use_system_python_headers():
+    """Fallback for Slicer's header-less Python: if the system has development headers for
+    the same Python major.minor (e.g. Ubuntu's python3.12-dev in /usr/include/python3.12),
+    put them on CPATH so torch.compile's runtime C helpers can build. Headers are ABI-stable
+    within a minor version, so a different patch release is fine. Returns True if found."""
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return False
+    name = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    for prefix in ("/usr/include", "/usr/local/include"):
+        candidate = os.path.join(prefix, name)
+        if os.path.isfile(os.path.join(candidate, "Python.h")):
+            cpath = os.environ.get("CPATH", "")
+            if candidate not in cpath.split(os.pathsep):
+                os.environ["CPATH"] = os.pathsep.join(p for p in (candidate, cpath) if p)
+            return True
+    return False
+
+
 def torch_compile_unsupported_reason(check_gpu=False):
     """Why torch.compile can't be used here, or None if it can.
 
@@ -181,7 +201,7 @@ def torch_compile_unsupported_reason(check_gpu=False):
         return "torch.compile is not supported on Windows."
 
     include_dir = sysconfig.get_paths().get("include")
-    if not (include_dir and os.path.isfile(os.path.join(include_dir, "Python.h"))):
+    if not (include_dir and os.path.isfile(os.path.join(include_dir, "Python.h"))) and not _use_system_python_headers():
         return (
             "torch.compile needs the Python development headers (Python.h), "
             "which are not present in this Python build."
