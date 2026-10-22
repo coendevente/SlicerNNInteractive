@@ -2202,6 +2202,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     # (autozoom-triggering ones are the slow exception) and never flash a dialog.
     PREDICTION_DIALOG_DELAY_S = 2.0
 
+    # Voxels added on each side when a segment's labelmap extent has to grow (see
+    # _update_segment_region), so follow-up prompts near the object update in place.
+    SEGMENT_EXTENT_GROW_MARGIN = 128
+
     def _polarity_color(self, positive):
         """The single positive->green / negative->red mapping used by every prompt visual."""
         return self.COLOR_POSITIVE if positive else self.COLOR_NEGATIVE
@@ -3822,8 +3826,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
           prompt -- even in a scene that already has other segments -- or growth that engulfs
           its old content) -> SetBinaryLabelmapToSegment(MODE_REPLACE) the bbox region only
           (the rest of this segment is/becomes background -- nothing of ours to preserve);
-        * otherwise (this segment has voxels both inside and outside the bbox) -> return False
-          so the caller does the full update, which preserves the outside content.
+        * otherwise (this segment has voxels both inside and outside the bbox) -> grow the
+          region to the union of the bbox and the segment's own extent and region-replace
+          that from the target buffer (which mirrors the whole segment), instead of the
+          full-volume update this used to fall back to.
 
         Emptiness is judged from THIS segment's own label value, not the labelmap's union
         extent, so siblings in a shared labelmap don't force a needless full update.
@@ -3879,15 +3885,31 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 # case being a fresh segment in a scene that already has others).
                 own = view == label_value
                 if own.any():
-                    kk, jj, ii = np.nonzero(own)
-                    own_within_bbox = (
-                        i0 <= ix0 + int(ii.min()) and ix0 + int(ii.max()) <= i1 - 1
-                        and j0 <= iy0 + int(jj.min()) and iy0 + int(jj.max()) <= j1 - 1
-                        and k0 <= iz0 + int(kk.min()) and iz0 + int(kk.max()) <= k1 - 1
+                    # Per-axis projections instead of np.nonzero (no index arrays per voxel).
+                    kk, jj, ii = (
+                        np.flatnonzero(own.any(axis=axes)) for axes in ((1, 2), (0, 2), (0, 1))
                     )
-                    if not own_within_bbox:
-                        # This segment has voxels outside the bbox -> full update preserves them.
-                        return False
+                    own_bbox = [
+                        [iz0 + int(kk[0]), iz0 + int(kk[-1]) + 1],
+                        [iy0 + int(jj[0]), iy0 + int(jj[-1]) + 1],
+                        [ix0 + int(ii[0]), ix0 + int(ii[-1]) + 1],
+                    ]
+                    # This segment has voxels outside the bbox. Rather than a full-volume
+                    # update (seconds on multi-GB volumes), grow the region to the union of
+                    # the bbox and the segment's own extent and region-replace that: the
+                    # target buffer holds this segment's complete current state (seeded from
+                    # it, then updated by every prediction), so the union crop of it already
+                    # contains the voxels outside the bbox, and nothing of ours lies beyond.
+                    # Pad the grown extent so the next prompts near this object land inside it
+                    # and take the cheap in-place path above: a region replace costs time
+                    # proportional to its volume (~0.7 s for 250 Mvoxels), the in-place write
+                    # only the prediction's bbox.
+                    margin = self.SEGMENT_EXTENT_GROW_MARGIN
+                    bbox = [
+                        [max(0, min(lo, olo) - margin), min(n, max(hi, ohi) + margin)]
+                        for (lo, hi), (olo, ohi), n in zip(bbox, own_bbox, mask.shape)
+                    ]
+                    (k0, k1), (j0, j1), (i0, i1) = bbox
                 # else: this segment is empty here (the allocation holds only sibling
                 # segments), so a region replace drops nothing of ours -> fall through.
 
