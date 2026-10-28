@@ -4154,14 +4154,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         ix0, ix1, iy0, iy1, iz0, iz1 = vimage.GetExtent()
         if ix1 < ix0 or iy1 < iy0 or iz1 < iz0:
             return np.zeros(shape, dtype=np.uint8)
-        # Same voxel grid <=> volume RAS->IJK applied to the labelmap IJK->RAS is identity.
+        # Copy by voxel index only when both grids match exactly. Even a tiny
+        # spacing/orientation mismatch can accumulate into a voxel shift over a
+        # large extent. Compare the original matrices to avoid inverse/product
+        # roundoff; any difference takes the generic resampling path.
         seg_to_world = vtk.vtkMatrix4x4()
         vimage.GetImageToWorldMatrix(seg_to_world)
-        world_to_vol = vtk.vtkMatrix4x4()
-        volume_node.GetRASToIJKMatrix(world_to_vol)
-        seg_to_vol = vtk.vtkMatrix4x4()
-        vtk.vtkMatrix4x4.Multiply4x4(world_to_vol, seg_to_world, seg_to_vol)
-        if not np.allclose(slicer.util.arrayFromVTKMatrix(seg_to_vol), np.eye(4), atol=1e-3):
+        vol_to_world = vtk.vtkMatrix4x4()
+        volume_node.GetIJKToRASMatrix(vol_to_world)
+        if not np.array_equal(
+            slicer.util.arrayFromVTKMatrix(seg_to_world),
+            slicer.util.arrayFromVTKMatrix(vol_to_world),
+        ):
             return None
         view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(segmentation_node, segment_id)
         if view is None:
