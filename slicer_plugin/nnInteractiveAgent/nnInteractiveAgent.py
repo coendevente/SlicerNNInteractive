@@ -1010,8 +1010,14 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         form.addRow(_("Other:"), row)
         self.updateInstalledVersion()
 
+        box = ctk.ctkCollapsibleButton()
+        box.text = _("Server")
+        box.connect("contentsCollapsed(bool)", lambda _c: self.updateServerHeading())
+        self.serverBox = box
+        layout.addWidget(box, 1)
+        server = qt.QVBoxLayout(box)
         self.internalRadio = qt.QRadioButton(_("Internal server (Slicer installs and starts it on this computer)"))
-        layout.addWidget(self.internalRadio)
+        server.addWidget(self.internalRadio)
         self.internalWidget = qt.QWidget()
         form = qt.QFormLayout(self.internalWidget)
         form.setContentsMargins(20, 0, 0, 0)
@@ -1048,10 +1054,10 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         form.addRow(_("Port:"), self.portSpin)
         self.startStopButton = qt.QPushButton(_("Start server"))
         form.addRow(self.startStopButton)
-        layout.addWidget(self.internalWidget)
+        server.addWidget(self.internalWidget)
 
         self.remoteRadio = qt.QRadioButton(_("Remote server (nninteractive-agent-web started elsewhere)"))
-        layout.addWidget(self.remoteRadio)
+        server.addWidget(self.remoteRadio)
         self.remoteWidget = qt.QWidget()
         form = qt.QFormLayout(self.remoteWidget)
         form.setContentsMargins(20, 0, 0, 0)
@@ -1066,7 +1072,7 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.insecureCheck = qt.QCheckBox(_("Accept a self-signed certificate"))
         self.insecureCheck.checked = settings.value(SETTINGS_PREFIX + "Insecure", "false") == "true"
         form.addRow("", self.insecureCheck)
-        layout.addWidget(self.remoteWidget)
+        server.addWidget(self.remoteWidget)
         internal = settings.value(SETTINGS_PREFIX + "Mode", "internal") == "internal"
         self.internalRadio.checked = internal
         self.remoteRadio.checked = not internal
@@ -1080,22 +1086,22 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                                           "the conversation (the segmentation stays in Slicer)")
         for b in (self.connectButton, self.disconnectButton, self.endSessionButton):
             row.addWidget(b)
-        layout.addLayout(row)
+        server.addLayout(row)
         self.serverInfoLabel = qt.QLabel("")
         self.serverInfoLabel.wordWrap = True
-        layout.addWidget(self.serverInfoLabel)
+        server.addWidget(self.serverInfoLabel)
 
         row = qt.QHBoxLayout()
         row.addWidget(qt.QLabel(_("Server output:")))
         row.addStretch(1)
         clearButton = qt.QPushButton(_("Clear"))
         row.addWidget(clearButton)
-        layout.addLayout(row)
+        server.addLayout(row)
         self.serverLog = qt.QPlainTextEdit()
         self.serverLog.readOnly = True
         self.serverLog.maximumBlockCount = 5000
         self.serverLog.minimumHeight = 100
-        layout.addWidget(self.serverLog, 1)
+        server.addWidget(self.serverLog, 1)
 
         box = ctk.ctkCollapsibleButton()
         box.text = _("Conversation")
@@ -1117,6 +1123,7 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                                          "Off: Ctrl+Enter or the Send button sends, Enter starts a new line.")
         self.enterSendsCheck.checked = settings.value(SETTINGS_PREFIX + "EnterSends", "true") == "true"
         form.addRow(self.enterSendsCheck)
+        layout.addStretch()  # takes the space while Server is collapsed
 
         self.internalRadio.connect("toggled(bool)", self.onModeChanged)
         self.llmCombo.connect("currentIndexChanged(int)", lambda _i: self.updateConfigurationGUI())
@@ -1143,7 +1150,20 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def connecting(self) -> bool:
         return self._connect_when_ready or self._logging_in or (self.conn._thread is not None and not self.conn.connected)
 
+    def updateServerHeading(self) -> None:
+        """While collapsed, the Server section's heading shows the connection status."""
+        if not self.serverBox.collapsed:
+            status = ""
+        elif self.conn.connected:
+            status = _("Connected to {agent}").format(agent=self.agent.get("label", "?"))
+        elif self.connecting():
+            status = _("Connecting")
+        else:
+            status = _("Disconnected")
+        self.serverBox.text = _("Server - {status}").format(status=status) if status else _("Server")
+
     def updateConfigurationGUI(self) -> None:
+        self.updateServerHeading()
         internal = self.internalRadio.checked
         locked = self.conn.connected or self.connecting()  # settings apply to the next connection
         self.internalRadio.enabled = self.remoteRadio.enabled = not locked
@@ -1845,6 +1865,7 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         t = ev.get("t")
         if t == "hello":
             self.agent = ev.get("agent") or {}
+            self.serverBox.collapsed = True  # connected: the settings are done
             self.serverInfoLabel.text = _("nnInteractive: {server} (model license: {license})<br>Agent: {agent}").format(
                 server=html.escape(str(ev.get("server"))), license=html.escape(str(ev.get("license") or "unknown")),
                 agent=html.escape(self.agent.get("label", "?")))
