@@ -1538,6 +1538,7 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 return
         if self.conn.send({"cmd": "send", "text": text}):
             self.messageEdit.setPlainText("")
+            self.chat.verticalScrollBar().value = self.chat.verticalScrollBar().maximum  # follow the answer
 
     def offerToSendImage(self) -> None:
         """A message but no image yet: explain, and offer to send the selected volume (the message follows)."""
@@ -1857,7 +1858,7 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         # A fresh format: a block after an <hr> would otherwise inherit its rule.
         cursor.insertBlock(qt.QTextBlockFormat(), qt.QTextCharFormat())
         cursor.insertHtml(text)
-        if at_end or not self.replaying:
+        if at_end:  # follow the output only while at the bottom, not while reading earlier output
             bar.value = bar.maximum
 
     def addChatImage(self, data):
