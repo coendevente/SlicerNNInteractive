@@ -146,6 +146,15 @@ def location_text(axes) -> str:
     return "[location axis0={}, axis1={}, axis2={}]".format(*[int(v) for v in axes])
 
 
+def _module_available(name: str) -> bool:
+    """``name`` can be imported. Checks a submodule, not just the package: nninteractive-client provides the
+    nnInteractive package too, without local inference."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ImportError:  # a parent package is missing
+        return False
+
+
 def hex_to_rgb(color: str):
     color = color.lstrip("#")
     return [int(color[k:k + 2], 16) / 255.0 for k in (0, 2, 4)]
@@ -1233,7 +1242,7 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def installInternalServer(self, local: bool) -> bool:
         """nninteractive-agent with the web demo in Slicer's Python, and nnInteractive for local inference
         (PyTorch through the NNUNet extension, as the nnInteractive module does)."""
-        if local and importlib.util.find_spec("nnInteractive") is None:
+        if local and not _module_available("nnInteractive.inference.inference_session"):
             try:
                 from SlicerNNUNetLib import InstallLogic
             except ImportError:
