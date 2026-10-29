@@ -3831,12 +3831,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 bbox_within_extent = (ix0 <= i0 and i1 - 1 <= ix1
                                       and iy0 <= j0 and j1 - 1 <= iy1
                                       and iz0 <= k0 and k1 - 1 <= iz1)
+                if bbox_within_extent and self._labelmap_is_shared(segmentation, segmentId, vimage):
+                    # A shared layer holds ONE value per voxel, so the in-place write below
+                    # would erase other segments wherever the prediction covers them.
+                    # Sharing is common: AddEmptySegment (our 'Next segment' and the editor's
+                    # Add) puts every new segment on the FIRST segment's layer, and loaded or
+                    # imported segmentations share layers too. Move this segment to its own
+                    # layer (same extent, so the in-place write still fits) and write there.
+                    # One-time per segment; later prompts find it unshared.
+                    segmentation.SeparateSegmentLabelmap(segmentId)
+                    return self._update_segment_region(mask, bbox, segmentationNode, segmentId)
                 if bbox_within_extent:
-                    # In-place write. The internal labelmap may be SHARED by several segments
-                    # (each stored as its own integer value): write this segment's own value
-                    # where the prediction is set; where it is not, clear only THIS segment's
-                    # voxels and leave any other segment's values untouched -- preserving the
-                    # rest without the disruptive SeparateSegmentLabelmap (which churned the ID).
+                    # In-place write into this segment's own (unshared) layer: write its
+                    # value where the prediction is set and clear it where it is not.
                     ks = slice(k0 - iz0, k1 - iz0)
                     js = slice(j0 - iy0, j1 - iy0)
                     i_s = slice(i0 - ix0, i1 - ix0)
@@ -3882,6 +3889,21 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             segmentationNode, segmentId, mask[k0:k1, j0:j1, i0:i1], bbox
         )
         return True
+
+    @staticmethod
+    def _labelmap_is_shared(segmentation, segment_id, labelmap):
+        """True if any OTHER segment stores its voxels in ``labelmap`` (the internal
+        binary labelmap of ``segment_id``). Compares representation objects, which is
+        O(number of segments) and touches no voxels. (vtkSegmentation.IsSharedBinaryLabelmap
+        is not used on purpose: it returns the inverse of what its name says.)"""
+        name = slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+        for other_id in segmentation.GetSegmentIDs():
+            if other_id == segment_id:
+                continue
+            other = segmentation.GetSegment(other_id)
+            if other is not None and other.GetRepresentation(name) is labelmap:
+                return True
+        return False
 
     def show_segmentation(self, segmentation_mask, changed_bbox=None):
         """
