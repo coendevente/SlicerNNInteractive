@@ -60,7 +60,15 @@ ROLE_ATTRIBUTE = "nnInteractiveAgent.Role"  # "result" or "work"
 NOTES_TAG = "nnInteractiveAgent.Notes"  # segment tag: the agent's notes on the object
 MAX_CHAT_IMAGES = 4  # thumbnails shown per tool result
 # The internal server: nninteractive-agent installed in Slicer's Python (an archive, so no git is needed).
-AGENT_PACKAGE = "nninteractive-agent[web] @ https://github.com/MIC-DKFZ/nninteractive-agent/archive/refs/heads/master.zip"
+AGENT_REPOSITORY = "MIC-DKFZ/nninteractive-agent"
+AGENT_COMMIT = "8fe94bda678d0c09c7c8363261e82bd984802984"  # the recommended version, tested with this module
+
+
+def agent_archive_url(ref: str) -> str:
+    return f"https://github.com/{AGENT_REPOSITORY}/archive/{ref}.zip"
+
+
+AGENT_PACKAGE = f"nninteractive-agent[web] @ {agent_archive_url(AGENT_COMMIT)}"
 AGENT_MODULES = ("nninteractive_agent", "claude_agent_sdk", "fastapi", "uvicorn", "multipart")
 LOCAL_INFERENCE_PACKAGE = "nnInteractive>=2.6.0"  # the [local] extra of nninteractive-agent
 DEFAULT_INTERNAL_PORT = 8444  # not 8443, the default of nninteractive-agent-web started by hand
@@ -144,6 +152,40 @@ def parse_server_link(text: str):
 def location_text(axes) -> str:
     """How the agent expects a pointed-at voxel (``web_host_prompt``)."""
     return "[location axis0={}, axis1={}, axis2={}]".format(*[int(v) for v in axes])
+
+
+def installed_agent_version():
+    """Version of the nninteractive-agent installed in Slicer's Python, or None."""
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version("nninteractive-agent")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def installed_agent_url():
+    """Where pip installed nninteractive-agent from (direct_url.json): an archive URL or a local folder, or None."""
+    import importlib.metadata
+
+    try:
+        return json.loads(importlib.metadata.distribution("nninteractive-agent").read_text("direct_url.json") or
+                          "{}").get("url")
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        return None
+
+
+def latest_agent_commit() -> str:
+    """The latest commit of the nninteractive-agent master branch."""
+    import urllib.request
+
+    request = urllib.request.Request(f"https://api.github.com/repos/{AGENT_REPOSITORY}/commits/master",
+                                     headers={"Accept": "application/vnd.github.sha"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        commit = response.read().decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError(f"unexpected answer: {commit[:100]}")
+    return commit
 
 
 def _module_available(name: str) -> bool:
@@ -935,6 +977,39 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         settings = qt.QSettings()
         layout = qt.QVBoxLayout(tab)
 
+        box = ctk.ctkCollapsibleButton()
+        box.text = _("nninteractive-agent version")
+        box.collapsed = True
+        layout.addWidget(box)
+        form = qt.QFormLayout(box)
+        self.installedVersionLabel = qt.QLabel("")
+        self.installedVersionLabel.wordWrap = True
+        self.installedVersionLabel.textInteractionFlags = qt.Qt.TextSelectableByMouse
+        form.addRow(_("Installed:"), self.installedVersionLabel)
+        row = qt.QHBoxLayout()
+        self.installRecommendedButton = qt.QPushButton(_("Install recommended version"))
+        self.installRecommendedButton.toolTip = _("Install the version this module was tested with (commit {commit}) "
+                                                  "in Slicer's Python; stops the internal server").format(
+                                                      commit=AGENT_COMMIT[:7])
+        self.installLatestButton = qt.QPushButton(_("Install latest version"))
+        self.installLatestButton.toolTip = _("Install the latest commit of the nninteractive-agent master branch "
+                                             "in Slicer's Python; stops the internal server")
+        row.addWidget(self.installRecommendedButton)
+        row.addWidget(self.installLatestButton)
+        form.addRow(row)
+        row = qt.QHBoxLayout()
+        package = settings.value(SETTINGS_PREFIX + "Package", "")
+        if package.endswith("/archive/refs/heads/master.zip"):  # the default of earlier versions of this module
+            package = ""
+        self.packageEdit = qt.QLineEdit(package)
+        self.packageEdit.placeholderText = _("other pip requirement, e.g. C:/src/nninteractive-agent[web]")
+        self.packageEdit.toolTip = _("Install nninteractive-agent from another source, such as a local checkout")
+        self.installCustomButton = qt.QPushButton(_("Install"))
+        row.addWidget(self.packageEdit, 1)
+        row.addWidget(self.installCustomButton)
+        form.addRow(_("Other:"), row)
+        self.updateInstalledVersion()
+
         self.internalRadio = qt.QRadioButton(_("Internal server (Slicer installs and starts it on this computer)"))
         layout.addWidget(self.internalRadio)
         self.internalWidget = qt.QWidget()
@@ -971,17 +1046,8 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.portSpin.setRange(1024, 65535)
         self.portSpin.value = int(settings.value(SETTINGS_PREFIX + "Port", DEFAULT_INTERNAL_PORT))
         form.addRow(_("Port:"), self.portSpin)
-        self.packageEdit = qt.QLineEdit(settings.value(SETTINGS_PREFIX + "Package", AGENT_PACKAGE))
-        self.packageEdit.toolTip = _("pip requirement nninteractive-agent is installed from (e.g. a local checkout: "
-                                     "C:/src/nninteractive-agent[web])")
-        form.addRow(_("Install from:"), self.packageEdit)
-        row = qt.QHBoxLayout()
         self.startStopButton = qt.QPushButton(_("Start server"))
-        self.reinstallButton = qt.QPushButton(_("Reinstall"))
-        self.reinstallButton.toolTip = _("Install nninteractive-agent again (for updates); stops the server")
-        row.addWidget(self.startStopButton)
-        row.addWidget(self.reinstallButton)
-        form.addRow(row)
+        form.addRow(self.startStopButton)
         layout.addWidget(self.internalWidget)
 
         self.remoteRadio = qt.QRadioButton(_("Remote server (nninteractive-agent-web started elsewhere)"))
@@ -1019,6 +1085,18 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.serverInfoLabel.wordWrap = True
         layout.addWidget(self.serverInfoLabel)
 
+        row = qt.QHBoxLayout()
+        row.addWidget(qt.QLabel(_("Server output:")))
+        row.addStretch(1)
+        clearButton = qt.QPushButton(_("Clear"))
+        row.addWidget(clearButton)
+        layout.addLayout(row)
+        self.serverLog = qt.QPlainTextEdit()
+        self.serverLog.readOnly = True
+        self.serverLog.maximumBlockCount = 5000
+        self.serverLog.minimumHeight = 100
+        layout.addWidget(self.serverLog, 1)
+
         box = ctk.ctkCollapsibleButton()
         box.text = _("Conversation")
         layout.addWidget(box)
@@ -1040,23 +1118,14 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.enterSendsCheck.checked = settings.value(SETTINGS_PREFIX + "EnterSends", "true") == "true"
         form.addRow(self.enterSendsCheck)
 
-        row = qt.QHBoxLayout()
-        row.addWidget(qt.QLabel(_("Server output:")))
-        row.addStretch(1)
-        clearButton = qt.QPushButton(_("Clear"))
-        row.addWidget(clearButton)
-        layout.addLayout(row)
-        self.serverLog = qt.QPlainTextEdit()
-        self.serverLog.readOnly = True
-        self.serverLog.maximumBlockCount = 5000
-        self.serverLog.minimumHeight = 100
-        layout.addWidget(self.serverLog, 1)
-
         self.internalRadio.connect("toggled(bool)", self.onModeChanged)
         self.llmCombo.connect("currentIndexChanged(int)", lambda _i: self.updateConfigurationGUI())
         self.inferenceCombo.connect("currentIndexChanged(int)", lambda _i: self.updateConfigurationGUI())
         self.startStopButton.connect("clicked()", self.onStartStopServer)
-        self.reinstallButton.connect("clicked()", self.onReinstall)
+        self.installRecommendedButton.connect("clicked()", lambda: self.onInstallAgent("recommended"))
+        self.installLatestButton.connect("clicked()", lambda: self.onInstallAgent("latest"))
+        self.installCustomButton.connect("clicked()", lambda: self.onInstallAgent("custom"))
+        self.packageEdit.connect("textChanged(QString)", lambda _t: self.updateConfigurationGUI())
         self.connectButton.connect("clicked()", self.onConnect)
         self.disconnectButton.connect("clicked()", self.onDisconnect)
         self.endSessionButton.connect("clicked()", self.onEndSession)
@@ -1082,14 +1151,14 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.remoteWidget.enabled = not internal and not locked
         running = self.internal.running
         for w in (self.llmCombo, self.llmUrlEdit, self.apiKeyFileEdit, self.inferenceCombo, self.inferenceUrlEdit,
-                  self.portSpin, self.packageEdit):
+                  self.portSpin):
             w.enabled = not running and not self._connect_when_ready
         llm = self.llmCombo.currentData
         self.llmUrlEdit.enabled = self.llmUrlEdit.enabled and llm == "server"
         self.apiKeyFileEdit.enabled = self.apiKeyFileEdit.enabled and llm in ("claude-api", "codex-api", "server")
         self.inferenceUrlEdit.enabled = self.inferenceUrlEdit.enabled and self.inferenceCombo.currentData == "server"
         self.startStopButton.text = _("Stop server") if running else _("Start server")
-        self.reinstallButton.enabled = not running
+        self.installCustomButton.enabled = bool(self.packageEdit.text.strip())
 
     def updateGUI(self) -> None:
         connected = self.conn.connected
@@ -1259,7 +1328,36 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 return False
             if not self._pip_install([LOCAL_INFERENCE_PACKAGE]):
                 return False
-        return self.installPackages([self.packageEdit.text.strip() or AGENT_PACKAGE], list(AGENT_MODULES))
+        if not self.installPackages([AGENT_PACKAGE], list(AGENT_MODULES)):
+            return False
+        # As TotalSegmentator does: offer the recommended version if another one is installed, unless the user
+        # chose that one in the "nninteractive-agent version" section.
+        installed = installed_agent_url()
+        settings = qt.QSettings()
+        if installed and installed != agent_archive_url(AGENT_COMMIT) and \
+                settings.value(SETTINGS_PREFIX + "AgentVersion", "recommended") == "recommended" and \
+                settings.value(SETTINGS_PREFIX + "DeclinedAgentCommit", "") != AGENT_COMMIT:
+            box = qt.QMessageBox(slicer.util.mainWindow())
+            box.icon = qt.QMessageBox.Question
+            box.windowTitle = _("Update nninteractive-agent")
+            box.text = _("This module recommends another version of nninteractive-agent than the installed one.")
+            box.detailedText = _("Installed: {installed}\n\nRecommended: {recommended}\n\nKeep current version is "
+                                 "not asked again for this recommended version. The nninteractive-agent version "
+                                 "section of the Configuration tab installs any version.").format(
+                                     installed=installed, recommended=agent_archive_url(AGENT_COMMIT))
+            switchButton = box.addButton(_("Switch to recommended version"), qt.QMessageBox.AcceptRole)
+            keepButton = box.addButton(_("Keep current version"), qt.QMessageBox.DestructiveRole)
+            box.addButton(qt.QMessageBox.Cancel)  # also Esc and the window's close button
+            box.setDefaultButton(switchButton)
+            box.exec_()
+            clicked = box.clickedButton()
+            box.deleteLater()
+            if clicked == switchButton:
+                return self.installAgent(AGENT_PACKAGE)
+            if clicked != keepButton:
+                return False  # Cancel: not starting the server, and ask again next time
+            settings.setValue(SETTINGS_PREFIX + "DeclinedAgentCommit", AGENT_COMMIT)
+        return True
 
     def startInternalServer(self) -> bool:
         self.saveConfiguration()
@@ -1308,14 +1406,49 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         else:
             self.startInternalServer()
 
-    def onReinstall(self) -> None:
-        requirement = self.packageEdit.text.strip() or AGENT_PACKAGE
-        if not slicer.util.confirmOkCancelDisplay(_("Install {package} again?").format(package=requirement)):
+    def onInstallAgent(self, version: str) -> None:
+        """Install nninteractive-agent: the ``recommended`` version, the ``latest`` master commit, or the
+        ``custom`` requirement."""
+        if version == "recommended":
+            requirement = AGENT_PACKAGE
+        elif version == "latest":
+            try:
+                commit = latest_agent_commit()
+            except Exception as e:  # noqa: BLE001 - shown to the user
+                slicer.util.errorDisplay(_("Could not get the latest version of nninteractive-agent: {error}").format(
+                    error=e))
+                return
+            requirement = f"nninteractive-agent[web] @ {agent_archive_url(commit)}"
+        else:
+            requirement = self.packageEdit.text.strip()
+        if not slicer.util.confirmOkCancelDisplay(
+                _("Install nninteractive-agent from {package}? This stops the internal server.").format(
+                    package=requirement), _("Install nninteractive-agent")):
             return
         self.stopInternalServer()
-        # The newest code even if the version number is the same, then whatever it needs.
-        if self._pip_install([requirement], ["--upgrade", "--force-reinstall", "--no-deps"]):
+        if self.installAgent(requirement):
+            qt.QSettings().setValue(SETTINGS_PREFIX + "AgentVersion", version)
+            self.saveConfiguration()
+
+    def installAgent(self, requirement: str) -> bool:
+        # The requested code even if the version number is the same, then whatever it needs.
+        ok = self._pip_install([requirement], ["--upgrade", "--force-reinstall", "--no-deps"]) and \
             self._pip_install([requirement])
+        self.updateInstalledVersion()
+        return ok
+
+    def updateInstalledVersion(self) -> None:
+        version, url = installed_agent_version(), installed_agent_url()
+        if version is None:
+            text = _("not installed")
+        elif url == agent_archive_url(AGENT_COMMIT):
+            text = _("{version}, recommended version (commit {commit})").format(version=version,
+                                                                               commit=AGENT_COMMIT[:7])
+        else:
+            match = re.fullmatch(rf"https://github\.com/{AGENT_REPOSITORY}/archive/([0-9a-f]{{40}})\.zip", url or "")
+            source = _("commit {commit}").format(commit=match.group(1)[:7]) if match else (url or _("unknown source"))
+            text = _("{version}, from {source}").format(version=version, source=source)
+        self.installedVersionLabel.text = text
 
     def pollInternalServer(self) -> None:
         lines = self.internal.read_log()
@@ -1462,8 +1595,8 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                     _("This agent server cannot receive segmentations: its version of nninteractive-agent has no "
                       "segmentation upload (POST /api/objects).\n\n{advice}\n\nEverything else works with this "
                       "server: the agent can still segment the volume you sent.").format(
-                        advice=_("Install a version that has it: Configuration tab, \"Install from\", then "
-                                 "Reinstall.") if internal else
+                        advice=_("Install a version that has it: Configuration tab, nninteractive-agent version, "
+                                 "Install recommended version.") if internal else
                         _("Ask whoever runs the server to update nninteractive-agent to a version that has it.")),
                     windowTitle=_("Segmentation upload not available"))
                 self.updateGUI()
