@@ -1536,9 +1536,51 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                     _("These are outside the agent's image and are left out: {labels}. Send anyway?").format(
                         labels=", ".join(dropped))):
                 return
+        if not self.confirmDataSharing():
+            return
         if self.conn.send({"cmd": "send", "text": text}):
             self.messageEdit.setPlainText("")
             self.chat.verticalScrollBar().value = self.chat.verticalScrollBar().maximum  # follow the answer
+
+    def llmDescription(self) -> tuple:
+        """(settings key, description) of where the agent's LLM requests go."""
+        name, label = self.agent.get("name", ""), self.agent.get("label", "?")
+        model = self.modelCombo.currentText or "?"
+        if name.startswith("claude"):
+            return "anthropic", _("Anthropic: {label}, model {model}").format(model=model, label=label)
+        if name.startswith("codex"):
+            return "openai", _("OpenAI: {label}, model {model}").format(model=model, label=label)
+        return "server_" + re.sub(r"[^A-Za-z0-9_.-]+", "_", label), _(
+            "the model server you configured: {label}. The images leave this computer only if that server runs on "
+            "another computer").format(label=label)
+
+    def confirmDataSharing(self) -> bool:
+        """Before the first message to an LLM provider: say what the agent sends to it. Can be dismissed for good."""
+        provider, description = self.llmDescription()
+        key = SETTINGS_PREFIX + "DataSharingAccepted/" + provider
+        settings = qt.QSettings()
+        if slicer.util.toBool(settings.value(key, False)):
+            return True
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.icon = qt.QMessageBox.Warning
+        box.windowTitle = _("Data sent to the LLM")
+        box.text = _("The agent sends renderings of the image (slices and 3D views) to its LLM: {llm}.").format(
+            llm=description)
+        box.informativeText = _("Do not use this with patient data unless you are allowed to share it with this "
+                                "LLM provider. Click OK to continue.")
+        box.detailedText = _("Sent to the LLM: your messages, rendered slices and 3D views of the image and the "
+                             "segmentation, the image's size, spacing and intensity statistics, numbers the agent "
+                             "computes from the voxels, the volume's name, and the names and notes of the objects. The volume itself is sent to the agent server, "
+                             "not to the LLM.")
+        box.standardButtons = qt.QMessageBox.Ok | qt.QMessageBox.Cancel
+        box.setDefaultButton(qt.QMessageBox.Cancel)
+        dontShowAgain = qt.QCheckBox(_("Don't show this again for this LLM provider"))
+        box.setCheckBox(dontShowAgain)
+        accepted = box.exec_() == qt.QMessageBox.Ok
+        box.deleteLater()
+        if accepted and dontShowAgain.checked:
+            settings.setValue(key, True)
+        return accepted
 
     def offerToSendImage(self) -> None:
         """A message but no image yet: explain, and offer to send the selected volume (the message follows)."""
