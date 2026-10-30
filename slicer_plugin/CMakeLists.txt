@@ -22,6 +22,7 @@ include(${Slicer_USE_FILE})
 #-----------------------------------------------------------------------------
 # Extension modules
 add_subdirectory(SlicerNNInteractive)
+add_subdirectory(nnInteractiveAgent)
 ## NEXT_MODULE
 
 if(BUILD_TESTING)
