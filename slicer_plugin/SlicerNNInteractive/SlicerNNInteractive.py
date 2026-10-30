@@ -659,6 +659,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.addObserver(
             slicer.mrmlScene, slicer.vtkMRMLScene.NodeRemovedEvent, self.on_scene_nodes_changed
         )
+        self.addObserver(
+            slicer.mrmlScene, slicer.vtkMRMLScene.StartCloseEvent, self.on_scene_start_close
+        )
 
         # Initialization is mandatory: keep every prompt control disabled until a
         # session is live (_on_session_ready re-enables them, gated per model).
@@ -1707,6 +1710,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         qt.QTimer.singleShot(0, _update_once)
 
+    def on_scene_start_close(self, caller, event):
+        """Uninitialize (the session's image is going away) and remove our prompt nodes
+        before the scene is closed. Left to the scene close, the scribble segmentation
+        is torn down while still in use and Slicer logs subject hierarchy errors for it."""
+        if self._is_tearing_down():
+            return
+        if self.session is not None:
+            self.release_session()
+            self.update_connect_status(connected=False)
+        self.remove_prompt_nodes()
+
     def _handle_selected_segment_change(self):
         """When the user picks a different segment to refine, the session re-seeds it
         (lazily, on the next prompt) and resets its interactions -- so the prompts left
@@ -1943,7 +1957,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.scribble_editor_widget.setMRMLScene(slicer.mrmlScene)
             self.scribble_editor_widget.setMaximumNumberOfUndoStates(10)
 
-        if getattr(self, "scribble_editor_node", None) is None:
+        # Also recreate it after File > Close Scene, which removes it from the scene.
+        editor_node = getattr(self, "scribble_editor_node", None)
+        if editor_node is None or editor_node.GetScene() is not slicer.mrmlScene:
             self.scribble_editor_node = slicer.mrmlScene.AddNewNodeByClass(
                 "vtkMRMLSegmentEditorNode"
             )
@@ -6084,8 +6100,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             volumeNodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
             if volumeNodes:
                 volumeNode = volumeNodes[-1]
-            # Show this volume node in the segment editor widget
-            self.ui.editor_widget.setSourceVolumeNode(volumeNode)
+            # Show this volume node in the segment editor widget (it rejects a source
+            # volume, with an error, until a segmentation is set, e.g. after Close Scene)
+            if self.segment_editor_node.GetSegmentationNode() is not None:
+                self.ui.editor_widget.setSourceVolumeNode(volumeNode)
 
         return volumeNode
 
