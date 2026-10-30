@@ -10,7 +10,13 @@ This repository makes [nnInteractive](https://github.com/MIC-DKFZ/nnInteractive)
 
 ## Video tutorial
 
+### nnInteractive
+
 https://github.com/user-attachments/assets/c9f9ee0a-f74d-4907-aa21-484dcfd10948
+
+### nnInteractive Agent
+
+https://github.com/user-attachments/assets/8a6a7fc7-df8d-47d9-b13d-1d6a49df16a7
 
 ## Table of contents
 
