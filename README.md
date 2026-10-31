@@ -312,6 +312,12 @@ When using `SlicerNNInteractive`, please cite:
 
 	[![arXiv](https://img.shields.io/badge/arXiv-2504.07991-b31b1b.svg)](https://arxiv.org/abs/2504.07991)
 
+3. When using the `nnInteractive Agent` module, please also cite its technical report:
+
+	> Isensee, F., Harsy, C. U., Rokuss, M., Hamm, B., Vollmuth, P., & Maier-Hein, K. H. (2026). nnInteractive Agent: General-Purpose AI Agents as 3D Image Annotators. https://arxiv.org/abs/2610.31080
+
+	[![arXiv](https://img.shields.io/badge/arXiv-2610.31080-b31b1b.svg)](https://arxiv.org/abs/2610.31080)
+
 ## License
 This repository is available under a Apache-2.0 license (see [here](LICENSE)).
 
