@@ -157,6 +157,26 @@ def cuda_gpu_available():
     return shutil.which("nvidia-smi") is not None
 
 
+def _use_system_python_headers():
+    """Fallback for Slicer's header-less Python: if the system has development headers for
+    the same Python major.minor (e.g. Ubuntu's python3.12-dev in /usr/include/python3.12),
+    put them on CPATH so torch.compile's runtime C helpers can build. Headers are ABI-stable
+    within a minor version, so a different patch release is fine. Returns True if found."""
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return False
+    name = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    for prefix in ("/usr/include", "/usr/local/include"):
+        candidate = os.path.join(prefix, name)
+        if os.path.isfile(os.path.join(candidate, "Python.h")):
+            cpath = os.environ.get("CPATH", "")
+            if candidate not in cpath.split(os.pathsep):
+                os.environ["CPATH"] = os.pathsep.join(p for p in (candidate, cpath) if p)
+            return True
+    return False
+
+
 def torch_compile_unsupported_reason(check_gpu=False):
     """Why torch.compile can't be used here, or None if it can.
 
@@ -181,7 +201,7 @@ def torch_compile_unsupported_reason(check_gpu=False):
         return "torch.compile is not supported on Windows."
 
     include_dir = sysconfig.get_paths().get("include")
-    if not (include_dir and os.path.isfile(os.path.join(include_dir, "Python.h"))):
+    if not (include_dir and os.path.isfile(os.path.join(include_dir, "Python.h"))) and not _use_system_python_headers():
         return (
             "torch.compile needs the Python development headers (Python.h), "
             "which are not present in this Python build."
@@ -200,6 +220,13 @@ SETTING_DEFAULTS = {
     # the checkbox keep their stored choice.
     "use_torch_compile": torch_compile_unsupported_reason() is None,
     "interactions_storage": "auto",
+    # Local sessions: keep the preprocessed image + interactions on the GPU when they fit
+    # (see nnInteractiveInferenceSession gpu_resident). "auto" / "on" / "off".
+    "gpu_resident": "auto",
+    # Local sessions: cap of the auto-zoom field of view, as a multiple of the 192^3 patch.
+    # 4 is nnInteractive's default; larger lets one prompt cover longer structures on
+    # large volumes. The session caps it at ~6.7 (CUDA 32-bit indexing limit).
+    "max_autozoom": "4",
     "device": "cuda:0",
     "checkpoint_path": "",
     "model_id": "",
@@ -825,6 +852,33 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         advanced_form.addRow("Interaction storage:", self.ui.storageCombo)
 
+        self.ui.gpuResidentCombo = qt.QComboBox()
+        self.ui.gpuResidentCombo.addItems(["auto", "on", "off"])
+        self.ui.gpuResidentCombo.setCurrentText(self.get_setting_str("gpu_resident"))
+        self.ui.gpuResidentCombo.setToolTip(
+            "Keep the image and all prompt channels in GPU memory for the whole session "
+            "(needs ~18 bytes/voxel of VRAM plus headroom). Removes the CPU decompression and "
+            "PCIe transfers that dominate auto-zoom and refinement on large volumes. "
+            "'auto' enables it when the volume fits; it overrides Interaction storage."
+        )
+        self.ui.gpuResidentCombo.currentTextChanged.connect(
+            lambda v: self._save_setting("gpu_resident", v, reinit=True)
+        )
+        advanced_form.addRow("GPU-resident data:", self.ui.gpuResidentCombo)
+
+        self.ui.maxAutozoomSpin = qt.QDoubleSpinBox()
+        self.ui.maxAutozoomSpin.setRange(1.0, 6.6)
+        self.ui.maxAutozoomSpin.setSingleStep(0.5)
+        self.ui.maxAutozoomSpin.setDecimals(1)
+        self.ui.maxAutozoomSpin.setValue(self._get_max_autozoom())
+        self.ui.maxAutozoomSpin.setToolTip(
+            "Largest auto-zoom field of view, in multiples of the 192-voxel patch "
+            "(4 = nnInteractive default). Higher values let one prompt capture longer/larger "
+            "structures on big volumes, at the cost of a slower prompt."
+        )
+        self.ui.maxAutozoomSpin.valueChanged.connect(self._on_max_autozoom_changed)
+        advanced_form.addRow("Max auto-zoom:", self.ui.maxAutozoomSpin)
+
         # --- Remote container ---
         self.ui.remoteContainer = qt.QWidget()
         remote_layout = qt.QVBoxLayout(self.ui.remoteContainer)
@@ -1299,6 +1353,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if license_str == "!!MISSING!!":
             return "Model license: UNKNOWN (warning!)"
         return f"Model license: {license_str}"
+
+    def _get_max_autozoom(self):
+        try:
+            return float(self.get_setting_str("max_autozoom"))
+        except (TypeError, ValueError):
+            return float(SETTING_DEFAULTS["max_autozoom"])
+
+    def _on_max_autozoom_changed(self, value):
+        self._save_setting("max_autozoom", str(value), reinit=False)
+        # Takes effect on the next prompt: a per-session override of the class constant.
+        if self.session is not None and getattr(self, "_session_mode", None) == "local":
+            self.session.MAX_AUTOZOOM_FACTOR = float(value)
 
     def on_autozoom_toggled(self, checked):
         self._save_setting_bool("autozoom", checked, reinit=False)
@@ -2181,6 +2247,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     # "Predicting ..." dialog once it has run this long. Most prompts finish faster
     # (autozoom-triggering ones are the slow exception) and never flash a dialog.
     PREDICTION_DIALOG_DELAY_S = 2.0
+
+    # Voxels added on each side when a segment's labelmap extent has to grow (see
+    # _update_segment_region), so follow-up prompts near the object update in place.
+    SEGMENT_EXTENT_GROW_MARGIN = 128
 
     def _polarity_color(self, positive):
         """The single positive->green / negative->red mapping used by every prompt visual."""
@@ -3802,8 +3872,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
           prompt -- even in a scene that already has other segments -- or growth that engulfs
           its old content) -> SetBinaryLabelmapToSegment(MODE_REPLACE) the bbox region only
           (the rest of this segment is/becomes background -- nothing of ours to preserve);
-        * otherwise (this segment has voxels both inside and outside the bbox) -> return False
-          so the caller does the full update, which preserves the outside content.
+        * otherwise (this segment has voxels both inside and outside the bbox) -> grow the
+          region to the union of the bbox and the segment's own extent and region-replace
+          that from the target buffer (which mirrors the whole segment), instead of the
+          full-volume update this used to fall back to.
 
         Emptiness is judged from THIS segment's own label value, not the labelmap's union
         extent, so siblings in a shared labelmap don't force a needless full update.
@@ -3866,15 +3938,31 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 # case being a fresh segment in a scene that already has others).
                 own = view == label_value
                 if own.any():
-                    kk, jj, ii = np.nonzero(own)
-                    own_within_bbox = (
-                        i0 <= ix0 + int(ii.min()) and ix0 + int(ii.max()) <= i1 - 1
-                        and j0 <= iy0 + int(jj.min()) and iy0 + int(jj.max()) <= j1 - 1
-                        and k0 <= iz0 + int(kk.min()) and iz0 + int(kk.max()) <= k1 - 1
+                    # Per-axis projections instead of np.nonzero (no index arrays per voxel).
+                    kk, jj, ii = (
+                        np.flatnonzero(own.any(axis=axes)) for axes in ((1, 2), (0, 2), (0, 1))
                     )
-                    if not own_within_bbox:
-                        # This segment has voxels outside the bbox -> full update preserves them.
-                        return False
+                    own_bbox = [
+                        [iz0 + int(kk[0]), iz0 + int(kk[-1]) + 1],
+                        [iy0 + int(jj[0]), iy0 + int(jj[-1]) + 1],
+                        [ix0 + int(ii[0]), ix0 + int(ii[-1]) + 1],
+                    ]
+                    # This segment has voxels outside the bbox. Rather than a full-volume
+                    # update (seconds on multi-GB volumes), grow the region to the union of
+                    # the bbox and the segment's own extent and region-replace that: the
+                    # target buffer holds this segment's complete current state (seeded from
+                    # it, then updated by every prediction), so the union crop of it already
+                    # contains the voxels outside the bbox, and nothing of ours lies beyond.
+                    # Pad the grown extent so the next prompts near this object land inside it
+                    # and take the cheap in-place path above: a region replace costs time
+                    # proportional to its volume (~0.7 s for 250 Mvoxels), the in-place write
+                    # only the prediction's bbox.
+                    margin = self.SEGMENT_EXTENT_GROW_MARGIN
+                    bbox = [
+                        [max(0, min(lo, olo) - margin), min(n, max(hi, ohi) + margin)]
+                        for (lo, hi), (olo, ohi), n in zip(bbox, own_bbox, mask.shape)
+                    ]
+                    (k0, k1), (j0, j1), (i0, i1) = bbox
                 # else: this segment is empty here (the allocation holds only sibling
                 # segments), so a region replace drops nothing of ours -> fall through.
 
@@ -4054,10 +4142,63 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.get_selected_segmentation_node_and_segment_id()
         )
 
+        mask = self._segment_mask_on_volume_grid(
+            segmentation_node, selected_segment_id, self.get_volume_node()
+        )
+        if mask is not None:
+            return mask
         mask = slicer.util.arrayFromSegmentBinaryLabelmap(
             segmentation_node, selected_segment_id, self.get_volume_node()
         )
         return (mask != 0).astype(np.uint8)
+
+    def _segment_mask_on_volume_grid(self, segmentation_node, segment_id, volume_node):
+        """Fast full-volume binary mask of one segment, or None to use the generic path.
+
+        arrayFromSegmentBinaryLabelmap() resamples the segment onto the reference volume,
+        which takes ~20 s for a 2 Gvoxel volume (measured on a shared labelmap layer).
+        When the segment's internal labelmap already lies on the volume's voxel grid
+        (the usual case: the segmentation's geometry comes from this volume), the same
+        mask is just this segment's label value in the zero-copy internal view, pasted
+        at the extent offset. Returns None if the grids differ or a transform is involved.
+        """
+        if segmentation_node is None or volume_node is None:
+            return None
+        if segmentation_node.GetParentTransformNode() or volume_node.GetParentTransformNode():
+            return None
+        segment = segmentation_node.GetSegmentation().GetSegment(segment_id)
+        if segment is None:
+            return None
+        shape = tuple(reversed(volume_node.GetImageData().GetDimensions()))  # (k, j, i)
+        vimage = segmentation_node.GetBinaryLabelmapInternalRepresentation(segment_id)
+        if vimage is None:
+            return np.zeros(shape, dtype=np.uint8)
+        ix0, ix1, iy0, iy1, iz0, iz1 = vimage.GetExtent()
+        if ix1 < ix0 or iy1 < iy0 or iz1 < iz0:
+            return np.zeros(shape, dtype=np.uint8)
+        # Same voxel grid <=> volume RAS->IJK applied to the labelmap IJK->RAS is identity.
+        seg_to_world = vtk.vtkMatrix4x4()
+        vimage.GetImageToWorldMatrix(seg_to_world)
+        world_to_vol = vtk.vtkMatrix4x4()
+        volume_node.GetRASToIJKMatrix(world_to_vol)
+        seg_to_vol = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Multiply4x4(world_to_vol, seg_to_world, seg_to_vol)
+        if not np.allclose(slicer.util.arrayFromVTKMatrix(seg_to_vol), np.eye(4), atol=1e-3):
+            return None
+        view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(segmentation_node, segment_id)
+        if view is None:
+            return None
+        # Clip the labelmap extent to the volume (an extent can exceed it after edits).
+        dst, src = [], []
+        for lo, hi, n in ((iz0, iz1 + 1, shape[0]), (iy0, iy1 + 1, shape[1]), (ix0, ix1 + 1, shape[2])):
+            a, b = max(lo, 0), min(hi, n)
+            if b <= a:
+                return np.zeros(shape, dtype=np.uint8)
+            dst.append(slice(a, b))
+            src.append(slice(a - lo, b - lo))
+        mask = np.zeros(shape, dtype=np.uint8)
+        np.equal(view[tuple(src)], segment.GetLabelValue(), out=mask[tuple(dst)].view(bool))
+        return mask
 
     def _segment_fingerprint(self):
         """Cheap O(1) identity for the selected segment's labelmap:
@@ -4318,6 +4459,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         want_compile = self.get_setting_bool("use_torch_compile")
         compile_reason = torch_compile_unsupported_reason()
         storage = self.get_setting_str("interactions_storage")
+        gpu_resident = {"on": True, "off": False}.get(self.get_setting_str("gpu_resident"), "auto")
+        max_autozoom = self._get_max_autozoom()
 
         use_compile = want_compile
         no_compile_reason = None
@@ -4348,6 +4491,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 # CPU-only torch wheel, which the config-tab probe can't see.
                 with_compile = False
 
+            import inspect
+
+            # gpu_resident is a local patch of nnInteractive; a reinstalled stock package
+            # lacks it, so only pass it when supported.
+            extra = {}
+            if "gpu_resident" in inspect.signature(nnInteractiveInferenceSession.__init__).parameters:
+                extra["gpu_resident"] = gpu_resident
             session = nnInteractiveInferenceSession(
                 device=device,
                 use_torch_compile=with_compile,
@@ -4357,7 +4507,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 # user's choice is respected there too.
                 do_autozoom=want_autozoom,
                 interactions_storage=storage,
+                **extra,
             )
+            session.MAX_AUTOZOOM_FACTOR = max_autozoom
             # Load the weights. initialize_from_trained_model_folder() runs the warmup
             # forward pass internally (torch.compile compilation + cuDNN autotuning);
             # because this runs on the session-executor thread -- the same thread every
@@ -4752,7 +4904,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         thread only."""
         if getattr(self.session, "supports_initial_label", True) and not self._selected_segment_is_empty():
             seg = self.get_segment_data()
-            if seg.sum() > 0:
+            if seg.any():
                 return seg
         return None
 
