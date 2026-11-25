@@ -2504,7 +2504,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def point_prompt(self, xyz=None, positive_click=False):
         """
         Adds a point interaction to the nnInteractive session.
-        ``xyz`` is in IJK (i, j, k) order; the session image is [1, k, j, i], so
+        ``xyz`` is an array index in (i, j, k) order; the session image is [1, k, j, i], so
         coordinates are reversed to match the array's spatial-axis order.
         """
         debug_print(f"{positive_click} point prompt triggered! {xyz}")
@@ -2533,7 +2533,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _place_point_from_event(self, slice_widget, event, event_widget=None):
         """Place a point prompt at a captured left-click (point tool, ViewTransform mode).
 
-        Mirrors the lasso's display->RAS->IJK conversion, adds the visual control point
+        Mirrors the lasso's display->RAS->array index conversion, adds the visual control point
         that markups Place mode used to add for us, and sends the point to the session.
         """
         slice_node = slice_widget.mrmlSliceNode()
@@ -2634,7 +2634,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._push_prompt_undo(undo if undo is not None else (lambda: None))
 
     def _bbox_outline_crop(self, xyz_a, xyz_b):
-        """Build a 1-voxel-thick rectangle outline for the box spanning two IJK corners,
+        """Build a 1-voxel-thick rectangle outline for the box spanning two corners (array indices, (i, j, k)),
         in the (crop, ((k0,k1),(j0,j1),(i0,i1))) form _add_prompt_overlay_segment expects.
         Clamped to the image; returns (None, None) if degenerate or out of bounds."""
         image = self.get_image_data()
@@ -2732,7 +2732,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def bbox_prompt(self, outer_point_one, outer_point_two, positive_click=False):
         """
         Adds a bounding-box interaction to the session. The two corners are given
-        in IJK (i, j, k); we reverse to (k, j, i) and build half-open intervals
+        as array indices in (i, j, k) order; we reverse to (k, j, i) and build half-open intervals
         ``[[k0, k1], [j0, j1], [i0, i1]]``. One axis is size 1 (the drawn slice),
         which satisfies the 2D-bbox requirement of the public models.
         """
@@ -2992,7 +2992,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Rasterize the freehand contour into a tight 2D crop and send it (with its
         interaction bbox) to the session. Display points are converted to RAS via the
-        stroke slice's XYToRAS, then to IJK; skimage fills the closed polygon.
+        stroke slice's XYToRAS, then to array indices; skimage fills the closed polygon.
         """
         pts = self._lasso_display_pts
         slice_widget = self._lasso_slice_widget
@@ -3006,11 +3006,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         try:
             xy_to_ras = slice_node.GetXYToRAS()
-            to_ijk = self._ras_to_ijk_converter()  # hoisted: one setup for the contour
+            to_index = self._ras_to_array_index_converter()  # hoisted: one setup for the contour
             xyzs = []
             for (x, y) in pts:
                 ras = xy_to_ras.MultiplyPoint([x, y, 0.0, 1.0])
-                xyzs.append(to_ijk([ras[0], ras[1], ras[2]]))
+                xyzs.append(to_index([ras[0], ras[1], ras[2]]))
             crop, bbox = self.lasso_points_to_crop(xyzs)
         except ValueError:
             # No single constant slice axis (e.g. an oblique reformat); ignore.
@@ -3107,12 +3107,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         from vtk.util import numpy_support
 
-        (k0, k1), (j0, j1), (i0, i1) = bbox
+        volume_node = self.get_volume_node()
         sub = np.ascontiguousarray(crop, dtype=np.uint8)
         oriented = slicer.vtkOrientedImageData()
-        oriented.SetExtent(i0, i1 - 1, j0, j1 - 1, k0, k1 - 1)
+        oriented.SetExtent(*self._array_bbox_to_ijk_extent(bbox, volume_node))
         ijk_to_ras = vtk.vtkMatrix4x4()
-        self.get_volume_node().GetIJKToRASMatrix(ijk_to_ras)
+        volume_node.GetIJKToRASMatrix(ijk_to_ras)
         oriented.SetImageToWorldMatrix(ijk_to_ras)
         oriented.GetPointData().SetScalars(
             numpy_support.numpy_to_vtk(
@@ -3384,11 +3384,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         vimage = node.GetBinaryLabelmapInternalRepresentation(label_name)
         if vimage is None:
             return None
-        # Allocated labelmap extent in IJK (i, j, k), inclusive. The scribble node shares
-        # the volume's geometry (SetReferenceImageGeometryParameterFromVolumeNode), so
-        # these indices address the volume array directly. A SHARED labelmap (fg + bg)
-        # reports the union extent, which is why we filter by THIS segment's value below.
-        ix0, ix1, iy0, iy1, iz0, iz1 = vimage.GetExtent()
+        # Allocated labelmap extent (i, j, k), inclusive, shifted from IJK to array
+        # indices. The scribble node shares the volume's geometry
+        # (SetReferenceImageGeometryParameterFromVolumeNode), so these then address the
+        # volume array directly. A SHARED labelmap (fg + bg) reports the union extent,
+        # which is why we filter by THIS segment's value below.
+        ix0, ix1, iy0, iy1, iz0, iz1 = self._labelmap_extent_in_array_indices(vimage)
         if ix1 < ix0 or iy1 < iy0 or iz1 < iz0:
             return None  # nothing allocated yet -- early AnyEvent before the real stroke
         view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(node, label_name)
@@ -3822,10 +3823,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         label_value = segment.GetLabelValue()
         vimage = segmentationNode.GetBinaryLabelmapInternalRepresentation(segmentId)
         if vimage is not None:
-            # Allocated labelmap extent in IJK (i, j, k), inclusive. For a SHARED labelmap
-            # this is the union over all its segments, so it tells us what is *allocated*,
-            # not what belongs to THIS segment.
-            ix0, ix1, iy0, iy1, iz0, iz1 = vimage.GetExtent()
+            # Allocated labelmap extent (i, j, k), inclusive, shifted from IJK to array
+            # indices like bbox. For a SHARED labelmap this is the union over all its
+            # segments, so it tells us what is *allocated*, not what belongs to THIS segment.
+            ix0, ix1, iy0, iy1, iz0, iz1 = self._labelmap_extent_in_array_indices(vimage)
             if ix1 >= ix0 and iy1 >= iy0 and iz1 >= iz0:  # non-empty allocation
                 view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(segmentationNode, segmentId)
                 bbox_within_extent = (ix0 <= i0 and i1 - 1 <= ix1
@@ -6121,11 +6122,48 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         return image_changed
 
-    def _ras_to_ijk_converter(self):
-        """One-time setup for RAS -> IJK conversion in the current volume node; returns
-        a per-point callable. Hoist this out of loops: building the VTK transform and
-        matrix dominates the cost, so per-point construction made long-contour
-        conversions (lasso submit) needlessly slow."""
+    def _array_origin_in_ijk(self, volume_node=None):
+        """IJK coordinates (i, j, k) of element [0, 0, 0] of the volume's numpy voxel array.
+
+        Terminology used in this module:
+
+        * IJK: VTK image coordinates, the ones the IJKToRAS matrix maps and VTK extents
+          are given in. They start at the image data's extent, which is usually 0 but
+          not always (e.g. a labelmap exported from a segmentation).
+        * Array index: the 0-based index into the numpy array of the voxels
+          (arrayFromVolume, the session image, the target buffer). Prompt coordinates
+          sent to nnInteractive and the prediction bboxes it returns are array indices,
+          in (i, j, k) or (k, j, i) order as noted at each use.
+
+        Array index = IJK - this origin. Every conversion between the two goes through
+        this offset."""
+        volume_node = volume_node if volume_node is not None else self.get_volume_node()
+        image = volume_node.GetImageData() if volume_node is not None else None
+        if image is None:
+            return (0, 0, 0)
+        e = image.GetExtent()
+        return (e[0], e[2], e[4])
+
+    def _array_bbox_to_ijk_extent(self, bbox, volume_node=None):
+        """Half-open array-index bbox ``((k0,k1),(j0,j1),(i0,i1))`` -> inclusive VTK
+        extent ``(i0, i1, j0, j1, k0, k1)`` in IJK (see _array_origin_in_ijk)."""
+        (k0, k1), (j0, j1), (i0, i1) = bbox
+        oi, oj, ok = self._array_origin_in_ijk(volume_node)
+        return (i0 + oi, i1 - 1 + oi, j0 + oj, j1 - 1 + oj, k0 + ok, k1 - 1 + ok)
+
+    def _labelmap_extent_in_array_indices(self, vimage):
+        """Inclusive VTK extent of a labelmap in the volume's geometry, converted from
+        IJK to array indices (see _array_origin_in_ijk)."""
+        oi, oj, ok = self._array_origin_in_ijk()
+        ix0, ix1, iy0, iy1, iz0, iz1 = vimage.GetExtent()
+        return ix0 - oi, ix1 - oi, iy0 - oj, iy1 - oj, iz0 - ok, iz1 - ok
+
+    def _ras_to_array_index_converter(self):
+        """One-time setup for RAS -> array index conversion in the current volume node;
+        returns a per-point callable giving (i, j, k) array indices (RAS -> IJK with the
+        RASToIJK matrix, then minus _array_origin_in_ijk). Hoist this out of loops:
+        building the VTK transform and matrix dominates the cost, so per-point
+        construction made long-contour conversions (lasso submit) needlessly slow."""
         volumeNode = self.get_volume_node()
 
         transformRasToVolumeRas = vtk.vtkGeneralTransform()
@@ -6134,20 +6172,22 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         volumeRasToIjk = vtk.vtkMatrix4x4()
         volumeNode.GetRASToIJKMatrix(volumeRasToIjk)
+        origin = self._array_origin_in_ijk(volumeNode)
 
         def _convert(pos):
             point_VolumeRas = transformRasToVolumeRas.TransformPoint(pos)
             point_Ijk = [0, 0, 0, 1]
             volumeRasToIjk.MultiplyPoint(list(point_VolumeRas) + [1.0], point_Ijk)
-            return [int(round(c)) for c in point_Ijk[0:3]]
+            return [int(round(c)) - o for c, o in zip(point_Ijk[0:3], origin)]
 
         return _convert
 
     def ras_to_xyz(self, pos):
         """
-        Converts an RAS position to IJK voxel coords in the current volume node.
+        Converts an RAS position to (i, j, k) voxel array indices in the current volume
+        node (see _ras_to_array_index_converter).
         """
-        return self._ras_to_ijk_converter()(pos)
+        return self._ras_to_array_index_converter()(pos)
 
 
     def lasso_points_to_crop(self, points):
@@ -6157,7 +6197,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         (k, j, i) = (z, y, x) order. Returns ``(crop, bbox)`` or ``(None, None)``
         if the polygon is empty.
 
-        ``points`` are in IJK (i, j, k) order; the image array is (k, j, i), so
+        ``points`` are array indices in (i, j, k) order; the image array is (k, j, i), so
         x->axis2, y->axis1, z->axis0.
         """
         from skimage.draw import polygon
