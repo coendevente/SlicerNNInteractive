@@ -209,7 +209,7 @@ Once you have completed the installation above, you can use `SlicerNNInteractive
 
 4. Click `Show 3D` button in the segment editor section (below the prompts section) to see the segmentation results in 3D.
 
-5. If needed, you can correct the generated segmentation with positive and negative prompts (between which you can toggle using the Positive/Negative buttons). You can undo the last interaction with `Ctrl+Z`.
+5. If needed, you can correct the generated segmentation with positive and negative prompts (between which you can toggle using the Positive/Negative buttons). You can undo the last interaction with `Ctrl+Z`. The `Undo` and `Redo` buttons of the Segment Editor also undo and redo each prediction, like a Paint stroke; the next prompt then continues from the restored segment.
 
 	a) Alternatively, you can reset the current segment using the "Reset segment button".
 
@@ -217,6 +217,9 @@ Once you have completed the installation above, you can use `SlicerNNInteractive
 
 ### Editing an existing segment
 You can edit an existing segmentation (generated using this plugin, or obtained otherwise, such as through loading in a segmentation file), by selecting the segment in the Segment Editor. Prompts are always applied to the selected segment.
+
+### Masking (threshold / editable area)
+nnInteractive results respect the `Masking` settings of the Segment Editor section, the same way Paint and the other effects do. If an `Editable intensity range` is set (for example, a threshold), or an `Editable area` other than `Everywhere` is selected, the prediction changes the segment only where editing is allowed. A positive prompt adds voxels only up to the mask boundary, and a negative prompt removes voxels only inside the mask. Outside the mask, the segment is left as it was. While masking is active, an orange "Masking active: ..." note appears below the prompt type buttons.
 
 ### Keyboard shortcuts
 Most buttons in the `nnInteractive Prompts` tab have a keyboard shortcut, shown in brackets in the button label (for example, `Bounding Box (B)`). The full list:

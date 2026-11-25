@@ -1250,6 +1250,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         layout.insertWidget(0, init_group)
 
+        # maskingHintLabel (in the .ui) is shown only while the Segment Editor's Masking
+        # settings restrict where results are written -- e.g. a threshold left enabled
+        # from an earlier Paint session would otherwise clip results silently.
+        self._update_masking_hint()
+
         logos = self._build_logos_widget()
         if logos is not None:
             layout.addWidget(logos)
@@ -1685,6 +1690,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._handle_active_source_volume_change(reupload=True)
         self._handle_selected_segment_change()
         self._update_initialize_button_state()
+        self._update_masking_hint()
 
     def on_scene_nodes_changed(self, caller, event, calldata=None):
         """Volumes added/removed: re-evaluate whether Initialize can be used. Coalesced
@@ -2504,7 +2510,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def point_prompt(self, xyz=None, positive_click=False):
         """
         Adds a point interaction to the nnInteractive session.
-        ``xyz`` is in IJK (i, j, k) order; the session image is [1, k, j, i], so
+        ``xyz`` is an array index in (i, j, k) order; the session image is [1, k, j, i], so
         coordinates are reversed to match the array's spatial-axis order.
         """
         debug_print(f"{positive_click} point prompt triggered! {xyz}")
@@ -2533,7 +2539,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _place_point_from_event(self, slice_widget, event, event_widget=None):
         """Place a point prompt at a captured left-click (point tool, ViewTransform mode).
 
-        Mirrors the lasso's display->RAS->IJK conversion, adds the visual control point
+        Mirrors the lasso's display->RAS->array index conversion, adds the visual control point
         that markups Place mode used to add for us, and sends the point to the session.
         """
         slice_node = slice_widget.mrmlSliceNode()
@@ -2634,7 +2640,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._push_prompt_undo(undo if undo is not None else (lambda: None))
 
     def _bbox_outline_crop(self, xyz_a, xyz_b):
-        """Build a 1-voxel-thick rectangle outline for the box spanning two IJK corners,
+        """Build a 1-voxel-thick rectangle outline for the box spanning two corners (array indices, (i, j, k)),
         in the (crop, ((k0,k1),(j0,j1),(i0,i1))) form _add_prompt_overlay_segment expects.
         Clamped to the image; returns (None, None) if degenerate or out of bounds."""
         image = self.get_image_data()
@@ -2732,7 +2738,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def bbox_prompt(self, outer_point_one, outer_point_two, positive_click=False):
         """
         Adds a bounding-box interaction to the session. The two corners are given
-        in IJK (i, j, k); we reverse to (k, j, i) and build half-open intervals
+        as array indices in (i, j, k) order; we reverse to (k, j, i) and build half-open intervals
         ``[[k0, k1], [j0, j1], [i0, i1]]``. One axis is size 1 (the drawn slice),
         which satisfies the 2D-bbox requirement of the public models.
         """
@@ -2992,7 +2998,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Rasterize the freehand contour into a tight 2D crop and send it (with its
         interaction bbox) to the session. Display points are converted to RAS via the
-        stroke slice's XYToRAS, then to IJK; skimage fills the closed polygon.
+        stroke slice's XYToRAS, then to array indices; skimage fills the closed polygon.
         """
         pts = self._lasso_display_pts
         slice_widget = self._lasso_slice_widget
@@ -3006,11 +3012,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         try:
             xy_to_ras = slice_node.GetXYToRAS()
-            to_ijk = self._ras_to_ijk_converter()  # hoisted: one setup for the contour
+            to_index = self._ras_to_array_index_converter()  # hoisted: one setup for the contour
             xyzs = []
             for (x, y) in pts:
                 ras = xy_to_ras.MultiplyPoint([x, y, 0.0, 1.0])
-                xyzs.append(to_ijk([ras[0], ras[1], ras[2]]))
+                xyzs.append(to_index([ras[0], ras[1], ras[2]]))
             crop, bbox = self.lasso_points_to_crop(xyzs)
         except ValueError:
             # No single constant slice axis (e.g. an oblique reformat); ignore.
@@ -3107,12 +3113,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         from vtk.util import numpy_support
 
-        (k0, k1), (j0, j1), (i0, i1) = bbox
+        volume_node = self.get_volume_node()
         sub = np.ascontiguousarray(crop, dtype=np.uint8)
         oriented = slicer.vtkOrientedImageData()
-        oriented.SetExtent(i0, i1 - 1, j0, j1 - 1, k0, k1 - 1)
+        oriented.SetExtent(*self._array_bbox_to_ijk_extent(bbox, volume_node))
         ijk_to_ras = vtk.vtkMatrix4x4()
-        self.get_volume_node().GetIJKToRASMatrix(ijk_to_ras)
+        volume_node.GetIJKToRASMatrix(ijk_to_ras)
         oriented.SetImageToWorldMatrix(ijk_to_ras)
         oriented.GetPointData().SetScalars(
             numpy_support.numpy_to_vtk(
@@ -3384,11 +3390,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         vimage = node.GetBinaryLabelmapInternalRepresentation(label_name)
         if vimage is None:
             return None
-        # Allocated labelmap extent in IJK (i, j, k), inclusive. The scribble node shares
-        # the volume's geometry (SetReferenceImageGeometryParameterFromVolumeNode), so
-        # these indices address the volume array directly. A SHARED labelmap (fg + bg)
-        # reports the union extent, which is why we filter by THIS segment's value below.
-        ix0, ix1, iy0, iy1, iz0, iz1 = vimage.GetExtent()
+        # Allocated labelmap extent (i, j, k), inclusive, shifted from IJK to array
+        # indices. The scribble node shares the volume's geometry
+        # (SetReferenceImageGeometryParameterFromVolumeNode), so these then address the
+        # volume array directly. A SHARED labelmap (fg + bg) reports the union extent,
+        # which is why we filter by THIS segment's value below.
+        ix0, ix1, iy0, iy1, iz0, iz1 = self._labelmap_extent_in_array_indices(vimage)
         if ix1 < ix0 or iy1 < iy0 or iz1 < iz0:
             return None  # nothing allocated yet -- early AnyEvent before the real stroke
         view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(node, label_name)
@@ -3791,6 +3798,124 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Re-arm the active tool on the newly selected / created segment.
         self._rearm_tool_later(active_tool)
 
+    def _masking_active(self):
+        """True when the Segment Editor's Masking settings (shared singleton parameter
+        node, editable in the embedded editor widget) restrict editing: an editable area
+        other than "Everywhere", or an editable intensity range."""
+        node = getattr(self, "segment_editor_node", None)
+        if node is None:
+            return False
+        return (node.GetMaskMode() != slicer.vtkMRMLSegmentationNode.EditAllowedEverywhere
+                or bool(node.GetSourceVolumeIntensityMask()))
+
+    def _editable_mask(self, segmentationNode, segmentId, bbox=None):
+        """Bool (k, j, i) array of the voxels the Segment Editor's Masking settings allow
+        editing, over the half-open ``bbox`` (or the whole source volume when None), or
+        None when masking is not active (the common case -- costs nothing).
+
+        Uses vtkMRMLSegmentationNode::GenerateEditMask, the same routine the built-in
+        Segment Editor effects use, so editable area (inside/outside segments, visible
+        segments, a single segment) and editable intensity range behave exactly like
+        they do for Paint. Its output is nonzero where editing is NOT allowed.
+        """
+        if not self._masking_active():
+            return None
+        from vtk.util import numpy_support
+
+        volume_node = self.get_volume_node()
+        if volume_node is None:
+            return None
+        if bbox is None:
+            # The whole voxel array, in array indices (its IJK extent may not start at 0).
+            e = volume_node.GetImageData().GetExtent()
+            bbox = ((0, e[5] - e[4] + 1), (0, e[3] - e[2] + 1), (0, e[1] - e[0] + 1))
+        (k0, k1), (j0, j1), (i0, i1) = bbox
+        ijk_extent = self._array_bbox_to_ijk_extent(bbox, volume_node)
+
+        node = self.segment_editor_node
+        reference = slicer.vtkOrientedImageData()
+        reference.SetExtent(*ijk_extent)
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        volume_node.GetIJKToRASMatrix(ijk_to_ras)
+        reference.SetImageToWorldMatrix(ijk_to_ras)
+
+        source_image = None
+        intensity_range = None
+        if node.GetSourceVolumeIntensityMask():
+            source_image = slicer.vtkSlicerSegmentationsModuleLogic.CreateOrientedImageDataFromVolumeNode(
+                volume_node
+            )
+            intensity_range = list(node.GetSourceVolumeIntensityMaskRange())
+
+        not_editable = slicer.vtkOrientedImageData()
+        if not segmentationNode.GenerateEditMask(
+            not_editable, node.GetMaskMode(), reference, segmentId,
+            node.GetMaskSegmentID() or "", source_image, intensity_range,
+        ):
+            raise RuntimeError("Failed to generate the Segment Editor edit mask")
+        e = not_editable.GetExtent()
+        if tuple(e) != tuple(ijk_extent):
+            raise RuntimeError(f"Unexpected edit mask extent {e}")
+        scalars = numpy_support.vtk_to_numpy(not_editable.GetPointData().GetScalars())
+        return scalars.reshape(k1 - k0, j1 - j0, i1 - i0) == 0
+
+    def _own_voxels_in_bbox(self, segmentationNode, segmentId, bbox):
+        """Bool (k, j, i) array over ``bbox`` of THIS segment's current voxels, read from
+        its internal labelmap (zero outside the allocated extent) -- no full-volume
+        extract."""
+        (k0, k1), (j0, j1), (i0, i1) = bbox
+        own = np.zeros((k1 - k0, j1 - j0, i1 - i0), dtype=bool)
+        segment = segmentationNode.GetSegmentation().GetSegment(segmentId)
+        vimage = segmentationNode.GetBinaryLabelmapInternalRepresentation(segmentId)
+        if segment is None or vimage is None:
+            return own
+        ix0, ix1, iy0, iy1, iz0, iz1 = self._labelmap_extent_in_array_indices(vimage)
+        a0, a1 = max(i0, ix0), min(i1, ix1 + 1)
+        b0, b1 = max(j0, iy0), min(j1, iy1 + 1)
+        c0, c1 = max(k0, iz0), min(k1, iz1 + 1)
+        if a1 <= a0 or b1 <= b0 or c1 <= c0:
+            return own
+        view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(segmentationNode, segmentId)
+        own[c0 - k0:c1 - k0, b0 - j0:b1 - j0, a0 - i0:a1 - i0] = (
+            view[c0 - iz0:c1 - iz0, b0 - iy0:b1 - iy0, a0 - ix0:a1 - ix0] == segment.GetLabelValue()
+        )
+        return own
+
+    def _masking_description(self):
+        """Short human-readable summary of the active Segment Editor masking, or ''."""
+        if not self._masking_active():
+            return ""
+        node = self.segment_editor_node
+        parts = []
+        mode = node.GetMaskMode()
+        if mode != slicer.vtkMRMLSegmentationNode.EditAllowedEverywhere:
+            names = {
+                slicer.vtkMRMLSegmentationNode.EditAllowedInsideAllSegments: "inside all segments",
+                slicer.vtkMRMLSegmentationNode.EditAllowedInsideVisibleSegments: "inside visible segments",
+                slicer.vtkMRMLSegmentationNode.EditAllowedOutsideAllSegments: "outside all segments",
+                slicer.vtkMRMLSegmentationNode.EditAllowedOutsideVisibleSegments: "outside visible segments",
+                slicer.vtkMRMLSegmentationNode.EditAllowedInsideSingleSegment: "inside a segment",
+            }
+            area = names.get(mode, "restricted area")
+            if mode == slicer.vtkMRMLSegmentationNode.EditAllowedInsideSingleSegment:
+                seg_node = self.ui.editor_widget.segmentationNode()
+                seg = seg_node.GetSegmentation().GetSegment(node.GetMaskSegmentID() or "") if seg_node else None
+                if seg is not None:
+                    area = f"inside '{seg.GetName()}'"
+            parts.append(area)
+        if node.GetSourceVolumeIntensityMask():
+            lo, hi = node.GetSourceVolumeIntensityMaskRange()
+            parts.append(f"intensity {lo:g} to {hi:g}")
+        return "Masking active: " + ", ".join(parts)
+
+    def _update_masking_hint(self):
+        label = getattr(self.ui, "maskingHintLabel", None)
+        if label is None:
+            return
+        text = self._masking_description()
+        label.setText(text)
+        label.setVisible(bool(text))
+
     def _update_segment_region(self, mask, bbox, segmentationNode, segmentId):
         """Update only the changed sub-extent of the segment instead of rewriting the whole
         volume. ``bbox`` is the backend's clipped paste bbox -- half-open and directly
@@ -3820,12 +3945,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return False
 
         label_value = segment.GetLabelValue()
+        # Segment Editor masking: only editable voxels take the prediction; the rest keep
+        # this segment's current state (None = masking off, the common case).
+        editable = self._editable_mask(segmentationNode, segmentId, bbox)
         vimage = segmentationNode.GetBinaryLabelmapInternalRepresentation(segmentId)
         if vimage is not None:
-            # Allocated labelmap extent in IJK (i, j, k), inclusive. For a SHARED labelmap
-            # this is the union over all its segments, so it tells us what is *allocated*,
-            # not what belongs to THIS segment.
-            ix0, ix1, iy0, iy1, iz0, iz1 = vimage.GetExtent()
+            # Allocated labelmap extent (i, j, k), inclusive, shifted from IJK to array
+            # indices like bbox. For a SHARED labelmap this is the union over all its
+            # segments, so it tells us what is *allocated*, not what belongs to THIS segment.
+            ix0, ix1, iy0, iy1, iz0, iz1 = self._labelmap_extent_in_array_indices(vimage)
             if ix1 >= ix0 and iy1 >= iy0 and iz1 >= iz0:  # non-empty allocation
                 view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(segmentationNode, segmentId)
                 bbox_within_extent = (ix0 <= i0 and i1 - 1 <= ix1
@@ -3849,6 +3977,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     i_s = slice(i0 - ix0, i1 - ix0)
                     sub_mask = mask[k0:k1, j0:j1, i0:i1]
                     current = view[ks, js, i_s]
+                    if editable is not None:
+                        sub_mask = np.where(editable, sub_mask != 0, current == label_value)
                     view[ks, js, i_s] = np.where(
                         sub_mask != 0, label_value, np.where(current == label_value, 0, current)
                     )
@@ -3885,9 +4015,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # SetBinaryLabelmapToSegment maps the foreground to this segment's value and leaves
         # other segments alone; the crop's own extent bounds the replace (zeroing this
         # segment outside it, which is what we want here).
-        self._set_segment_region_from_crop(
-            segmentationNode, segmentId, mask[k0:k1, j0:j1, i0:i1], bbox
-        )
+        crop = mask[k0:k1, j0:j1, i0:i1]
+        if editable is not None:
+            # Non-editable voxels keep this segment's current content (all of which lies
+            # inside the bbox on this path).
+            crop = np.where(
+                editable, crop != 0, self._own_voxels_in_bbox(segmentationNode, segmentId, bbox)
+            )
+        self._set_segment_region_from_crop(segmentationNode, segmentId, crop, bbox)
         return True
 
     @staticmethod
@@ -3923,11 +4058,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         was_3d_shown = segmentationNode.GetSegmentation().ContainsRepresentation(slicer.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName())
 
         with slicer.util.RenderBlocker():  # avoid flashing of 3D view
-            # NOTE: we deliberately do NOT call saveStateForUndo() here. It snapshots
-            # the whole labelmap on every prediction (slow), and undo is handled by the
-            # nnInteractive session (Ctrl+Z -> session.undo()), not the segment editor.
-            updated_region = False
+            # Let the Segment Editor's Undo revert this prediction, like a Paint stroke.
+            # Cheap: the editor copies only the labelmap layers modified since the last
+            # saved state. After an editor undo the segment no longer matches the
+            # session's fingerprint, so the next prompt re-seeds the session from it.
+            # (Ctrl+Z stays nnInteractive's own undo: it drops the last prompt and
+            # recomputes.)
             t_update = time.time()
+            self.ui.editor_widget.saveStateForUndo()
+            updated_region = False
             if changed_bbox is not None:
                 try:
                     updated_region = self._update_segment_region(
@@ -3937,6 +4076,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     debug_print(f"region-limited update failed; full update instead ({exc})")
                     updated_region = False
             if not updated_region:
+                editable = self._editable_mask(segmentationNode, selectedSegmentID)
+                if editable is not None:
+                    # New array -- never modify the session-owned target buffer.
+                    segmentation_mask = np.where(
+                        editable, segmentation_mask != 0, self.get_segment_data() != 0
+                    ).astype(np.uint8)
                 slicer.util.updateSegmentBinaryLabelmapFromArray(
                     segmentation_mask,
                     segmentationNode,
@@ -6121,11 +6266,48 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         return image_changed
 
-    def _ras_to_ijk_converter(self):
-        """One-time setup for RAS -> IJK conversion in the current volume node; returns
-        a per-point callable. Hoist this out of loops: building the VTK transform and
-        matrix dominates the cost, so per-point construction made long-contour
-        conversions (lasso submit) needlessly slow."""
+    def _array_origin_in_ijk(self, volume_node=None):
+        """IJK coordinates (i, j, k) of element [0, 0, 0] of the volume's numpy voxel array.
+
+        Terminology used in this module:
+
+        * IJK: VTK image coordinates, the ones the IJKToRAS matrix maps and VTK extents
+          are given in. They start at the image data's extent, which is usually 0 but
+          not always (e.g. a labelmap exported from a segmentation).
+        * Array index: the 0-based index into the numpy array of the voxels
+          (arrayFromVolume, the session image, the target buffer). Prompt coordinates
+          sent to nnInteractive and the prediction bboxes it returns are array indices,
+          in (i, j, k) or (k, j, i) order as noted at each use.
+
+        Array index = IJK - this origin. Every conversion between the two goes through
+        this offset."""
+        volume_node = volume_node if volume_node is not None else self.get_volume_node()
+        image = volume_node.GetImageData() if volume_node is not None else None
+        if image is None:
+            return (0, 0, 0)
+        e = image.GetExtent()
+        return (e[0], e[2], e[4])
+
+    def _array_bbox_to_ijk_extent(self, bbox, volume_node=None):
+        """Half-open array-index bbox ``((k0,k1),(j0,j1),(i0,i1))`` -> inclusive VTK
+        extent ``(i0, i1, j0, j1, k0, k1)`` in IJK (see _array_origin_in_ijk)."""
+        (k0, k1), (j0, j1), (i0, i1) = bbox
+        oi, oj, ok = self._array_origin_in_ijk(volume_node)
+        return (i0 + oi, i1 - 1 + oi, j0 + oj, j1 - 1 + oj, k0 + ok, k1 - 1 + ok)
+
+    def _labelmap_extent_in_array_indices(self, vimage):
+        """Inclusive VTK extent of a labelmap in the volume's geometry, converted from
+        IJK to array indices (see _array_origin_in_ijk)."""
+        oi, oj, ok = self._array_origin_in_ijk()
+        ix0, ix1, iy0, iy1, iz0, iz1 = vimage.GetExtent()
+        return ix0 - oi, ix1 - oi, iy0 - oj, iy1 - oj, iz0 - ok, iz1 - ok
+
+    def _ras_to_array_index_converter(self):
+        """One-time setup for RAS -> array index conversion in the current volume node;
+        returns a per-point callable giving (i, j, k) array indices (RAS -> IJK with the
+        RASToIJK matrix, then minus _array_origin_in_ijk). Hoist this out of loops:
+        building the VTK transform and matrix dominates the cost, so per-point
+        construction made long-contour conversions (lasso submit) needlessly slow."""
         volumeNode = self.get_volume_node()
 
         transformRasToVolumeRas = vtk.vtkGeneralTransform()
@@ -6134,20 +6316,22 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         volumeRasToIjk = vtk.vtkMatrix4x4()
         volumeNode.GetRASToIJKMatrix(volumeRasToIjk)
+        origin = self._array_origin_in_ijk(volumeNode)
 
         def _convert(pos):
             point_VolumeRas = transformRasToVolumeRas.TransformPoint(pos)
             point_Ijk = [0, 0, 0, 1]
             volumeRasToIjk.MultiplyPoint(list(point_VolumeRas) + [1.0], point_Ijk)
-            return [int(round(c)) for c in point_Ijk[0:3]]
+            return [int(round(c)) - o for c, o in zip(point_Ijk[0:3], origin)]
 
         return _convert
 
     def ras_to_xyz(self, pos):
         """
-        Converts an RAS position to IJK voxel coords in the current volume node.
+        Converts an RAS position to (i, j, k) voxel array indices in the current volume
+        node (see _ras_to_array_index_converter).
         """
-        return self._ras_to_ijk_converter()(pos)
+        return self._ras_to_array_index_converter()(pos)
 
 
     def lasso_points_to_crop(self, points):
@@ -6157,7 +6341,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         (k, j, i) = (z, y, x) order. Returns ``(crop, bbox)`` or ``(None, None)``
         if the polygon is empty.
 
-        ``points`` are in IJK (i, j, k) order; the image array is (k, j, i), so
+        ``points`` are array indices in (i, j, k) order; the image array is (k, j, i), so
         x->axis2, y->axis1, z->axis0.
         """
         from skimage.draw import polygon

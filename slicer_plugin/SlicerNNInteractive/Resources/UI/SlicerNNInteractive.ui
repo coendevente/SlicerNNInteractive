@@ -128,6 +128,25 @@
           </widget>
          </item>
          <item>
+          <widget class="QLabel" name="maskingHintLabel">
+           <property name="visible">
+            <bool>false</bool>
+           </property>
+           <property name="toolTip">
+            <string>nnInteractive results are written only where the Segment Editor's Masking settings allow editing; elsewhere the segment is left unchanged. Change it in the Masking section of the segment editor below.</string>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">color: #e08e0b; font-weight: bold;</string>
+           </property>
+           <property name="alignment">
+            <set>Qt::AlignCenter</set>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
           <widget class="QGroupBox" name="pointPromptsGroup">
            <property name="title">
             <string>Interaction Tools:</string>
