@@ -209,7 +209,7 @@ Once you have completed the installation above, you can use `SlicerNNInteractive
 
 4. Click `Show 3D` button in the segment editor section (below the prompts section) to see the segmentation results in 3D.
 
-5. If needed, you can correct the generated segmentation with positive and negative prompts (between which you can toggle using the Positive/Negative buttons). You can undo the last interaction with `Ctrl+Z`.
+5. If needed, you can correct the generated segmentation with positive and negative prompts (between which you can toggle using the Positive/Negative buttons). You can undo the last interaction with `Ctrl+Z`. The `Undo` and `Redo` buttons of the Segment Editor also undo and redo each prediction, like a Paint stroke; the next prompt then continues from the restored segment.
 
 	a) Alternatively, you can reset the current segment using the "Reset segment button".
 

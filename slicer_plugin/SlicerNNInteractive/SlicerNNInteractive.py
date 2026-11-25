@@ -4058,11 +4058,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         was_3d_shown = segmentationNode.GetSegmentation().ContainsRepresentation(slicer.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName())
 
         with slicer.util.RenderBlocker():  # avoid flashing of 3D view
-            # NOTE: we deliberately do NOT call saveStateForUndo() here. It snapshots
-            # the whole labelmap on every prediction (slow), and undo is handled by the
-            # nnInteractive session (Ctrl+Z -> session.undo()), not the segment editor.
-            updated_region = False
+            # Let the Segment Editor's Undo revert this prediction, like a Paint stroke.
+            # Cheap: the editor copies only the labelmap layers modified since the last
+            # saved state. After an editor undo the segment no longer matches the
+            # session's fingerprint, so the next prompt re-seeds the session from it.
+            # (Ctrl+Z stays nnInteractive's own undo: it drops the last prompt and
+            # recomputes.)
             t_update = time.time()
+            self.ui.editor_widget.saveStateForUndo()
+            updated_region = False
             if changed_bbox is not None:
                 try:
                     updated_region = self._update_segment_region(
