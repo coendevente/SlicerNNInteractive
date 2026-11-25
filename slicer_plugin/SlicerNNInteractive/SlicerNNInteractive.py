@@ -1250,6 +1250,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         layout.insertWidget(0, init_group)
 
+        # maskingHintLabel (in the .ui) is shown only while the Segment Editor's Masking
+        # settings restrict where results are written -- e.g. a threshold left enabled
+        # from an earlier Paint session would otherwise clip results silently.
+        self._update_masking_hint()
+
         logos = self._build_logos_widget()
         if logos is not None:
             layout.addWidget(logos)
@@ -1685,6 +1690,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._handle_active_source_volume_change(reupload=True)
         self._handle_selected_segment_change()
         self._update_initialize_button_state()
+        self._update_masking_hint()
 
     def on_scene_nodes_changed(self, caller, event, calldata=None):
         """Volumes added/removed: re-evaluate whether Initialize can be used. Coalesced
@@ -3792,6 +3798,124 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Re-arm the active tool on the newly selected / created segment.
         self._rearm_tool_later(active_tool)
 
+    def _masking_active(self):
+        """True when the Segment Editor's Masking settings (shared singleton parameter
+        node, editable in the embedded editor widget) restrict editing: an editable area
+        other than "Everywhere", or an editable intensity range."""
+        node = getattr(self, "segment_editor_node", None)
+        if node is None:
+            return False
+        return (node.GetMaskMode() != slicer.vtkMRMLSegmentationNode.EditAllowedEverywhere
+                or bool(node.GetSourceVolumeIntensityMask()))
+
+    def _editable_mask(self, segmentationNode, segmentId, bbox=None):
+        """Bool (k, j, i) array of the voxels the Segment Editor's Masking settings allow
+        editing, over the half-open ``bbox`` (or the whole source volume when None), or
+        None when masking is not active (the common case -- costs nothing).
+
+        Uses vtkMRMLSegmentationNode::GenerateEditMask, the same routine the built-in
+        Segment Editor effects use, so editable area (inside/outside segments, visible
+        segments, a single segment) and editable intensity range behave exactly like
+        they do for Paint. Its output is nonzero where editing is NOT allowed.
+        """
+        if not self._masking_active():
+            return None
+        from vtk.util import numpy_support
+
+        volume_node = self.get_volume_node()
+        if volume_node is None:
+            return None
+        if bbox is None:
+            # The whole voxel array, in array indices (its IJK extent may not start at 0).
+            e = volume_node.GetImageData().GetExtent()
+            bbox = ((0, e[5] - e[4] + 1), (0, e[3] - e[2] + 1), (0, e[1] - e[0] + 1))
+        (k0, k1), (j0, j1), (i0, i1) = bbox
+        ijk_extent = self._array_bbox_to_ijk_extent(bbox, volume_node)
+
+        node = self.segment_editor_node
+        reference = slicer.vtkOrientedImageData()
+        reference.SetExtent(*ijk_extent)
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        volume_node.GetIJKToRASMatrix(ijk_to_ras)
+        reference.SetImageToWorldMatrix(ijk_to_ras)
+
+        source_image = None
+        intensity_range = None
+        if node.GetSourceVolumeIntensityMask():
+            source_image = slicer.vtkSlicerSegmentationsModuleLogic.CreateOrientedImageDataFromVolumeNode(
+                volume_node
+            )
+            intensity_range = list(node.GetSourceVolumeIntensityMaskRange())
+
+        not_editable = slicer.vtkOrientedImageData()
+        if not segmentationNode.GenerateEditMask(
+            not_editable, node.GetMaskMode(), reference, segmentId,
+            node.GetMaskSegmentID() or "", source_image, intensity_range,
+        ):
+            raise RuntimeError("Failed to generate the Segment Editor edit mask")
+        e = not_editable.GetExtent()
+        if tuple(e) != tuple(ijk_extent):
+            raise RuntimeError(f"Unexpected edit mask extent {e}")
+        scalars = numpy_support.vtk_to_numpy(not_editable.GetPointData().GetScalars())
+        return scalars.reshape(k1 - k0, j1 - j0, i1 - i0) == 0
+
+    def _own_voxels_in_bbox(self, segmentationNode, segmentId, bbox):
+        """Bool (k, j, i) array over ``bbox`` of THIS segment's current voxels, read from
+        its internal labelmap (zero outside the allocated extent) -- no full-volume
+        extract."""
+        (k0, k1), (j0, j1), (i0, i1) = bbox
+        own = np.zeros((k1 - k0, j1 - j0, i1 - i0), dtype=bool)
+        segment = segmentationNode.GetSegmentation().GetSegment(segmentId)
+        vimage = segmentationNode.GetBinaryLabelmapInternalRepresentation(segmentId)
+        if segment is None or vimage is None:
+            return own
+        ix0, ix1, iy0, iy1, iz0, iz1 = self._labelmap_extent_in_array_indices(vimage)
+        a0, a1 = max(i0, ix0), min(i1, ix1 + 1)
+        b0, b1 = max(j0, iy0), min(j1, iy1 + 1)
+        c0, c1 = max(k0, iz0), min(k1, iz1 + 1)
+        if a1 <= a0 or b1 <= b0 or c1 <= c0:
+            return own
+        view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(segmentationNode, segmentId)
+        own[c0 - k0:c1 - k0, b0 - j0:b1 - j0, a0 - i0:a1 - i0] = (
+            view[c0 - iz0:c1 - iz0, b0 - iy0:b1 - iy0, a0 - ix0:a1 - ix0] == segment.GetLabelValue()
+        )
+        return own
+
+    def _masking_description(self):
+        """Short human-readable summary of the active Segment Editor masking, or ''."""
+        if not self._masking_active():
+            return ""
+        node = self.segment_editor_node
+        parts = []
+        mode = node.GetMaskMode()
+        if mode != slicer.vtkMRMLSegmentationNode.EditAllowedEverywhere:
+            names = {
+                slicer.vtkMRMLSegmentationNode.EditAllowedInsideAllSegments: "inside all segments",
+                slicer.vtkMRMLSegmentationNode.EditAllowedInsideVisibleSegments: "inside visible segments",
+                slicer.vtkMRMLSegmentationNode.EditAllowedOutsideAllSegments: "outside all segments",
+                slicer.vtkMRMLSegmentationNode.EditAllowedOutsideVisibleSegments: "outside visible segments",
+                slicer.vtkMRMLSegmentationNode.EditAllowedInsideSingleSegment: "inside a segment",
+            }
+            area = names.get(mode, "restricted area")
+            if mode == slicer.vtkMRMLSegmentationNode.EditAllowedInsideSingleSegment:
+                seg_node = self.ui.editor_widget.segmentationNode()
+                seg = seg_node.GetSegmentation().GetSegment(node.GetMaskSegmentID() or "") if seg_node else None
+                if seg is not None:
+                    area = f"inside '{seg.GetName()}'"
+            parts.append(area)
+        if node.GetSourceVolumeIntensityMask():
+            lo, hi = node.GetSourceVolumeIntensityMaskRange()
+            parts.append(f"intensity {lo:g} to {hi:g}")
+        return "Masking active: " + ", ".join(parts)
+
+    def _update_masking_hint(self):
+        label = getattr(self.ui, "maskingHintLabel", None)
+        if label is None:
+            return
+        text = self._masking_description()
+        label.setText(text)
+        label.setVisible(bool(text))
+
     def _update_segment_region(self, mask, bbox, segmentationNode, segmentId):
         """Update only the changed sub-extent of the segment instead of rewriting the whole
         volume. ``bbox`` is the backend's clipped paste bbox -- half-open and directly
@@ -3821,6 +3945,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return False
 
         label_value = segment.GetLabelValue()
+        # Segment Editor masking: only editable voxels take the prediction; the rest keep
+        # this segment's current state (None = masking off, the common case).
+        editable = self._editable_mask(segmentationNode, segmentId, bbox)
         vimage = segmentationNode.GetBinaryLabelmapInternalRepresentation(segmentId)
         if vimage is not None:
             # Allocated labelmap extent (i, j, k), inclusive, shifted from IJK to array
@@ -3850,6 +3977,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     i_s = slice(i0 - ix0, i1 - ix0)
                     sub_mask = mask[k0:k1, j0:j1, i0:i1]
                     current = view[ks, js, i_s]
+                    if editable is not None:
+                        sub_mask = np.where(editable, sub_mask != 0, current == label_value)
                     view[ks, js, i_s] = np.where(
                         sub_mask != 0, label_value, np.where(current == label_value, 0, current)
                     )
@@ -3886,9 +4015,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # SetBinaryLabelmapToSegment maps the foreground to this segment's value and leaves
         # other segments alone; the crop's own extent bounds the replace (zeroing this
         # segment outside it, which is what we want here).
-        self._set_segment_region_from_crop(
-            segmentationNode, segmentId, mask[k0:k1, j0:j1, i0:i1], bbox
-        )
+        crop = mask[k0:k1, j0:j1, i0:i1]
+        if editable is not None:
+            # Non-editable voxels keep this segment's current content (all of which lies
+            # inside the bbox on this path).
+            crop = np.where(
+                editable, crop != 0, self._own_voxels_in_bbox(segmentationNode, segmentId, bbox)
+            )
+        self._set_segment_region_from_crop(segmentationNode, segmentId, crop, bbox)
         return True
 
     @staticmethod
@@ -3938,6 +4072,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     debug_print(f"region-limited update failed; full update instead ({exc})")
                     updated_region = False
             if not updated_region:
+                editable = self._editable_mask(segmentationNode, selectedSegmentID)
+                if editable is not None:
+                    # New array -- never modify the session-owned target buffer.
+                    segmentation_mask = np.where(
+                        editable, segmentation_mask != 0, self.get_segment_data() != 0
+                    ).astype(np.uint8)
                 slicer.util.updateSegmentBinaryLabelmapFromArray(
                     segmentation_mask,
                     segmentationNode,
