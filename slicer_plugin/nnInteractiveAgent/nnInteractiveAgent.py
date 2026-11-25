@@ -17,6 +17,8 @@ the same as the [k, j, i] order of ``slicer.util.arrayFromVolume``. So label pat
 directly into arrays with the shape of the volume.
 """
 
+import email.utils
+import hashlib
 import html
 import importlib
 import importlib.util
@@ -36,6 +38,8 @@ import threading
 import time
 import urllib.parse
 import zlib
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -59,6 +63,8 @@ IMAGE_ATTRIBUTE = "nnInteractiveAgent.Image"  # "<volume key>:<n>" of the server
 ROLE_ATTRIBUTE = "nnInteractiveAgent.Role"  # "result" or "work"
 NOTES_TAG = "nnInteractiveAgent.Notes"  # segment tag: the agent's notes on the object
 MAX_CHAT_IMAGES = 4  # thumbnails shown per tool result
+CHAT_IMAGE_DOWNLOADS = 4  # chat images downloaded in parallel
+CHAT_IMAGE_CACHE_BYTES = 256 * 1024 * 1024  # memory for chat images kept across reconnects
 # The internal server: nninteractive-agent installed in Slicer's Python (an archive, so no git is needed).
 AGENT_REPOSITORY = "MIC-DKFZ/nninteractive-agent"
 AGENT_COMMIT = "8fe94bda678d0c09c7c8363261e82bd984802984"  # the recommended version, tested with this module
@@ -218,6 +224,183 @@ class EndpointNotFoundError(RuntimeError):
     """The server has no such endpoint (an older nninteractive-agent)."""
 
 
+class HttpCache:
+    """A private HTTP cache in memory, as a browser keeps one (RFC 9111, the parts the agent server uses).
+
+    A response is stored unless it says ``no-store``. It is fresh for ``max-age`` (less its ``Age``), else
+    until ``Expires``, else for a tenth of the time since ``Last-Modified``; ``no-cache`` makes it stale at
+    once. A fresh entry is used without asking the server; a stale one is revalidated with
+    ``If-None-Match``/``If-Modified-Since``, and a 304 answer renews it. The least recently used entries
+    are dropped beyond ``max_bytes``. Thread-safe.
+    """
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self._entries = OrderedDict()  # url -> {"data", "etag", "last_modified", "expires"}
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def lookup(self, url: str):
+        """``(data, fresh)`` of the stored response, ``(None, False)`` if there is none."""
+        with self._lock:
+            entry = self._entries.get(url)
+            if entry is None:
+                return None, False
+            self._entries.move_to_end(url)
+            return entry["data"], time.time() < entry["expires"]
+
+    def validators(self, url: str) -> dict:
+        """The conditional request headers that revalidate the stored response."""
+        with self._lock:
+            entry = self._entries.get(url)
+        headers = {}
+        if entry is not None:
+            if entry["etag"]:
+                headers["If-None-Match"] = entry["etag"]
+            if entry["last_modified"]:
+                headers["If-Modified-Since"] = entry["last_modified"]
+        return headers
+
+    def store(self, url: str, data: bytes, headers) -> None:
+        """A 200 answer of ``url``."""
+        directives = self._directives(headers)
+        if "no-store" in directives:
+            self.remove(url)
+            return
+        entry = {"data": data, "etag": headers.get("ETag"), "last_modified": headers.get("Last-Modified"),
+                 "expires": self._expires(headers, directives)}
+        with self._lock:
+            old = self._entries.pop(url, None)
+            if old is not None:
+                self._bytes -= len(old["data"])
+            if len(data) > self.max_bytes:
+                return
+            self._entries[url] = entry
+            self._bytes += len(data)
+            while self._bytes > self.max_bytes:
+                _url, dropped = self._entries.popitem(last=False)
+                self._bytes -= len(dropped["data"])
+
+    def renew(self, url: str, headers):
+        """A 304 answer of ``url``: the stored data, now fresh again (``None`` if it was dropped meanwhile)."""
+        directives = self._directives(headers)
+        with self._lock:
+            entry = self._entries.get(url)
+            if entry is None:
+                return None
+            entry["etag"] = headers.get("ETag") or entry["etag"]
+            entry["last_modified"] = headers.get("Last-Modified") or entry["last_modified"]
+            entry["expires"] = self._expires(headers, directives, entry["last_modified"])
+            self._entries.move_to_end(url)
+            return entry["data"]
+
+    def remove(self, url: str) -> None:
+        with self._lock:
+            entry = self._entries.pop(url, None)
+            if entry is not None:
+                self._bytes -= len(entry["data"])
+
+    @staticmethod
+    def _directives(headers) -> dict:
+        out = {}
+        for part in (headers.get("Cache-Control") or "").split(","):
+            name, _sep, value = part.strip().partition("=")
+            if name:
+                out[name.lower()] = value.strip('"')
+        return out
+
+    @staticmethod
+    def _http_date(text):
+        try:
+            return email.utils.parsedate_to_datetime(text).timestamp() if text else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _expires(cls, headers, directives: dict, last_modified=None) -> float:
+        now = time.time()
+        if "no-cache" in directives:
+            return now
+        try:
+            age = max(0.0, float(headers.get("Age") or 0))
+        except ValueError:
+            age = 0.0
+        if "max-age" in directives:  # s-maxage is for shared caches only
+            try:
+                return now + max(0.0, float(directives["max-age"]) - age)
+            except ValueError:
+                return now
+        date = cls._http_date(headers.get("Date")) or now
+        expires = headers.get("Expires")
+        if expires is not None:
+            t = cls._http_date(expires)
+            return now + (t - date) - age if t is not None else now  # an invalid date: already expired
+        modified = cls._http_date(headers.get("Last-Modified") or last_modified)
+        if modified is not None and modified < date:
+            return now + 0.1 * (date - modified) - age  # heuristic freshness, as browsers do
+        return now
+
+
+class ImageDownloader:
+    """Downloads chat images in parallel worker threads, through an ``HttpCache``.
+
+    ``fetch`` returns cached data at once if it is fresh; otherwise it starts a download (one per URL at a
+    time) and ``on_done(url, data)`` is called in the worker thread when it ends (``data`` is ``None`` on
+    failure). Each worker keeps its own HTTP connection open between images.
+    """
+
+    def __init__(self, workers: int, cache_bytes: int):
+        self.cache = HttpCache(cache_bytes)
+        self._workers = workers
+        self._executor = None
+        self._local = threading.local()
+        self._in_flight = set()
+        self._lock = threading.Lock()
+
+    def fetch(self, url: str, cookies: dict, verify: bool, on_done):
+        """Fresh cached data of ``url``, or ``None`` (then ``on_done`` follows once it is downloaded)."""
+        data, fresh = self.cache.lookup(url)
+        if fresh:
+            return data
+        with self._lock:
+            if url in self._in_flight:
+                return None
+            self._in_flight.add(url)
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(self._workers, thread_name_prefix="nnInteractiveAgentImage")
+            self._executor.submit(self._download, url, cookies, verify, on_done)
+        return None
+
+    def _download(self, url: str, cookies: dict, verify: bool, on_done) -> None:
+        data = None
+        try:
+            import requests
+
+            session = getattr(self._local, "session", None)
+            if session is None:
+                session = self._local.session = requests.Session()
+            r = session.get(url, cookies=cookies, verify=verify, headers=self.cache.validators(url), timeout=30)
+            if r.status_code == 304:
+                data = self.cache.renew(url, r.headers)
+                if data is None:  # dropped from the cache meanwhile: get it again
+                    r = session.get(url, cookies=cookies, verify=verify, timeout=30)
+            if data is None and r.status_code == 200:
+                data = r.content
+                self.cache.store(url, data, r.headers)
+        except Exception as e:  # noqa: BLE001 - a missing thumbnail is cosmetic
+            logging.debug(f"nnInteractiveAgent: could not download {url}: {e}")
+        finally:
+            with self._lock:
+                self._in_flight.discard(url)
+        on_done(url, data)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
 class AgentConnection:
     """One logged-in session of the agent server.
 
@@ -238,6 +421,7 @@ class AgentConnection:
         self._thread = None
         self._stop = threading.Event()
         self.connected = False
+        self.images = ImageDownloader(CHAT_IMAGE_DOWNLOADS, CHAT_IMAGE_CACHE_BYTES)
 
     # ------------------------------------------------------------- HTTP
     def url(self, path: str) -> str:
@@ -403,10 +587,9 @@ class AgentConnection:
                 while not self._stop.is_set():
                     opcode, data = ws.recv_data()
                     if opcode == websocket.ABNF.OPCODE_TEXT:
-                        ev = json.loads(data.decode())
-                        if ev.get("t") == "result" and ev.get("images"):
-                            ev["image_data"] = self._fetch_images(ev["images"][:MAX_CHAT_IMAGES])
-                        self.inbox.put(("event", ev))
+                        # Nothing slow here: this thread must keep reading to answer the server's pings
+                        # (chat images are downloaded by ``fetch_image`` in other threads).
+                        self.inbox.put(("event", json.loads(data.decode())))
                     elif opcode == websocket.ABNF.OPCODE_BINARY:
                         self.inbox.put(("patch",) + decode_patch(data))
                     elif opcode == websocket.ABNF.OPCODE_CLOSE:
@@ -423,14 +606,12 @@ class AgentConnection:
                 self.inbox.put(("closed", "Connection lost, reconnecting ...", False))
                 self._stop.wait(1.0)
 
-    def _fetch_images(self, urls) -> list:
-        out = []
-        for u in urls:
-            try:
-                out.append(self._request("GET", u, timeout=30).content)
-            except Exception:  # noqa: BLE001 - a missing thumbnail is cosmetic
-                out.append(None)
-        return out
+    def fetch_image(self, path: str):
+        """Fresh cached data of the chat image at ``path`` (a URL relative to the server), or ``None``: then
+        it is downloaded in the background and arrives in the inbox as ``("image", path, data)``."""
+        cookies = {COOKIE: self.cookie} if self.cookie else None
+        return self.images.fetch(self.url(path), cookies, self.verify,
+                                 lambda _url, data: self.inbox.put(("image", path, data)))
 
 
 ###############################################################################
@@ -797,7 +978,8 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.busy = False
         self.ready = False
         self.agent = None
-        self._chat_images = 0
+        self._chat_image_placeholder = None
+        self._chat_images_arrived = False  # the chat needs a new layout for images that replaced placeholders
         self._downloading = None
         self._download_failed = {}  # image tag -> message, for downloads that failed (not retried automatically)
         self._last_flush = 0.0
@@ -1144,6 +1326,7 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def cleanup(self) -> None:
         self.timer.stop()
         self.conn.stop()
+        self.conn.images.shutdown()
         self.internal.stop()
         self.removeObservers()
 
@@ -1837,6 +2020,9 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                     self.onEvent(item[1])
                 elif kind == "patch":
                     self.mirror.apply_patch(item[1], item[2])
+                elif kind == "image":
+                    if self.setChatImage(item[1], item[2]):
+                        self._chat_images_arrived = True
                 elif kind == "call":
                     item[1](item[2], item[3])
                 elif kind == "open":
@@ -1848,6 +2034,7 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                         self.conn.stop()
             except Exception:  # noqa: BLE001 - one bad message must not stop the module
                 logging.exception("nnInteractiveAgent: could not process a server message")
+        self.relayoutChatImages()
         if self.mirror.dirty and time.time() - self._last_flush > 0.3:
             try:
                 self.mirror.flush()
@@ -1873,7 +2060,6 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             for m in self.agent.get("models", []):
                 self.modelCombo.addItem(m.get("label", m["id"]), m["id"])
             self.chat.clear()
-            self._chat_images = 0
             self.replaying = True
             self.setImage(ev.get("image"), new=False)
         elif t == "replay_done":
@@ -2010,14 +2196,10 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         elif t == "result":
             if ev.get("error"):
                 self.appendHtml(f"<div style='color:#c33'>{esc(ev.get('tool'))}: {esc(ev.get('text', '')[:300])}</div>")
-            if self.showImagesCheck.checked and ev.get("image_data"):
-                imgs = []
-                for data in ev["image_data"]:
-                    name = self.addChatImage(data)
-                    if name:
-                        imgs.append(f"<a href='{name}'><img src='{name}' height='110'></a>")
-                if imgs:
-                    self.appendHtml("<div>" + " ".join(imgs) + "</div>")
+            if self.showImagesCheck.checked and ev.get("images"):
+                names = [self.chatImage(path) for path in ev["images"][:MAX_CHAT_IMAGES]]
+                self.appendHtml("<div>" + " ".join(f"<a href='{n}'><img src='{n}' height='110'></a>"
+                                                   for n in names) + "</div>")
         elif t == "task":
             status = ev.get("status")
             text = ev.get("description") if status == "started" else (ev.get("summary") or "").strip().split("\n")[0]
@@ -2057,16 +2239,43 @@ class nnInteractiveAgentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         if at_end:  # follow the output only while at the bottom, not while reading earlier output
             bar.value = bar.maximum
 
-    def addChatImage(self, data):
-        if not data:
-            return None
-        image = qt.QImage()
-        if not image.loadFromData(qt.QByteArray(data)):
-            return None
-        self._chat_images += 1
-        name = f"img:{self._chat_images}"
-        self.chat.document.addResource(qt.QTextDocument.ImageResource, qt.QUrl(name), image)
+    @staticmethod
+    def chatImageName(path: str) -> str:
+        """The chat document's resource name of the image at ``path`` (the same after a reconnect)."""
+        return "img:" + hashlib.sha1(path.encode()).hexdigest()[:20]
+
+    def chatImage(self, path: str) -> str:
+        """The resource name of the image at ``path`` in the chat: the image if it is in the cache, else a
+        placeholder that ``setChatImage`` replaces once it is downloaded."""
+        name = self.chatImageName(path)
+        data = self.conn.fetch_image(path)
+        if data is None or not self.setChatImage(path, data):
+            if self._chat_image_placeholder is None:
+                self._chat_image_placeholder = qt.QImage(110, 110, qt.QImage.Format_ARGB32)
+                self._chat_image_placeholder.fill(qt.QColor(128, 128, 128, 60))
+            self.chat.document.addResource(qt.QTextDocument.ImageResource, qt.QUrl(name),
+                                           self._chat_image_placeholder)
         return name
+
+    def setChatImage(self, path: str, data) -> bool:
+        """Make the image at ``path`` the chat's resource for it; ``False`` if ``data`` is no image."""
+        image = qt.QImage()
+        if not data or not image.loadFromData(qt.QByteArray(data)):
+            return False
+        self.chat.document.addResource(qt.QTextDocument.ImageResource, qt.QUrl(self.chatImageName(path)), image)
+        return True
+
+    def relayoutChatImages(self) -> None:
+        """Lay out the chat again, for downloaded images that replaced placeholders (once per ``poll``)."""
+        if not self._chat_images_arrived:
+            return
+        self._chat_images_arrived = False
+        bar = self.chat.verticalScrollBar()
+        at_end = bar.value >= bar.maximum - 4
+        document = self.chat.document
+        document.markContentsDirty(0, document.characterCount())
+        if at_end:
+            bar.value = bar.maximum
 
     def showImage(self, name: str) -> None:
         image = self.chat.document.resource(qt.QTextDocument.ImageResource, qt.QUrl(name))
